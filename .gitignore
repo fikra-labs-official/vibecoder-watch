@@ -1,0 +1,19 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+.DS_Store
+.zeus/
+.local/
+app-side/connection.js
+__pycache__/
+
+# Preview packages include the revocable device credential.
+install/*.zab
+install/*-qr.png
+.claude-flow/
+bridge/parakeet-runner/.build/
+
+# Bridge databases belong to the runtime folder, never to the repo.
+*.sqlite3

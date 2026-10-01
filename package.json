@@ -1,0 +1,32 @@
+{
+  "name": "musafer-bipmax",
+  "version": "0.7.3",
+  "private": true,
+  "description": "Private voice remote for local Hermes on MacBook",
+  "scripts": {
+    "build": "node scripts/build-app.mjs musafir build",
+    "preview": "node scripts/build-app.mjs musafir preview",
+    "zeus": "zeus",
+    "test": "node --test test/*.test.mjs",
+    "test:bridge": "python3 -m unittest discover -s bridge -p \"test_*.py\"",
+    "preview:ui": "node scripts/preview-ui.mjs",
+    "build:orca": "node scripts/build-app.mjs orca build",
+    "preview:orca": "node scripts/build-app.mjs orca preview",
+    "build:claude": "node scripts/build-app.mjs claude build",
+    "preview:claude": "node scripts/build-app.mjs claude preview",
+    "build:codex": "node scripts/build-app.mjs codex build",
+    "preview:codex": "node scripts/build-app.mjs codex preview",
+    "build:limits": "node scripts/build-app.mjs limits build",
+    "preview:limits": "node scripts/build-app.mjs limits preview"
+  },
+  "devDependencies": {
+    "@zeppos/zeus-cli": "1.9.3"
+  },
+  "_moduleAliases": {
+    "zeppos-app-utils": "node_modules/@zeppos/zeus-cli/private-modules/zeppos-app-utils"
+  },
+  "dependencies": {
+    "@zeppos/zml": "0.0.43"
+  },
+  "type": "module"
+}

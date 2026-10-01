@@ -1,0 +1,59 @@
+{
+  "configVersion": "v3",
+  "app": {
+    "appId": 1092605,
+    "appName": "Лимиты",
+    "appType": "app",
+    "version": {
+      "code": 5,
+      "name": "0.1.4"
+    },
+    "icon": "limits-icon.png",
+    "vender": "Fikra Labs",
+    "description": "Лимиты Claude Code и Codex: сколько осталось и когда сброс"
+  },
+  "permissions": [
+    "data:os.device.info",
+    "device:os.local_storage"
+  ],
+  "runtime": {
+    "apiVersion": {
+      "compatible": "3.6.0",
+      "target": "3.6.0",
+      "minVersion": "3.6"
+    }
+  },
+  "targets": {
+    "common": {
+      "module": {
+        "page": {
+          "pages": [
+            "page/index"
+          ]
+        },
+        "app-side": {
+          "path": "app-side/index"
+        },
+        "setting": {
+          "path": "setting/index"
+        }
+      },
+      "platforms": [
+        {
+          "st": "s",
+          "dw": 390
+        }
+      ],
+      "designWidth": 390
+    }
+  },
+  "i18n": {
+    "ru-RU": {
+      "appName": "Лимиты"
+    },
+    "en-US": {
+      "appName": "Limits"
+    }
+  },
+  "defaultLanguage": "ru-RU"
+}

@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Мусафир · предпросмотр часов</title>
+  <link rel="stylesheet" href="/preview/styles.css">
+</head>
+<body>
+  <div class="preview-banner">Предпросмотр · демонстрация, команды не отправляются</div>
+  <main>
+    <section class="stage" aria-label="Экран часов Мусафир">
+      <div class="watch-shell">
+        <div class="watch-screen" id="watch-screen">
+          <div class="os-header" aria-hidden="true">
+            <span id="app-name">Мусафир</span>
+            <time id="watch-time">00:00</time>
+          </div>
+          <div id="widget-layer"></div>
+        </div>
+      </div>
+    </section>
+
+    <aside class="controls">
+      <div class="brand-kicker">MUSLIM MUSAFIR</div>
+      <h1>Экран часов</h1>
+      <p class="lead">Интерактивный просмотр настоящей страницы Zepp. Запись и кнопки запускают её реальные обработчики.</p>
+
+      <label for="app-select">Приложение</label>
+      <div class="select-wrap">
+        <select id="app-select">
+          <option value="musafir">Мусафир</option>
+          <option value="orca">Orca</option>
+        </select>
+      </div>
+
+      <label for="state-select">Состояние</label>
+      <div class="select-wrap">
+        <select id="state-select">
+          <option value="ready">Готов к команде</option>
+          <option value="recording">Запись: микрофон и таймер</option>
+          <option value="uploading">Передача: 62%</option>
+          <option value="transcribing">Распознавание</option>
+          <option value="review">Проверка текста</option>
+          <option value="approval">Запрос разрешения</option>
+          <option value="job">Мусафир работает</option>
+          <option value="result">Длинный ответ</option>
+          <option value="offline">Телефон не отвечает</option>
+          <option value="error">Ошибка записи</option>
+        </select>
+      </div>
+
+      <div class="hint">
+        <span class="hint-dot"></span>
+        <p><strong>Попробуйте сценарий:</strong> выберите «Готов», нажмите «Запись», затем «Стоп». После передачи подтвердите текст и пройдите запрос разрешения.</p>
+      </div>
+
+      <dl class="snapshot" id="snapshot">
+        <div><dt>Фаза</dt><dd data-field="phase">загрузка</dd></div>
+        <div><dt>Виджетов</dt><dd data-field="widgets">0</dd></div>
+        <div><dt>Источник</dt><dd>page/index.js</dd></div>
+      </dl>
+    </aside>
+  </main>
+  <script type="module" src="/preview/harness.mjs"></script>
+</body>
+</html>

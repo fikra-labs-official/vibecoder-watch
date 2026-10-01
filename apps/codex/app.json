@@ -1,0 +1,62 @@
+{
+  "configVersion": "v3",
+  "app": {
+    "appId": 1092604,
+    "appName": "Codex",
+    "appType": "app",
+    "version": {
+      "code": 8,
+      "name": "0.1.7"
+    },
+    "icon": "codex-icon.png",
+    "vender": "Fikra Labs",
+    "description": "Codex в проектах на Mac с часов"
+  },
+  "permissions": [
+    "data:os.device.info",
+    "device:os.mic",
+    "device:os.local_storage"
+  ],
+  "runtime": {
+    "apiVersion": {
+      "compatible": "3.6.0",
+      "target": "3.6.0",
+      "minVersion": "3.6"
+    }
+  },
+  "targets": {
+    "common": {
+      "module": {
+        "page": {
+          "pages": [
+            "page/index",
+            "page/voice",
+            "page/history"
+          ]
+        },
+        "app-side": {
+          "path": "app-side/index"
+        },
+        "setting": {
+          "path": "setting/index"
+        }
+      },
+      "platforms": [
+        {
+          "st": "s",
+          "dw": 390
+        }
+      ],
+      "designWidth": 390
+    }
+  },
+  "i18n": {
+    "ru-RU": {
+      "appName": "Codex"
+    },
+    "en-US": {
+      "appName": "Codex"
+    }
+  },
+  "defaultLanguage": "ru-RU"
+}
