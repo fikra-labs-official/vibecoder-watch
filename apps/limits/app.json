@@ -5,8 +5,8 @@
     "appName": "Лимиты",
     "appType": "app",
     "version": {
-      "code": 5,
-      "name": "0.1.4"
+      "code": 6,
+      "name": "0.1.5"
     },
     "icon": "limits-icon.png",
     "vender": "Fikra Labs",

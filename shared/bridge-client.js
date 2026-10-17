@@ -53,9 +53,34 @@ export function forwardRequest(request, fetchRequest, bridgeURL, deviceToken, pr
     headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + deviceToken },
     body: JSON.stringify({ method: request.method, params: request.params || {} })
   }).then(response => {
-    const body = typeof response.body === 'string' ? JSON.parse(response.body) : response.body
-    if (!body || typeof body.ok !== 'boolean') throw new Error('Invalid bridge reply')
-    if (response.status !== 200) return { ok: false, error: body.error || 'Мост к Mac недоступен' }
+    let body
+    try {
+      body = typeof response.body === 'string' ? JSON.parse(response.body) : response.body
+      if (!body || typeof body.ok !== 'boolean') throw new Error('Invalid bridge reply')
+    } catch (error) {
+      const invalid = new Error('Invalid bridge reply')
+      invalid.code = 'BRIDGE_PROTOCOL'
+      throw invalid
+    }
+    if (response.status !== 200) return {
+      ok: false, error: body.error || 'Мост к Mac недоступен',
+      ...(profile === 'limits' ? { code: 'BRIDGE_HTTP', retryable: response.status >= 500 } : {})
+    }
     return body
   })
+}
+
+// A failed HTTP request does not prove that Tailscale or the Mac is offline.
+// Only the read-only limits page consumes retryable replies; agent commands do not retry.
+export function forwardLimitsRequest(request, fetchRequest, bridgeURL, deviceToken) {
+  return Promise.resolve().then(() => forwardRequest(request, fetchRequest, bridgeURL, deviceToken, 'limits'))
+    .catch(error => {
+      const malformed = error && error.code === 'BRIDGE_PROTOCOL'
+      return {
+        ok: false,
+        code: malformed ? 'BRIDGE_PROTOCOL' : 'BRIDGE_TRANSPORT',
+        retryable: !malformed,
+        error: malformed ? 'Mac прислал некорректный ответ' : 'Телефон не получил ответ Mac'
+      }
+    })
 }

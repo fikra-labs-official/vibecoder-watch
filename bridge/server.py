@@ -22,7 +22,7 @@ from urllib.request import Request, urlopen
 from lexicon import compile_rules, normalize
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "0.7.12"
+VERSION = "0.7.13"
 ID = re.compile(r"^[0-9]{1,16}-[0-9]{1,8}$")
 MAX_AUDIO = 8 * 1024 * 1024
 MAX_TEXT_CHARS = 30_000

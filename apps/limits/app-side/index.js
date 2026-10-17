@@ -1,6 +1,6 @@
 import { BaseSideService } from '@zeppos/zml/base-side'
 import { bridgeURL, deviceToken } from './connection'
-import { forwardRequest, resolveConnection } from '../shared/bridge-client'
+import { forwardLimitsRequest, resolveConnection } from '../shared/bridge-client'
 
 AppSideService(BaseSideService({
   onInit() {
@@ -12,11 +12,7 @@ AppSideService(BaseSideService({
       respond(null, { ok: false, error: 'Открой Zepp → настройки приложения «Лимиты» и введи адрес моста и ключ' })
       return
     }
-    forwardRequest(request, options => this.fetch(options), connection.url, connection.token, 'limits')
+    forwardLimitsRequest(request, options => this.fetch(options), connection.url, connection.token)
       .then(result => respond(null, result))
-      .catch(() => respond(null, {
-        ok: false,
-        error: 'Нет связи с Mac. Проверьте Tailscale и оставьте Mac включённым.'
-      }))
   }
 }))
