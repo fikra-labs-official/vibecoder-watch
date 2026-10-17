@@ -30,6 +30,51 @@ const LEGACY_COLORS = { background: 0x0b0b0c, gold: 0xeac477, text: 0xf4eee3,
 function clockText(seconds) {
   return `${Math.floor(seconds / 60).toString().padStart(2, '0')}:${(seconds % 60).toString().padStart(2, '0')}`
 }
+function reviewRows(value, width, textSize) {
+  const glyphs = Array.from(value)
+  const widths = new Map()
+  let marks
+  try { marks = new RegExp('\\p{Mark}', 'u') }
+  catch (error) { marks = /[\u0300-\u036f\u0610-\u061a\u064b-\u065f\u0670\u06d6-\u06ed\u093a-\u094f\u1ab0-\u1aff\u1dc0-\u1dff\u20d0-\u20ff\ufe20-\ufe2f]/u }
+  const joinsPrevious = glyph => marks.test(glyph) || /[\u200d\ufe00-\ufe0f]/u.test(glyph) ||
+    (glyph.codePointAt(0) >= 0x1f3fb && glyph.codePointAt(0) <= 0x1f3ff)
+  const regional = glyph => glyph && glyph.codePointAt(0) >= 0x1f1e6 && glyph.codePointAt(0) <= 0x1f1ff
+  const glyphWidth = glyph => {
+    if (joinsPrevious(glyph)) return 0
+    if (widths.has(glyph)) return widths.get(glyph)
+    let measured = 0
+    try {
+      const layout = getTextLayout(glyph, { text_size: textSize, text_width: 0, wrapped: 0 })
+      if (layout && layout.result !== -1 && layout.width > 0 && layout.width <= textSize * 2) measured = layout.width
+    } catch (error) {}
+    const fallback = textSize * (/\s/u.test(glyph) ? 0.4 : /[MWmwЖШЩЮФжшщюф]|[^\u0000-\u052f]/u.test(glyph) ? 1.05 : 0.68)
+    const result = Math.max(measured, fallback) + 0.5
+    widths.set(glyph, result)
+    return result
+  }
+  const rows = []
+  let index = 0, offset = 0
+  while (index < glyphs.length) {
+    let end = index, used = 0, wordEnd = -1, regionalRun = 0
+    while (end < glyphs.length && glyphs[end] !== '\n') {
+      const next = glyphWidth(glyphs[end])
+      const joined = end > index && (glyphs[end - 1] === '\u200d' || joinsPrevious(glyphs[end]) ||
+        (regional(glyphs[end]) && regionalRun % 2 === 1))
+      if (end > index && used + next > width && !joined) break
+      used += next
+      regionalRun = regional(glyphs[end]) ? regionalRun + 1 : 0
+      end++
+      if (/\s/u.test(glyphs[end - 1])) wordEnd = end
+    }
+    if (end < glyphs.length && glyphs[end] !== '\n' && wordEnd > index + (end - index) / 2) end = wordEnd
+    const text = glyphs.slice(index, end).join('')
+    const separator = glyphs[end] === '\n' ? '\n' : ''
+    rows.push({ text, display: text.trim() ? text : '↵', start: offset, end: offset + text.length, separator })
+    offset += text.length + separator.length
+    index = end + separator.length
+  }
+  return rows
+}
 function pagesFor(value, width, px, height = 146) {
   const characters = Array.from(String(value || ''))
   if (!characters.length) return ['']
@@ -102,6 +147,8 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
     this.pageSource = null
     this.textPages = ['']
     this.textPage = 0
+    this.reviewSource = null
+    this.reviewRows = []
     this.keyboardOpen = false
     this.keyboardGeneration = 0
     this.heroFrame = null
@@ -262,6 +309,30 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
             ? this.openMusafirReport() : this.openHistory()
     })
     if (this.menuButton) this.menuButton.setProperty(prop.VISIBLE, false)
+    if (isMusafir) {
+      const footerHeight = Math.max(44, px(54))
+      const editHeight = Math.max(44, px(44))
+      const editY = height - 16 - footerHeight - 10 - editHeight
+      const listY = px(139)
+      const listWidth = width - px(48)
+      this.reviewEditLayout = { x: px(24), y: editY, w: listWidth, h: editHeight }
+      this.reviewTextWidth = listWidth - 24
+      this.reviewTextSize = Math.max(18, px(20))
+      const rowHeight = Math.max(44, px(40))
+      this.reviewScroll = createWidget(widget.SCROLL_LIST, {
+        x: px(24), y: listY, w: listWidth, h: editY - listY - 10,
+        item_space: 0, snap_to_center: false, item_enable_horizon_drag: false,
+        item_config: [{
+          type_id: 1, item_height: rowHeight, item_bg_color: COLORS.background, item_bg_radius: 0,
+          text_view: [{ x: 6, y: 0, w: this.reviewTextWidth, h: rowHeight,
+            key: 'display', color: COLORS.text, text_size: this.reviewTextSize, action: true }],
+          text_view_count: 1
+        }],
+        item_config_count: 1, data_array: [{ display: '' }], data_count: 1,
+        item_click_func: (_list, index) => this.editReviewRow(index)
+      })
+      this.reviewScroll.setProperty(prop.VISIBLE, false)
+    }
     this.hideNavigation()
     this.setButtons(null, null)
     this.registerInteraction()
@@ -432,6 +503,35 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
     const state = this.client.getState()
     if (state.phase !== 'review') return
     this.openKeyboard(state.text, value => this.client.updateReviewText(value))
+  },
+
+  editReviewRow(index) {
+    if (this.closed || this.keyboardOpen || !this.client) return
+    const state = this.client.getState()
+    const row = this.reviewRows[index]
+    if (state.phase !== 'review' || !row || state.text !== this.reviewSource) return
+    const original = state.text
+    this.openKeyboard(original.slice(row.start, row.end), value => {
+      const current = this.client.getState()
+      if (current.phase !== 'review' || current.text !== original) throw new Error('Текст изменился. Откройте строку заново.')
+      this.reviewKeepPosition = true
+      try { this.client.updateReviewText(original.slice(0, row.start) + value + original.slice(row.end)) }
+      finally { this.reviewKeepPosition = false }
+    })
+  },
+
+  showReviewText(text) {
+    if (text !== this.reviewSource) {
+      this.reviewSource = text
+      this.reviewRows = reviewRows(text, this.reviewTextWidth, this.reviewTextSize)
+      this.reviewScroll.setProperty(prop.UPDATE_DATA, {
+        data_array: this.reviewRows, data_count: this.reviewRows.length, on_page: this.reviewKeepPosition ? 1 : 0
+      })
+    }
+    this.reviewScroll.setProperty(prop.VISIBLE, true)
+    this.bodyWidget.setProperty(prop.VISIBLE, false)
+    this.hideNavigation()
+    this.editButton.setProperty(prop.MORE, { ...this.reviewEditLayout, text: 'Править весь текст' })
   },
 
   writeTask() {
@@ -1045,7 +1145,17 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
     })
     this.pageWidget.setProperty(prop.MORE, { y: navigationY, h: px(38) })
     this.editButton.setProperty(prop.VISIBLE, review)
-    this.setBody(body, reader, review || reportButton || stopApproval ? 108 : 146)
+    if (isMusafir && review) {
+      this.showReviewText(state.text)
+      if (!state.error) this.stageWidget.setProperty(prop.TEXT, 'Листайте · нажмите строку для правки')
+    } else {
+      if (this.reviewScroll) {
+        this.reviewScroll.setProperty(prop.VISIBLE, false)
+        this.reviewSource = null
+      }
+      this.bodyWidget.setProperty(prop.VISIBLE, true)
+      this.setBody(body, reader, review || reportButton || stopApproval ? 108 : 146)
+    }
     this.setButtons(primary, secondary)
     if (active) this.animate()
     if (changed) console.log(`[${logName}] watch state: ${state.phase}`)

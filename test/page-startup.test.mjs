@@ -85,23 +85,25 @@ export function pageFixture({ media = () => { throw Error('recorder unavailable'
       const element = {
       kind,
       options: { ...options, visible: true },
+      updates: [],
       setProperty(key, value) {
+        this.updates.push({ key, value })
         if (kind === 3 && key === 'text') throw new Error('BUTTON prop.TEXT is invalid on native Zepp OS')
         if (kind === 3 && key === 'more') {
           for (const required of ['x', 'y', 'w', 'h', 'text']) {
             assert.ok(Object.hasOwn(value, required), `BUTTON prop.MORE requires ${required}`)
           }
         }
-        if (key === 'more') Object.assign(this.options, value)
+        if (key === 'more' || key === 'update-data') Object.assign(this.options, value)
         else this.options[key] = value
       }
       }
       widgets.push(element)
       return element
     },
-    widget: { FILL_RECT: 1, TEXT: 2, BUTTON: 3, IMG: 4 },
+    widget: { FILL_RECT: 1, TEXT: 2, BUTTON: 3, IMG: 4, SCROLL_LIST: 5 },
     align: { CENTER_H: 1, CENTER_V: 2, LEFT: 3, TOP: 4 }, text_style: { WRAP: 1 },
-    prop: { VISIBLE: 'visible', MORE: 'more', TEXT: 'text', COLOR: 'color' },
+    prop: { VISIBLE: 'visible', MORE: 'more', TEXT: 'text', COLOR: 'color', UPDATE_DATA: 'update-data' },
     getTextLayout: layout || (() => ({ height: 80, width: 300 })),
     mediaId: { RECORDER: 1 }, codec: { OPUS: 1 },
     create() { mediaCalls += 1; return media() },
@@ -1898,4 +1900,118 @@ test('an edited draft and its pending audio cannot be restored into a different 
   assert.equal(storage.get('pending-audio'), JSON.stringify(unaccepted))
   assert.deepEqual(removed, [])
   third.page.onDestroy()
+})
+
+test('Musafir review scroll preserves the full text despite underestimated native multiline height', async () => {
+  for (const [width, height] of [[432, 514], [390, 450], [390, 400]]) {
+    const f = pageFixture({ chats: true, storage: new Map([[MUSAFIR_CONTEXT_KEY, JSON.stringify({ target: 'musafir', chatId: null, mode: 'task', jobId: null, openJob: false })]]), width, height,
+      layout: text => ({ result: 0, height: 1, width: Array.from(text).length * 14 }) })
+    f.page.build(); await flush()
+    const text = '  Первые слова для проверки.\n\n' + 'Длинное сообщение на часах без пропущенных слов. '.repeat(45) + '\nПоследняя строка 🙂'
+    f.page.client.createTypedReview(text)
+    const rows = f.page.reviewRows
+    assert.equal(rows.map(row => row.text + row.separator).join(''), text)
+    assert.ok(rows.length > 40)
+    for (const row of rows) assert.equal(text.slice(row.start, row.end), row.text)
+    assert.ok(rows.some(row => row.text === '' && row.display === '↵'))
+    assert.equal(f.page.reviewScroll.options.visible, true)
+    assert.equal(f.page.bodyWidget.options.visible, false)
+    assert.equal(f.page.nextButton.options.visible, false)
+    const list = f.page.reviewScroll.options, edit = f.page.editButton.options, send = f.page.primaryButton.options
+    assert.ok(list.y + list.h + 8 <= edit.y)
+    assert.ok(edit.y + edit.h + 8 <= send.y)
+    assert.ok(send.y + send.h <= height - 14)
+    assert.ok(list.item_config[0].item_height >= 44)
+    assert.equal(list.item_enable_horizon_drag, false)
+    const updates = f.page.reviewScroll.updates.filter(update => update.key === 'update-data').length
+    f.page.render(f.page.client.getState())
+    assert.equal(f.page.reviewScroll.updates.filter(update => update.key === 'update-data').length, updates,
+      'unchanged review must not reset the native scroll position')
+    f.page.editTranscript(); assert.equal(f.keyboard().text, text); f.keyboard().onCancel()
+    assert.equal(f.requests.length, 0)
+    f.page.discardReview()
+    assert.equal(f.page.reviewScroll.options.visible, false)
+    assert.equal(f.page.bodyWidget.options.visible, true)
+    f.page.onDestroy()
+  }
+})
+
+test('Musafir tap-to-edit changes exactly one UTF-16 span and keeps separators and unsent state', async () => {
+  const f = pageFixture({ chats: true, storage: new Map([[MUSAFIR_CONTEXT_KEY, JSON.stringify({ target: 'musafir', chatId: null, mode: 'task', jobId: null, openJob: false })]]) })
+  f.page.build(); await flush()
+  const text = '🙂 Первая строка\n\nТретья строка\nКонец'
+  f.page.client.createTypedReview(text)
+  const row = f.page.reviewRows.find(value => value.text.includes('Третья'))
+  const index = f.page.reviewRows.indexOf(row)
+  f.page.reviewScroll.options.item_click_func(null, index, 'display')
+  assert.equal(f.keyboard().text, row.text)
+  const replacement = '  Исправлено 🕌  '
+  f.keyboard().onComplete(null, { data: replacement })
+  const expected = text.slice(0, row.start) + replacement + text.slice(row.end)
+  assert.equal(f.page.client.getState().text, expected)
+  assert.equal(JSON.parse(f.storage.get(f.page.draftStorageKey)).text, expected)
+  assert.equal(f.page.reviewRows.map(value => value.text + value.separator).join(''), expected)
+  assert.equal(f.page.reviewScroll.options.on_page, 1, 'fragment edit retains approximate scroll position')
+  assert.equal(f.requests.length, 0)
+  const blank = f.page.reviewRows.findIndex(value => value.text === '')
+  f.page.editReviewRow(blank)
+  assert.equal(f.keyboard().text, '', 'placeholder must never enter the editable text')
+  f.keyboard().onCancel()
+  assert.equal(f.page.client.getState().text, expected)
+  f.page.editReviewRow(0)
+  const pending = f.keyboard()
+  f.page.client.updateReviewText('Другой локальный черновик')
+  pending.onComplete(null, { data: 'Запоздалая правка' })
+  assert.equal(f.page.client.getState().text, 'Другой локальный черновик')
+  assert.match(f.page.stageWidget.options.text, /Текст изменился/)
+  f.page.editReviewRow(0)
+  const destroyed = f.keyboard()
+  f.page.onDestroy()
+  destroyed.onComplete(null, { data: 'Правка после закрытия' })
+  assert.equal(JSON.parse(f.storage.get(f.page.draftStorageKey)).text, 'Другой локальный черновик')
+})
+
+test('Musafir scroll accepts 30000 Unicode codepoints with bounded glyph measurements and intact graphemes', async () => {
+  let measurements = 0
+  const f = pageFixture({ chats: true, storage: new Map([[MUSAFIR_CONTEXT_KEY, JSON.stringify({ target: 'musafir', chatId: null, mode: 'task', jobId: null, openJob: false })]]), layout: text => {
+    measurements++
+    return { result: 0, height: 1, width: Array.from(text).length * 12 }
+  } })
+  f.page.build(); await flush()
+  const text = Array.from(('Русский текст е\u0301 👨‍👩‍👧‍👦 汉字\n\n').repeat(1600)).slice(0, 30000).join('')
+  assert.equal(Array.from(text).length, 30000)
+  const before = measurements
+  f.page.client.createTypedReview(text)
+  assert.equal(f.page.reviewRows.map(row => row.text + row.separator).join(''), text)
+  assert.ok(f.page.reviewRows.length < 5000)
+  assert.ok(measurements - before <= new Set(Array.from(text)).size, 'glyph metrics are cached per review')
+  for (const row of f.page.reviewRows) {
+    assert.doesNotMatch(row.text, /[\ud800-\udbff]$/u)
+    assert.doesNotMatch(row.text, /^[\udc00-\udfff\u0301\u200d]/u)
+    assert.doesNotMatch(row.text, /\u200d$/u)
+  }
+  assert.equal(f.requests.length, 0)
+  assert.equal(f.gesture(), true)
+  assert.equal(f.replacements.at(-1).url, 'page/index')
+  assert.equal(JSON.parse(f.storage.get(f.page.draftStorageKey)).text, text)
+  f.page.onDestroy()
+})
+
+test('Musafir row boundaries keep skin tones, flag pairs and spacing marks with their base', async () => {
+  const f = pageFixture({ chats: true, storage: new Map([[MUSAFIR_CONTEXT_KEY, JSON.stringify({
+    target: 'musafir', chatId: null, mode: 'task', jobId: null, openJob: false
+  })]]) })
+  f.page.build(); await flush()
+  for (let prefix = 0; prefix < 36; prefix++) {
+    const text = 'W'.repeat(prefix) + '👍🏽 🇪🇬 🇷🇺 का конец'
+    if (prefix === 0) f.page.client.createTypedReview(text)
+    else f.page.client.updateReviewText(text)
+    assert.equal(f.page.reviewRows.map(row => row.text + row.separator).join(''), text)
+    for (const row of f.page.reviewRows) {
+      if (row.text.includes('👍')) assert.ok(row.text.includes('👍🏽'))
+      assert.doesNotMatch(row.text, /^[🏽ा]/u)
+      assert.equal(Array.from(row.text).filter(c => c.codePointAt(0) >= 0x1f1e6 && c.codePointAt(0) <= 0x1f1ff).length % 2, 0)
+    }
+  }
+  f.page.onDestroy()
 })

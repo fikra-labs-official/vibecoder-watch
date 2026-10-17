@@ -234,6 +234,7 @@ function applyWidget(record) {
   if (type === widget.SCROLL_LIST) {
     if (record.renderedData === options.data_array) return
     record.renderedData = options.data_array
+    const scrollTop = options.on_page === 1 ? node.scrollTop : 0
     node.replaceChildren()
     for (let index = 0; index < (options.data_count || 0); index++) {
       const data = options.data_array[index]
@@ -264,6 +265,7 @@ function applyWidget(record) {
       }
       node.append(item)
     }
+    node.scrollTop = scrollTop
   }
 }
 

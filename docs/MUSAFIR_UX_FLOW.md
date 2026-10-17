@@ -68,3 +68,16 @@ including cancel/destroy/reopen races, typed input, late replies, exact return
 destinations, five selectable heroes and all three screen geometries. Browser
 inspection uses synthetic tasks and never sends a real command to the owner's
 agent. Physical touch, keyboard and BLE acceptance still require the watch.
+
+## 0.10.1 review scrolling
+
+The review uses a fixed native SCROLL_LIST viewport above Edit/Send/Cancel, with
+width-safe single-line rows instead of paginating a fixed-height wrapped TEXT.
+The original text remains authoritative. Row ranges are UTF-16 spans excluding
+newline delimiters; a fragment edit is accepted only while the entire captured
+review still matches. Empty-line display markers never enter the editor or text.
+Same-text rerenders do not update list data. Fragment replacement retains the
+approximate list position; full replacement resets it. All edits remain local
+until Send. The API 2 list contract is used without API 4 scroll-bar requirements.
+Physical scrolling, tap-versus-drag and native keyboard behavior still require
+device acceptance.
