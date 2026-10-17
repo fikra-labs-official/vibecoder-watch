@@ -15,6 +15,10 @@ export function createAgentVoiceRoute({ request, context, save = () => {}, prefi
       sessionId: typeof job.sessionId === 'string' && job.sessionId ? job.sessionId : context.sessionId || null })
     const publicJob = { ok: true, id: context.aliasId, state: job.state, result: job.result || '',
       text: '', error: job.error || '' }
+    if (job.state === 'error' && job.error === 'Остановлено с часов') {
+      publicJob.state = 'cancelled'
+      publicJob.result = job.error
+    }
     if (job.state === 'night') {
       // Waiting for the night shift: the shared recorder shows it as a finished answer with the waiting note.
       publicJob.state = 'completed'
@@ -29,20 +33,8 @@ export function createAgentVoiceRoute({ request, context, save = () => {}, prefi
         Object.assign(publicJob.approval, { question: approval.question, options: approval.options, step: approval.step })
       }
     }
-    let cursor = job.nextCursor
-    let length = Array.from(publicJob.result).length
-    const seen = new Set()
-    while (job.state === 'completed' && cursor != null) {
-      if (options && typeof options.onRouteProgress === 'function') options.onRouteProgress()
-      if (seen.has(cursor) || seen.size >= 128 || length > 100000) throw new Error('Ответ слишком большой. Полный текст сохранён на Mac.')
-      seen.add(cursor)
-      const page = await request({ method: prefix + '_JOB', params: { id: job.id, cursor } }, options)
-      if (!page || !page.ok || !page.job || page.job.id !== job.id) throw new Error('Не удалось получить продолжение ответа')
-      publicJob.result += page.job.result || ''
-      length += Array.from(page.job.result || '').length
-      if (length > 100000) throw new Error('Ответ слишком большой. Полный текст сохранён на Mac.')
-      cursor = page.job.nextCursor
-    }
+    // The first result renders immediately; the full reader streams history chunks.
+    publicJob.reportLength = Number.isInteger(job.resultLength) ? job.resultLength : Array.from(publicJob.result).length
     return publicJob
   }
   return async function route(payload, options) {
@@ -57,6 +49,7 @@ export function createAgentVoiceRoute({ request, context, save = () => {}, prefi
       return { ok: true, id: params.id, state: 'completed', result: reply.message || 'Дозор поставлен', text: '', error: '' }
     }
     if (method === 'LATEST_JOB') {
+      if (context.startFresh === true && !context.pendingSend) return { ok: true, job: null }
       const pendingId = context.pendingSend === true && context.aliasId
       const resumeId = context.resumeJob === true && context.jobId
       const exactId = pendingId || resumeId
@@ -69,7 +62,7 @@ export function createAgentVoiceRoute({ request, context, save = () => {}, prefi
       return job && job.ok ? { ok: true, job: job.job === null ? null : job } : job
     }
     if (method === 'SEND_TEXT') {
-      remember({ aliasId: params.id, pendingSend: true })
+      remember({ aliasId: params.id, pendingSend: true, startFresh: false })
       const sendParams = { id: params.id, textId: params.textId || params.id, project: context.project, mode: context.mode || 'auto' }
       if (context.sessionId) sendParams.sessionId = context.sessionId
       if (context.night === true) sendParams.night = true
@@ -78,7 +71,9 @@ export function createAgentVoiceRoute({ request, context, save = () => {}, prefi
         sendParams.kind = context.kind
         if (context.kind === 'research' && context.both === true) sendParams.both = true  // the bridge mirrors the topic to the other agent
       }
-      return jobReply(await request({ method: prefix + '_SEND', params: sendParams }, options), params.id, options)
+      const reply = await request({ method: prefix + '_SEND', params: sendParams }, options)
+      if (reply && !reply.ok && reply.retryable === false) remember({ pendingSend: false, startFresh: true })
+      return jobReply(reply, params.id, options)
     }
     if (method === 'JOB_STATUS') {
       const id = context.pendingSend === true && context.aliasId ? context.aliasId : context.jobId || params.id

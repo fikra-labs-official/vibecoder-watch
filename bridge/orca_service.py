@@ -135,6 +135,7 @@ class OrcaService:
         self.quick_commands = normalize_quick_commands(quick_commands)
         self.lock = threading.RLock()
         self._rpc_local = threading.local()
+        self.dispatching = set()
         self.db = sqlite3.connect(self.state / "orca.sqlite3", check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.executescript("""
@@ -612,14 +613,20 @@ class OrcaService:
                 type(limit) is not int or not 1 <= limit <= 600):
             raise ValueError("Некорректная история")
         row = self._job(job_id)
+        with self.lock:
+            pair = self.db.execute("SELECT project_label FROM pairs WHERE id=?", (row["pair_id"],)).fetchone()
+        if not pair or not pair["project_label"]:
+            raise ValueError("Связка задачи не найдена")
         content = row["source_text"] if field == "text" else (row["result"] or row["error"] or row["summary"] or "")
         if offset > len(content):
             raise ValueError("Страница за пределами истории")
         page = content[offset:offset + limit]
+        context = {"target": "orca", "pairId": row["pair_id"], "label": pair["project_label"],
+                   "jobId": row["id"], "resumeJob": True, "autoRecord": False}
         return {"ok": True, "id": job_id, "field": field, "content": page, "total": len(content),
                 "offset": offset, "complete": offset + len(page) == len(content),
                 "created": row["created"], "state": self._public_state(row["state"]),
-                "deleted": row["deleted_at"] is not None}
+                "deleted": row["deleted_at"] is not None, "context": context}
 
     def _history_set_deleted(self, params):
         self._only(params, "id", "deleted")
@@ -675,6 +682,7 @@ class OrcaService:
             if job["state"] in ("completed", "error", "unknown"):
                 return {"ok": True, "job": self._public_job(job, params)}
             data = json.loads(job["data"])
+            dispatch_inflight = job_id in self.dispatching
             data["stopRequested"] = True
             self.db.execute("UPDATE jobs SET stage='stopping',data=?,updated=? WHERE id=?",
                             (json.dumps(data, ensure_ascii=False, separators=(",", ":")), time.time(), job_id))
@@ -683,8 +691,10 @@ class OrcaService:
         dispatch = data.get("activeDispatch")
         if dispatch:
             try:
-                self._mutate(job_id, "worker-abandon", [
-                    "orchestration", "worker-abandon", "--dispatch", dispatch, "--json"])
+                abandoned = self._mutate(job_id, "worker-abandon", [
+                    "orchestration", "worker-abandon", "--dispatch", dispatch, "--json"], timeout=2)
+                if abandoned.get("abandoned") is not True:
+                    raise CliFailure("Orca не подтвердила остановку dispatch")
             except Exception as exc:
                 notes.append("dispatch не отгорожен: " + str(exc)[:80])
             try:
@@ -692,16 +702,40 @@ class OrcaService:
                 worker = data.get("activeRole") == "worker"
                 handle = pair["worker_id"] if worker else pair["reviewer_id"]
                 expected = pair["worker_incarnation"] if worker else pair["reviewer_incarnation"]
-                term = self._terminal(handle, pair["workspace_id"], require_idle=False)
+                term = self._terminal(handle, pair["workspace_id"], require_idle=False,
+                                      check_idle=False, read_timeout=2)
                 if term["incarnationId"] != expected:
                     raise ValueError("сессия агента сменилась")
-                self._mutate(job_id, "interrupt", [
-                    "terminal", "send", "--terminal", handle, "--interrupt", "--json"])
+                interrupted = self._mutate(job_id, "interrupt", [
+                    "terminal", "send", "--terminal", handle, "--interrupt", "--json"], timeout=2)
+                sent = interrupted.get("send", interrupted)
+                if not isinstance(sent, dict) or sent.get("accepted") is not True:
+                    raise CliFailure("Orca не подтвердила прерывание агента")
+                verified, _ = self._read_call([
+                    "terminal", "wait", "--terminal", handle, "--for", "tui-idle",
+                    "--timeout-ms", "1000", "--json"], timeout=2, allow_timeout=True)
+                wait = verified.get("wait", verified) if isinstance(verified, dict) else {}
+                if not isinstance(wait, dict) or wait.get("satisfied") is not True:
+                    raise CliFailure("агент всё ещё активен после прерывания", code="stop_unconfirmed")
             except Exception as exc:
                 notes.append("агент не прерван: " + str(exc)[:80])
-        message = "Остановлено с часов" + ("; " + "; ".join(notes) if notes else "")
-        self._save(job_id, state="error", stage="stopped", summary="Остановлено с часов",
-                   error=message[:1000], data=data)
+        else:
+            with self.lock:
+                worker_start = self.db.execute(
+                    "SELECT 1 FROM operations WHERE job_id=? AND kind='worker-start' LIMIT 1",
+                    (job_id,)).fetchone()
+            safe_without_dispatch = (job["stage"] in (
+                "queued", "coordinator_starting", "dispatch_ready", "paused") and
+                not dispatch_inflight and worker_start is None)
+            if not safe_without_dispatch:
+                notes.append("запуск агента мог начаться до сохранения dispatch ID")
+        if notes:
+            self._save(job_id, state="unknown", stage="stop_unconfirmed",
+                       summary="Остановка не подтверждена",
+                       error=("Остановка не подтверждена: " + "; ".join(notes))[:1000], data=data)
+        else:
+            self._save(job_id, state="error", stage="stopped", summary="Остановлено с часов",
+                       error="Остановлено с часов", data=data)
         self.wake.set()
         return {"ok": True, "job": self._public_job(self._job(job_id), params)}
 
@@ -773,30 +807,44 @@ class OrcaService:
             self._poll(job_id)
 
     def _dispatch(self, job_id, role, kind, data):
-        job, pair = self._job(job_id), self._pair(self._job(job_id)["pair_id"])
-        self._verify_pair(pair, require_idle=True, role=role)
-        round_no = int(data.get("round", 0))
-        folder = self.tasks / job_id
-        folder.mkdir(exist_ok=True, mode=0o700)
-        report = folder / f"{role}-{round_no}-{uuid.uuid4().hex[:8]}.json"
-        prompt = self._prompt(job, data, role, kind, report)
-        terminal = pair["reviewer_id"] if role == "reviewer" else pair["worker_id"]
-        receipt = self._mutate(job_id, "worker-start", [
-            "orchestration", "worker-start", "--spec", prompt,
-            "--worktree", "id:" + pair["workspace_id"], "--terminal", terminal,
-            "--run", data["runId"], "--from", data["coordinatorId"],
-            "--timeout-ms", "15000", "--json"])
-        dispatch_id = _find(receipt, "dispatchId") or _find(receipt.get("dispatch", {}), "id")
-        task_id = _find(receipt, "taskId") or _find(receipt.get("task", {}), "id")
-        if not dispatch_id or not task_id:
-            raise CliFailure("Orca не вернула точные Task/Dispatch ID")
-        data.update({"activeDispatch": dispatch_id, "activeTask": task_id or "",
-                     "activeRole": role, "reportPath": str(report)})
-        stage = "worker_working" if role == "worker" else (
-            "reviewer_checking" if kind == "review" else "reviewer_working")
-        self._save(job_id, stage=stage, data=data,
-                   summary="Боевой работает" if role == "worker" else "Проверяющий проверяет")
-        self.wake.set()
+        with self.lock:
+            job = self._job(job_id)
+            if job["state"] != "running" or job["stage"] in (
+                    "stopping", "stopped", "stop_unconfirmed"):
+                return
+            self.dispatching.add(job_id)
+        try:
+            pair = self._pair(job["pair_id"])
+            self._verify_pair(pair, require_idle=True, role=role)
+            round_no = int(data.get("round", 0))
+            folder = self.tasks / job_id
+            folder.mkdir(exist_ok=True, mode=0o700)
+            report = folder / f"{role}-{round_no}-{uuid.uuid4().hex[:8]}.json"
+            prompt = self._prompt(job, data, role, kind, report)
+            terminal = pair["reviewer_id"] if role == "reviewer" else pair["worker_id"]
+            with self.lock:
+                current = self._job(job_id)
+                if current["stage"] in ("stopping", "stopped", "stop_unconfirmed"):
+                    return
+            receipt = self._mutate(job_id, "worker-start", [
+                "orchestration", "worker-start", "--spec", prompt,
+                "--worktree", "id:" + pair["workspace_id"], "--terminal", terminal,
+                "--run", data["runId"], "--from", data["coordinatorId"],
+                "--timeout-ms", "15000", "--json"])
+            dispatch_id = _find(receipt, "dispatchId") or _find(receipt.get("dispatch", {}), "id")
+            task_id = _find(receipt, "taskId") or _find(receipt.get("task", {}), "id")
+            if not dispatch_id or not task_id:
+                raise CliFailure("Orca не вернула точные Task/Dispatch ID")
+            data.update({"activeDispatch": dispatch_id, "activeTask": task_id or "",
+                         "activeRole": role, "reportPath": str(report)})
+            stage = "worker_working" if role == "worker" else (
+                "reviewer_checking" if kind == "review" else "reviewer_working")
+            self._save(job_id, stage=stage, data=data,
+                       summary="Боевой работает" if role == "worker" else "Проверяющий проверяет")
+            self.wake.set()
+        finally:
+            with self.lock:
+                self.dispatching.discard(job_id)
 
     def _poll(self, job_id):
         job = self._job(job_id)
@@ -1078,8 +1126,9 @@ class OrcaService:
             raise ValueError("Рабочий каталог Orca не найден")
         return value
 
-    def _terminal(self, handle, workspace_id, require_idle):
-        result, meta = self._read_call(["terminal", "show", "--terminal", handle, "--json"], timeout=5)
+    def _terminal(self, handle, workspace_id, require_idle, check_idle=True, read_timeout=5):
+        result, meta = self._read_call(
+            ["terminal", "show", "--terminal", handle, "--json"], timeout=read_timeout)
         term = result.get("terminal", result) if isinstance(result, dict) else {}
         agent = term.get("agentIdentity")
         if (not isinstance(term, dict) or term.get("handle") != handle or
@@ -1087,7 +1136,7 @@ class OrcaService:
                 not term.get("connected") or not term.get("writable") or
                 agent not in ("claude", "codex") or not term.get("incarnationId")):
             raise ValueError("Сессия Orca недоступна или изменила идентичность")
-        idle = self._idle(term)
+        idle = self._idle(term) if check_idle else None
         if require_idle and idle is not True:
             raise ValueError("Сессия Orca занята или её состояние нельзя подтвердить")
         term = dict(term)
@@ -1243,7 +1292,7 @@ class OrcaService:
         result = value.get("result", value)
         return (result if isinstance(result, dict) else {"value": result}), meta
 
-    def _mutate(self, job_id, kind, argv):
+    def _mutate(self, job_id, kind, argv, timeout=20):
         request_id = "watch_" + uuid.uuid4().hex
         call_argv = list(argv)
         # This is a first submission. Orca assigns the recovery UUID; our local
@@ -1260,7 +1309,7 @@ class OrcaService:
                             (time.time(), request_id))
             self.db.commit()
         try:
-            result, _ = self._call(call_argv, timeout=20)
+            result, _ = self._call(call_argv, timeout=timeout)
         except Exception as exc:
             state = "unknown" if isinstance(exc, CliFailure) and exc.uncertain else "rejected"
             with self.lock:
@@ -1287,10 +1336,11 @@ class OrcaService:
         if not set(changes) <= allowed:
             raise TypeError("invalid job field")
         with self.lock:
-            if "state" in changes and changes.get("stage") != "stopped":
-                stage = self.db.execute("SELECT stage FROM jobs WHERE id=?", (job_id,)).fetchone()
-                if stage and stage[0] in ("stopping", "stopped"):
-                    return  # an owner stop is final; late settlements or failures cannot reopen it
+            final_stop_stages = ("stopped", "stop_unconfirmed")
+            stage = self.db.execute("SELECT stage FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if (stage and stage[0] in ("stopping", *final_stop_stages) and
+                    changes.get("stage") not in final_stop_stages):
+                return  # an owner stop is final; no late callback may mutate the stopped record
             sql = ",".join(f"{key}=?" for key in changes)
             self.db.execute(f"UPDATE jobs SET {sql} WHERE id=?", (*changes.values(), job_id))
             self.db.commit()
@@ -1301,7 +1351,7 @@ class OrcaService:
         """Owner notification for one durable transition; never breaks the coordinator."""
         try:
             job = self._job(job_id)
-            if job["stage"] == "stopped":
+            if job["stage"] in ("stopped", "stop_unconfirmed"):
                 return  # the owner stopped it from the watch; nothing to announce
             with self.lock:
                 pair = self.db.execute("SELECT project_label FROM pairs WHERE id=?", (job["pair_id"],)).fetchone()

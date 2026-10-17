@@ -38,6 +38,28 @@ class FakeProcess:
         self.done.set()
 
 
+class KillFallbackProcess(FakeProcess):
+    def __init__(self, kill_stops=True):
+        super().__init__(hang=True)
+        self.kill_stops = kill_stops
+        self.wait_calls = 0
+
+    def terminate(self):
+        self.terminated = True
+
+    def kill(self):
+        self.killed = True
+        if self.kill_stops:
+            self.returncode = -9
+            self.done.set()
+
+    def wait(self, timeout=None):
+        self.wait_calls += 1
+        if self.done.is_set():
+            return self.returncode
+        raise subprocess.TimeoutExpired("claude", timeout)
+
+
 def at(day, hour, minute=0):
     return time.mktime((2026, 9, day, hour, minute, 0, 0, 0, -1))
 
@@ -217,6 +239,28 @@ class ClaudeServiceTests(unittest.TestCase):
         release.set()
         self.assertEqual(self.wait("9-4")["state"], "completed")
 
+    def test_stop_during_spawn_is_unknown_until_the_late_process_is_terminated(self):
+        entered, release = threading.Event(), threading.Event()
+        process = FakeProcess(hang=True)
+        def slow_runner(argv, cwd, env):
+            entered.set()
+            release.wait(2)
+            return process
+        self.service.runner = slow_runner
+        self.service.rpc("CLAUDE_SEND", {
+            "id": "9-5", "textId": "9-5", "project": str(self.crm)}, lambda _: "Задача")
+        self.assertTrue(entered.wait(1))
+        stopped = self.service.rpc("CLAUDE_STOP", {"id": "9-5"})["job"]
+        self.assertEqual(stopped["state"], "unknown")
+        self.assertNotEqual(stopped["error"], "Остановлено с часов")
+        release.set()
+        for _ in range(200):
+            if self.service._job("9-5")["error"] == "Остановлено с часов":
+                break
+            time.sleep(0.005)
+        self.assertTrue(process.terminated)
+        self.assertEqual(self.service._job("9-5")["error"], "Остановлено с часов")
+
     def test_failures_are_errors_and_stop_terminates_the_child(self):
         self.process = FakeProcess(result_json("Не могу: нет доступа", is_error=True), returncode=1)
         self.service.rpc("CLAUDE_SEND", {"id": "2-1", "textId": "2-1", "project": str(self.shop)}, lambda _: "x")
@@ -245,6 +289,56 @@ class ClaudeServiceTests(unittest.TestCase):
         self.assertEqual(self.wait("2-4")["error"], "Остановлено с часов")
         self.assertEqual(self.service.rpc("CLAUDE_STOP", {"id": "2-4"})["job"]["state"], "error")
         self.assertFalse(any(k == "claude:2-4:error" for k, _ in self.notes))
+
+    def test_stop_kills_after_bounded_wait_and_reports_unconfirmed_kill(self):
+        fallback = KillFallbackProcess()
+        confirmed, reason = self.service._terminate_process(fallback)
+        self.assertTrue(confirmed)
+        self.assertEqual(reason, "")
+        self.assertTrue(fallback.terminated and fallback.killed)
+        self.assertEqual(fallback.wait_calls, 2)
+
+        unkillable = KillFallbackProcess(kill_stops=False)
+        self.process = unkillable
+        self.service.rpc("CLAUDE_SEND", {
+            "id": "2-6", "textId": "2-6", "project": str(self.crm)}, lambda _: "x")
+        for _ in range(200):
+            if "2-6" in self.service.processes:
+                break
+            time.sleep(0.005)
+        stopped = self.service.rpc("CLAUDE_STOP", {"id": "2-6"})["job"]
+        self.assertEqual(stopped["state"], "unknown")
+        self.assertNotEqual(stopped["error"], "Остановлено с часов")
+        self.assertIn("не подтверждено", stopped["error"])
+        self.assertEqual(stopped["result"], stopped["error"])
+        unkillable.done.set()
+
+    def test_running_without_a_process_cannot_report_confirmed_stop(self):
+        process = FakeProcess(hang=True)
+        self.process = process
+        self.service.rpc("CLAUDE_SEND", {
+            "id": "2-7", "textId": "2-7", "project": str(self.crm)}, lambda _: "x")
+        for _ in range(200):
+            if "2-7" in self.service.processes:
+                break
+            time.sleep(0.005)
+        with self.service.lock:
+            self.service.processes.pop("2-7", None)
+        stopped = self.service.rpc("CLAUDE_STOP", {"id": "2-7"})["job"]
+        self.assertEqual(stopped["state"], "unknown")
+        self.assertNotEqual(stopped["error"], "Остановлено с часов")
+        self.assertEqual(stopped["result"], stopped["error"])
+        process.done.set()
+
+    def test_result_persists_beyond_the_watch_reader_cap_without_silent_truncation(self):
+        result = "начало🙂" + "я" * 200_500 + "КОНЕЦ"
+        self.process = FakeProcess(result_json(result))
+        self.service.rpc("CLAUDE_SEND", {"id": "2-9", "textId": "2-9", "project": str(self.crm)}, lambda _: "x")
+        self.assertEqual(self.wait("2-9")["state"], "completed")
+        self.assertEqual(self.service._job("2-9")["result"], result)
+        tail = self.service.rpc("CLAUDE_HISTORY_DETAIL", {
+            "id": "2-9", "field": "result", "offset": len(result) - 5, "limit": 5})
+        self.assertEqual((tail["content"], tail["total"], tail["complete"]), ("КОНЕЦ", len(result), True))
 
     def test_timeout_and_history_with_trash(self):
         self.service.timeout = 30
@@ -407,6 +501,11 @@ class ClaudeServiceTests(unittest.TestCase):
         self.assertTrue(done["result"].startswith("Два вывода.\nТретий вывод.\n\nПолный отчёт"))
         detail = self.service.rpc("CLAUDE_HISTORY_DETAIL", {"id": "6-1", "field": "result"})
         self.assertEqual(detail["content"], report)
+        self.assertEqual(detail["context"], {
+            "target": "claude", "project": str(Path(self.temp.name) / "state" / "research"), "label": "Исследование",
+            "sessionId": "11111111-2222-3333-4444-555555555555", "mode": "auto",
+            "jobId": "6-1", "openJob": True, "resumeJob": True, "autoRecord": False,
+        })
         self.assertEqual(dict(self.notes)["claude:6-1:completed"], "Claude · Исследование\nДва вывода.\nТретий вывод.")
         key, name, data, caption = files[0]
         self.assertEqual(key, "claude:6-1:report")

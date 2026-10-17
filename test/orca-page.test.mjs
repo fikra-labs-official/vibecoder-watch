@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import test from 'node:test'
 import vm from 'node:vm'
+import { textRows } from '../shared/text-rows.js'
 
 const source = fs.readFileSync(new URL('../page/orca.js', import.meta.url), 'utf8')
   .replace(/^import .*$/gm, '')
@@ -10,15 +11,25 @@ const flush = () => new Promise(resolve => setImmediate(resolve))
 function fixture({ width = 390, height = 450, request = async () => ({ ok: true }),
   storage = new Map() } = {}) {
   let page
+  const timers = new Map()
+  let nextTimer = 0
   const widgets = []
   const replacements = []
   const wakeCalls = []
+  const interaction = { gesture: null, key: null, offGesture: 0, offKey: 0 }
   vm.runInNewContext(source, {
     Page(definition) { page = Object.assign(Object.create(definition), definition) },
     BasePage: value => value,
+    setStatusBarVisible() {},
+    setTimeout(callback, delay) { const id = ++nextTimer; timers.set(id, { callback, delay }); return id },
+    clearTimeout(id) { timers.delete(id) },
     getDeviceInfo: () => ({ width, height }),
     replace: value => replacements.push(value),
     setWakeUpRelaunch: value => wakeCalls.push(value),
+    getTextLayout(value, options) {
+      return { result: 0, width: Math.max(1, Array.from(value).length * options.text_size * 0.6), height: options.text_size }
+    },
+    textRows,
     LocalStorage: class {
       getItem(key) { return storage.get(key) }
       setItem(key, value) { storage.set(key, value) }
@@ -26,19 +37,34 @@ function fixture({ width = 390, height = 450, request = async () => ({ ok: true 
     createWidget(kind, options) {
       const item = {
         kind,
+        moreUpdates: 0,
         options: { visible: true, ...options },
         setProperty(property, value) {
-          if (property === 'more') Object.assign(this.options, value)
+          if (kind === 3 && property === 'text') throw new Error('BUTTON prop.TEXT is forbidden')
+          if (kind === 3 && property === 'more') {
+            for (const key of ['x', 'y', 'w', 'h']) {
+              assert.equal(Number.isFinite(value[key]), true, `BUTTON MORE ${key}`)
+            }
+            this.moreUpdates += 1
+          }
+          if (property === 'more' || property === 'update_data') Object.assign(this.options, value)
           else this.options[property] = value
         }
       }
       widgets.push(item)
       return item
     },
-    widget: { FILL_RECT: 1, TEXT: 2, BUTTON: 3 },
+    widget: { FILL_RECT: 1, TEXT: 2, BUTTON: 3, SCROLL_LIST: 4 },
     align: { CENTER_H: 1 },
     text_style: { WRAP: 1 },
-    prop: { TEXT: 'text', VISIBLE: 'visible', MORE: 'more' },
+    prop: { TEXT: 'text', VISIBLE: 'visible', MORE: 'more', UPDATE_DATA: 'update_data' },
+    onGesture(option) { interaction.gesture = option.callback },
+    offGesture() { interaction.offGesture += 1 },
+    GESTURE_RIGHT: 10,
+    onKey(option) { interaction.key = option.callback },
+    offKey() { interaction.offKey += 1 },
+    KEY_BACK: 20,
+    KEY_EVENT_CLICK: 21,
     Date: class extends Date { static now() { return 1700000000000 } },
     console: { log() {} }
   })
@@ -48,7 +74,7 @@ function fixture({ width = 390, height = 450, request = async () => ({ ok: true 
     return request(payload, options)
   }
   page.build()
-  return { page, widgets, replacements, storage, calls, wakeCalls }
+  return { page, widgets, replacements, storage, calls, wakeCalls, interaction, timers }
 }
 
 test('sleep restores the chosen project and pair without creating agents again', () => {
@@ -82,10 +108,11 @@ test('invalid saved navigation returns to the home menu', () => {
 
 test('a late catalog reply cannot replace any newer menu page', async () => {
   let finish
-  const f = fixture({ request: () => new Promise(resolve => { finish = resolve }) })
+  const f = fixture({ request: payload => payload.method === 'SUMMARY' ? Promise.resolve({ ok: true, text: 'На связи' }) : new Promise(resolve => { finish = resolve }) })
   f.page.projects()
   assert.equal(f.page.heading.options.text, 'Orca')
   assert.match(f.page.note.options.text, /Получаю данные/)
+  await flush()
   f.page.project({ id: 'current', projectLabel: 'Текущий', name: 'main' })
   finish({ ok: true, workspaces: [{ id: 'stale', projectLabel: 'Старый', name: 'ответ' }] })
   await flush()
@@ -116,6 +143,10 @@ test('agent catalog follows server cursors without client-side slicing', async (
   await flush()
   assert.deepEqual(JSON.parse(JSON.stringify(f.calls[1].payload.params)), { cursor: 'agents-2', limit: 3 })
   assert.deepEqual(f.page.items.map(item => item.label), ['Седьмой'])
+  f.page.backAction()
+  await flush()
+  assert.deepEqual(JSON.parse(JSON.stringify(f.calls[2].payload.params)), { limit: 3 })
+  assert.deepEqual(f.page.items.map(item => item.label), ['Один', 'Два', 'Три'])
   f.page.onDestroy()
 })
 
@@ -173,7 +204,7 @@ test('Orca menu routes voice to its voice page and top-level menu preserves its 
   const context = { target: 'orca', pairId: 'pair-1', label: 'Проект' }
   f.page.voice(context)
   f.page.home()
-  assert.equal(f.page.backAction, undefined)
+  assert.equal(f.page.backAction, null)
   assert.equal(f.page.back.options.visible, false)
   assert.deepEqual(JSON.parse(JSON.stringify(f.replacements)), [{ url: 'page/voice' }])
   assert.deepEqual(JSON.parse(f.storage.get('voice-destination')), context)
@@ -276,6 +307,10 @@ test('menu layouts stay inside the watch and visible controls do not overlap', (
     const worker = { id: 'worker', title: 'Боевой' }
     const reviewer = { id: 'reviewer', title: 'Проверяющий' }
     f.page.confirmPair(workspace, worker, reviewer)
+    for (const control of [...f.page.rows, f.page.back, f.page.next]) {
+      assert.ok(control.options.h >= 44, `control height must be at least 44 at ${width}x${height}`)
+      assert.ok(control.moreUpdates > 0, `control must receive a full prop.MORE update at ${width}x${height}`)
+    }
     const visible = f.widgets.filter(item => item.kind !== 1 && item.options.visible)
       .map(item => item.options)
     for (let index = 0; index < visible.length; index += 1) {
@@ -376,7 +411,10 @@ test('project menu creates a private GitHub repository only after confirmation',
   f.page.nextAction()
   assert.equal(f.page.items[0].label, 'Репозиторий GitHub')
   f.page.items[0].action()
-  assert.equal(f.page.heading.options.text, 'Приватный репозиторий?')
+  assert.equal(f.page.heading.options.text, 'Приватный GitHub?')
+  assert.equal(f.page.items[0].label, 'Продолжить приватно')
+  assert.match(f.page.note.options.text, /Такси Дубай\nmain/)
+  assert.match(f.page.note.options.text, /приватный репозиторий/)
   assert.equal(f.calls.length, 0)
   f.page.items[0].action(); await flush()
   const call = f.calls.find(c => c.payload.method === 'ORCA_GITHUB_CREATE').payload.params
@@ -394,4 +432,237 @@ test('Orca home note turns into the cross-agent summary line', async () => {
   await flush(); await flush()
   assert.equal(f.page.note.options.text, 'Тишина: агенты свободны')
   f.page.onDestroy()
+})
+
+test('busy terminals cannot be selected', async () => {
+  const workspace = { id: 'workspace', projectLabel: 'Проект', name: 'main' }
+  const busy = { id: 'busy', title: 'Занятый Codex', agent: 'codex', busy: true }
+  const idle = { id: 'idle', title: 'Свободный Claude', agent: 'claude', busy: false }
+  const f = fixture({ request: async ({ method }) => method === 'ORCA_TERMINALS'
+    ? { ok: true, terminals: [busy, idle], nextCursor: null }
+    : { ok: true, text: 'Свободно' } })
+  f.page.terminals(workspace, 'worker')
+  await flush()
+  assert.equal(f.page.items[0].label, 'Занят · Занятый Codex')
+  assert.equal(f.page.items[0].action, null)
+  f.page.rows[0].options.click_func()
+  assert.equal(f.calls.filter(call => call.payload.method === 'ORCA_TERMINALS').length, 1)
+  assert.equal(f.page.heading.options.text, 'Выбери боевого')
+  f.page.rows[1].options.click_func()
+  await flush()
+  assert.equal(f.page.heading.options.text, 'Проверяющий')
+  f.page.onDestroy()
+})
+
+test('wizard Back keeps model and mode choices until the final create request', async () => {
+  const workspace = { id: 'workspace', projectLabel: 'Проект', name: 'main' }
+  const preset = {
+    id: 'pair-preset', label: 'Codex + Claude', workerAgent: 'codex', reviewerAgent: 'claude'
+  }
+  const f = fixture({ request: async ({ method, params }) => {
+    if (method === 'ORCA_MODELS') return { ok: true, nextCursor: null, models: params.agent === 'codex'
+      ? [{ id: 'gpt-one', label: 'GPT one' }, { id: 'gpt-two', label: 'GPT two' }]
+      : [{ id: 'sonnet', label: 'Sonnet' }] }
+    if (method === 'ORCA_MODES') return { ok: true, nextCursor: null, modes: params.agent === 'codex'
+      ? [{ id: 'auto', label: 'Авто' }]
+      : [{ id: 'plan', label: 'План' }] }
+    if (method === 'ORCA_PAIR_CREATE') return { ok: true, operation: { id: params.id, state: 'completed', pair: {
+      id: 'new-pair', projectLabel: 'Проект', workerAgent: 'codex', reviewerAgent: 'claude'
+    } } }
+    if (method === 'SUMMARY') return { ok: true, text: 'Свободно' }
+    throw new Error(method)
+  } })
+
+  f.page.models(workspace, preset, 'worker')
+  await flush()
+  f.page.items.find(item => item.label === 'GPT one').action()
+  await flush()
+  assert.equal(f.page.heading.options.text, 'Модель проверки')
+  f.page.backAction()
+  await flush()
+  assert.equal(f.page.heading.options.text, 'Модель боевого')
+  f.page.items.find(item => item.label === 'GPT two').action()
+  await flush()
+  f.page.items[0].action()
+  assert.equal(f.page.heading.options.text, 'Режим агентов')
+  f.page.backAction()
+  await flush()
+  assert.equal(f.page.heading.options.text, 'Модель проверки')
+  f.page.items[0].action()
+  f.page.items.find(item => item.label === 'Другой режим…').action()
+  await flush()
+  f.page.items[0].action()
+  await flush()
+  assert.equal(f.page.heading.options.text, 'Режим проверки')
+  f.page.backAction()
+  await flush()
+  assert.equal(f.page.heading.options.text, 'Режим боевого')
+  f.page.items[0].action()
+  await flush()
+  f.page.items[0].action()
+  assert.equal(f.page.heading.options.text, 'Открыть связку?')
+  f.page.backAction()
+  await flush()
+  assert.equal(f.page.heading.options.text, 'Режим проверки')
+  f.page.items[0].action()
+  f.page.items[0].action()
+  await flush()
+
+  const create = f.calls.find(call => call.payload.method === 'ORCA_PAIR_CREATE')
+  assert.deepEqual(JSON.parse(JSON.stringify(create.payload.params)), {
+    id: '1700000000000-1', workspaceId: 'workspace', presetId: 'pair-preset',
+    models: { worker: 'gpt-two', reviewer: 'sonnet' }, modes: { worker: 'auto', reviewer: 'plan' }
+  })
+  f.page.onDestroy()
+})
+
+test('native Back and right swipe use the visible Back action and handlers are removed', async () => {
+  const workspace = { id: 'workspace', projectLabel: 'Проект', name: 'main' }
+  const f = fixture({ request: async ({ method }) => method === 'ORCA_LIST'
+    ? { ok: true, workspaces: [], nextCursor: null }
+    : { ok: true, text: 'Свободно' } })
+  f.page.project(workspace)
+  assert.equal(f.interaction.gesture(10), true)
+  await flush()
+  assert.equal(f.page.heading.options.text, 'Проекты')
+  assert.equal(f.interaction.key(20, 21), true)
+  assert.equal(f.page.heading.options.text, 'Orca')
+  assert.equal(f.interaction.key(20, 21), false)
+  f.page.project(workspace, 1)
+  assert.equal(f.interaction.gesture(10), true)
+  assert.equal(f.page.items[0].label, 'Готовые связки')
+  f.page.onDestroy()
+  assert.equal(f.interaction.offGesture, 1)
+  assert.equal(f.interaction.offKey, 1)
+})
+
+test('long errors use the scroll list without truncating the message', async () => {
+  const tail = 'КОНЕЦ_СООБЩЕНИЯ'
+  const message = 'Очень подробная ошибка подключения. '.repeat(20) + tail
+  const f = fixture({ request: async ({ method }) => {
+    if (method === 'SUMMARY') return { ok: true, text: 'Свободно' }
+    throw new Error(message)
+  } })
+  f.page.projects()
+  await flush()
+  assert.equal(f.page.heading.options.text, 'Не удалось')
+  assert.equal(f.page.note.options.visible, false)
+  assert.equal(f.page.noteScroll.options.visible, true)
+  const rendered = f.page.noteScroll.options.data_array.map(row => row.text + row.separator).join('')
+  assert.equal(rendered, message)
+  assert.match(rendered, new RegExp(tail))
+  f.page.onDestroy()
+})
+
+test('a lost create receipt restores by exact operation ID without creating again', async () => {
+  const storage = new Map()
+  const workspace = { id: 'workspace', projectLabel: 'Atlas', name: 'main' }
+  const first = fixture({ storage, request: async ({ method }) => {
+    if (method === 'ORCA_GITHUB_CREATE') throw new Error('Квитанция потеряна')
+    return { ok: true, text: 'Свободно' }
+  } })
+  first.page.github(workspace)
+  first.page.items[0].action()
+  const saved = JSON.parse(storage.get('orca-resume'))
+  assert.deepEqual(saved, {
+    screen: 'operation', kind: 'provision', id: '1700000000000-1',
+    method: 'ORCA_GITHUB_CREATE', workspace
+  })
+  await flush()
+  assert.equal(first.page.items[0].label, 'Проверить операцию')
+  first.page.onDestroy()
+
+  const restored = fixture({ storage, request: async ({ method, params }) => {
+    assert.equal(method, 'ORCA_OPERATION')
+    assert.deepEqual(JSON.parse(JSON.stringify(params)), { id: saved.id })
+    return { ok: true, operation: { id: saved.id, state: 'completed',
+      message: 'Приватный репозиторий готов', github: { private: true } } }
+  } })
+  await flush()
+  assert.deepEqual(restored.calls.map(call => call.payload.method), ['ORCA_OPERATION'])
+  assert.equal(restored.page.heading.options.text, 'GitHub')
+  assert.equal(restored.page.note.options.text, 'Приватный репозиторий готов')
+  restored.page.onDestroy()
+})
+
+test('a lost quick receipt checks the exact job and only explicit retry reuses its ID', async () => {
+  const storage = new Map()
+  const pair = { id: 'pair-1', projectLabel: 'Работа', workerAgent: 'codex', reviewerAgent: 'claude' }
+  const command = { id: 'continue', label: 'Продолжай' }
+  const first = fixture({ storage, request: async ({ method }) => {
+    if (method === 'ORCA_SEND') throw new Error('Квитанция потеряна')
+    return { ok: true, text: 'Свободно' }
+  } })
+  first.page.sendQuick(pair, command)
+  const saved = JSON.parse(storage.get('orca-resume'))
+  assert.equal(saved.kind, 'quick')
+  assert.equal(saved.id, '1700000000000-1')
+  await flush()
+  first.page.onDestroy()
+
+  const restored = fixture({ storage, request: async ({ method, params }) => {
+    if (method === 'ORCA_JOB') return { ok: false, retryable: false, error: 'Запрос не найден' }
+    if (method === 'ORCA_SEND') return { ok: true, job: { id: params.id, state: 'queued' } }
+    throw new Error(method)
+  } })
+  await flush()
+  assert.deepEqual(restored.calls.map(call => call.payload.method), ['ORCA_JOB'])
+  assert.equal(restored.page.heading.options.text, 'Команда не найдена')
+  restored.page.items.find(item => item.label === 'Отправить снова').action()
+  await flush()
+  assert.deepEqual(restored.calls.map(call => call.payload.method), ['ORCA_JOB', 'ORCA_SEND'])
+  assert.equal(restored.calls[1].payload.params.id, saved.id)
+  assert.equal(restored.replacements.at(-1).url, 'page/voice')
+  assert.equal(JSON.parse(storage.get('voice-destination')).jobId, saved.id)
+  restored.page.onDestroy()
+})
+
+test('home resumes an existing folder operation or unsent draft without starting another one', () => {
+  const contexts = [
+    {
+      context: { target: 'folder', rootId: 'storage', label: 'Storage', operationId: 'plan-7' },
+      draft: null
+    },
+    {
+      context: { target: 'folder', rootId: 'external', label: 'External' },
+      draft: { id: '1700000000000-2', text: 'Ответ на уточнение', pendingSend: false }
+    }
+  ]
+  for (const { context, draft } of contexts) {
+    const storage = new Map([['voice-destination', JSON.stringify(context)]])
+    if (draft) storage.set(`voice-draft:folder:${context.rootId}:`, JSON.stringify(draft))
+    const f = fixture({ storage })
+    assert.equal(f.page.items[0].label, 'Продолжить проект')
+    assert.equal(f.page.next.options.visible, true)
+    f.page.items[0].action()
+    assert.equal(f.replacements.at(-1).url, 'page/voice')
+    assert.deepEqual(JSON.parse(storage.get('voice-destination')), context)
+    assert.equal(f.calls.some(call => call.payload.method.startsWith('ORCA_')), false)
+    f.page.onDestroy()
+  }
+
+  const stale = fixture({ storage: new Map([['voice-destination', JSON.stringify({
+    target: 'folder', rootId: 'storage', label: 'Storage'
+  })]]) })
+  assert.equal(stale.page.items.some(item => item.label === 'Продолжить проект'), false)
+  stale.page.onDestroy()
+})
+
+test('a hung Orca mutation times out to exact-ID recovery and destroy cancels all deadlines', async () => {
+  const f = fixture({ request: async payload => payload.method === 'SUMMARY'
+    ? { ok: true, text: 'На связи' } : new Promise(() => {}) })
+  f.page.sendQuick({ id: 'pair-1', projectLabel: 'Работа' }, { id: 'status', label: 'Статус' })
+  await flush()
+  assert.equal(f.page.mutationPending, true)
+  const timeout = [...f.timers.values()].find(timer => timer.delay === 18000)
+  assert.ok(timeout)
+  timeout.callback(); await flush()
+  assert.equal(f.page.mutationPending, false)
+  assert.equal(f.page.items[0].label, 'Проверить отправку')
+  const saved = JSON.parse(f.storage.get('orca-resume'))
+  f.page.items[0].action(); await flush()
+  assert.equal(f.calls.at(-1).payload.method, 'ORCA_JOB')
+  assert.equal(f.calls.at(-1).payload.params.id, saved.id)
+  f.page.onDestroy()
+  assert.equal(f.timers.size, 0)
 })

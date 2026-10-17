@@ -18,7 +18,7 @@ test('a dictated task runs in the chosen project and the returned session is con
   assert.equal(sent.state, 'queued')
   const done = await route({ method: 'JOB_STATUS', params: { id: '1700000000000-1' } })
   assert.equal(done.state, 'completed')
-  assert.equal(done.result, 'Первая часть Первая часть ')
+  assert.equal(done.result, 'Первая часть ')
   assert.equal(context.sessionId, '11111111-2222-3333-4444-555555555555')
   await route({ method: 'SEND_TEXT', params: { id: '1700000000000-2', textId: '1700000000000-2' } })
   const second = calls.find(c => c.method === 'CLAUDE_SEND' && c.params.id === '1700000000000-2')
@@ -184,7 +184,7 @@ test('a lost new send receipt never maps the previous Claude job to the new voic
   assert.deepEqual(calls.at(-1), { method: 'CLAUDE_JOB', params: { id: '1700000000000-2' } })
 })
 
-test('startup with an uncertain Claude send recovers its exact alias and forwards pagination progress', async () => {
+test('startup with an uncertain Claude send recovers its exact alias and renders the first chunk without blocking on continuation', async () => {
   const options = { onRouteProgress() { options.progress += 1 }, progress: 0 }
   const calls = []
   const context = { target: 'claude', project: '/work/crm', mode: 'auto',
@@ -195,13 +195,12 @@ test('startup with an uncertain Claude send recovers its exact alias and forward
       result: payload.params.cursor ? 'два' : 'один ', nextCursor: payload.params.cursor ? null : 'page-2' } }
   } })
   const latest = await route({ method: 'LATEST_JOB' }, options)
-  assert.equal(latest.job.result, 'один два')
+  assert.equal(latest.job.result, 'один ')
   assert.deepEqual(calls.map(call => call.payload), [
-    { method: 'CLAUDE_JOB', params: { id: '1700000000000-2' } },
-    { method: 'CLAUDE_JOB', params: { id: '1700000000000-2', cursor: 'page-2' } }
+    { method: 'CLAUDE_JOB', params: { id: '1700000000000-2' } }
   ])
   assert.ok(calls.every(call => call.receivedOptions === options))
-  assert.ok(options.progress >= 2)
+  assert.equal(options.progress, 1)
 })
 
 test('Claude and Codex expose submitting before their process starts', async () => {
@@ -219,3 +218,35 @@ test('Claude and Codex expose submitting before their process starts', async () 
     assert.equal(reply.state, 'submitting')
   }
 })
+
+for (const [factory, prefix] of [[createClaudeVoiceRoute, 'CLAUDE'], [createCodexVoiceRoute, 'CODEX']]) {
+  test(prefix + ' fresh and selected-session compose never adopts a different latest job', async () => {
+    const context = { target: prefix.toLowerCase(), project: 'project-a', sessionId: 'selected-session', startFresh: true }
+    const calls = []
+    const route = factory({ context, request: async payload => {
+      calls.push(payload)
+      if (payload.method.endsWith('_LATEST')) return { ok: true, job: { id: 'other-job', state: 'completed', sessionId: 'other-session' } }
+      return { ok: true, job: { id: payload.params.id, state: 'queued' } }
+    } })
+    assert.deepEqual(await route({ method: 'LATEST_JOB' }), { ok: true, job: null })
+    assert.equal(calls.length, 0)
+    assert.equal(context.sessionId, 'selected-session')
+    await route({ method: 'SEND_TEXT', params: { id: '123-1', textId: '123-1' } })
+    assert.equal(calls[0].params.sessionId, 'selected-session')
+    assert.equal(context.startFresh, false)
+  })
+  test(prefix + ' definite rejection restores fresh context and confirmed stop is terminal', async () => {
+    const context = { target: prefix.toLowerCase(), project: 'project-a', startFresh: true }
+    let stopped = false
+    const route = factory({ context, request: async payload => stopped
+      ? { ok: true, job: { id: '123-1', state: 'error', error: 'Остановлено с часов' } }
+      : { ok: false, retryable: false, error: 'Нет проекта' } })
+    const rejection = await route({ method: 'SEND_TEXT', params: { id: '123-1' } })
+    assert.equal(rejection.retryable, false)
+    assert.equal(context.pendingSend, false)
+    assert.equal(context.startFresh, true)
+    stopped = true
+    const result = await route({ method: 'JOB_STATUS', params: { id: '123-1' } })
+    assert.equal(result.state, 'cancelled')
+  })
+}

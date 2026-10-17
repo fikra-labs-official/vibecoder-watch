@@ -97,7 +97,7 @@ test('lost Orca receipt refreshes the same alias and never resends to Orca or He
   client.close()
 })
 
-test('completed results and owner questions are assembled from every Orca page', async () => {
+test('completed results render immediately and owner questions are assembled before decisions', async () => {
   const calls = []
   const context = { target: 'orca', pairId: 'pair-2', jobId: 'orca-2', aliasId: 'voice-2' }
   const route = createOrcaVoiceRoute({
@@ -116,9 +116,9 @@ test('completed results and owner questions are assembled from every Orca page',
   })
   const completed = await route({ method: 'JOB_STATUS', params: { id: 'voice-2' } })
   assert.equal(completed.id, 'voice-2')
-  assert.equal(completed.result, 'Первая вторая 🙂')
+  assert.equal(completed.result, 'Первая ')
   assert.deepEqual(calls.map(call => call.params), [
-    { id: 'orca-2' }, { id: 'orca-2', cursor: 'result-2' }
+    { id: 'orca-2' }
   ])
 
   calls.length = 0
@@ -566,4 +566,18 @@ test('a transport retry after project resume becomes a read-only operation looku
   assert.equal(calls.filter(method => method === 'ORCA_PROJECT_RESUME').length, 1)
   assert.equal(calls.filter(method => method === 'ORCA_OPERATION').length, 2)
   client.close()
+})
+
+test('definite Orca rejection keeps the current compose intent and confirmed stop is terminal', async () => {
+  const context = { target: 'orca', pairId: 'pair-1', startFresh: true }
+  let stopped = false
+  const route = createOrcaVoiceRoute({ context, request: async () => stopped
+    ? { ok: true, job: { id: '123-1', state: 'error', stage: 'stopped', error: 'Остановлено с часов' } }
+    : { ok: false, retryable: false, error: 'Нет связки' } })
+  assert.deepEqual(await route({ method: 'LATEST_JOB' }), { ok: true, job: null })
+  assert.equal((await route({ method: 'SEND_TEXT', params: { id: '123-1' } })).retryable, false)
+  assert.equal(context.pendingSend, false)
+  assert.equal(context.startFresh, true)
+  stopped = true
+  assert.equal((await route({ method: 'JOB_STATUS', params: { id: '123-1' } })).state, 'cancelled')
 })

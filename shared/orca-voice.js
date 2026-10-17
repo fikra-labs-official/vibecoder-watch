@@ -16,21 +16,10 @@ export function createOrcaVoiceRoute({ request, context, save = () => {} }) {
     const publicJob = { ok: true, id: context.aliasId, state: job.state === 'question' ? 'approval' : job.state,
       result: job.result || job.summary || '', text: '', error: job.error || '',
       orcaStage: job.stage, questionId: job.questionId || null }
-    // Read every page; a short BLE envelope must not silently lose the answer/question.
-    let cursor = job.nextCursor
-    let length = Array.from(publicJob.result).length
+    if (job.stage === 'stopped') { publicJob.state = 'cancelled'; publicJob.result = job.error || 'Остановлено с часов' }
+    // The first result renders immediately; the full reader streams history chunks.
+    publicJob.reportLength = Number.isInteger(job.resultLength) ? job.resultLength : Array.from(publicJob.result).length
     const seen = new Set()
-    while (job.state === 'completed' && cursor != null) {
-      if (options && typeof options.onRouteProgress === 'function') options.onRouteProgress()
-      if (seen.has(cursor) || seen.size >= 128 || length > 100000) throw new Error('Ответ слишком большой. Полный отчёт сохранён на Mac.')
-      seen.add(cursor)
-      const page = await request({ method: 'ORCA_JOB', params: { id: job.id, cursor } }, options)
-      if (!page || !page.ok || !page.job || page.job.id !== job.id) throw new Error('Не удалось получить продолжение ответа')
-      publicJob.result += page.job.result || ''
-      length += Array.from(page.job.result || '').length
-      if (length > 100000) throw new Error('Ответ слишком большой. Полный отчёт сохранён на Mac.')
-      cursor = page.job.nextCursor
-    }
     if (job.state === 'question') {
       if (!job.questionId) throw new Error('Некорректный вопрос Orca')
       remember({ pendingQuestionId: job.questionId })
@@ -56,6 +45,7 @@ export function createOrcaVoiceRoute({ request, context, save = () => {} }) {
     const { method, params = {} } = payload
     if (method === 'STATUS') return { ok: true, agent: 'Orca' }
     if (method === 'LATEST_JOB') {
+      if (context.startFresh === true && !context.pendingSend) return { ok: true, job: null }
       if (context.answering && !context.pendingSend) return { ok: true, job: null }
       const pendingId = context.pendingSend === true && (context.answering ? context.jobId : context.aliasId)
       const resumeId = context.resumeJob === true && context.jobId
@@ -69,13 +59,14 @@ export function createOrcaVoiceRoute({ request, context, save = () => {} }) {
       return job && job.ok ? { ok: true, job: job.job === null ? null : job } : job
     }
     if (method === 'SEND_TEXT') {
-      remember({ aliasId: params.id, pendingSend: true })
+      remember({ aliasId: params.id, pendingSend: true, startFresh: false })
       const reply = context.answering
         ? await request({ method: 'ORCA_REPLY', params: { id: context.jobId, questionId: context.pendingQuestionId, textId: params.textId || params.id } }, options)
         : context.askRole
           ? await request({ method: 'ORCA_ASK', params: { id: params.id, textId: params.textId || params.id, pairId: context.pairId, role: context.askRole } }, options)
           : await request({ method: 'ORCA_SEND', params: { id: params.id, textId: params.textId || params.id, pairId: context.pairId } }, options)
       if (reply && reply.ok) remember({ answering: false })
+      if (reply && !reply.ok && reply.retryable === false) remember({ pendingSend: false, startFresh: true })
       return jobReply(reply, params.id, options)
     }
     if (method === 'JOB_STATUS') {

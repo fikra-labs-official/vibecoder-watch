@@ -3,7 +3,9 @@ import fs from 'node:fs'
 import test from 'node:test'
 import vm from 'node:vm'
 
-const shared = fs.readFileSync(new URL('../shared/agent-menu.js', import.meta.url), 'utf8')
+const textRowsSource = fs.readFileSync(new URL('../shared/text-rows.js', import.meta.url), 'utf8')
+  .replace('export function textRows', 'function textRows')
+const shared = textRowsSource + '\n' + fs.readFileSync(new URL('../shared/agent-menu.js', import.meta.url), 'utf8')
   .replace(/^import .*$/gm, '').replace('export function createAgentMenuPage', 'function createAgentMenuPage')
 const entries = {
   claude: fs.readFileSync(new URL('../page/claude.js', import.meta.url), 'utf8').replace(/^import .*$/gm, ''),
@@ -11,29 +13,54 @@ const entries = {
 }
 const flush = () => new Promise(resolve => setImmediate(resolve))
 
-function fixture({ kind = 'claude', request = async () => ({ ok: true }), storage = new Map() } = {}) {
+function fixture({ kind = 'claude', request = async () => ({ ok: true }), storage = new Map(),
+  device = { width: 390, height: 450 }, storageThrows = 0 } = {}) {
   let page
   const replacements = []
+  const interaction = { gesture: null, key: null, offGesture: 0, offKey: 0 }
+  const timers = new Map()
+  const statusBar = []
+  let nextTimer = 1
+  let storageFailures = storageThrows
+  const clock = {
+    setTimeout(callback, delay) { const id = nextTimer++; timers.set(id, { callback, delay }); return id },
+    clearTimeout(id) { timers.delete(id) },
+    expire(delay) {
+      for (const [id, timer] of [...timers]) if (timer.delay === delay) { timers.delete(id); timer.callback() }
+    }
+  }
   vm.runInNewContext(shared + '\n' + entries[kind], {
     Page(definition) { page = Object.assign(Object.create(definition), definition) },
     BasePage: value => value,
-    getDeviceInfo: () => ({ width: 390, height: 450 }),
+    getDeviceInfo: () => device,
     replace: value => replacements.push(value),
+    routerBack: () => replacements.push({ back: true }),
     setWakeUpRelaunch() {},
-    LocalStorage: class { getItem(key) { return storage.get(key) } setItem(key, value) { storage.set(key, value) } },
+    setStatusBarVisible(value) { statusBar.push(value) },
+    setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout,
+    getTextLayout(text, options) { return { result: 0, width: Array.from(text).length * options.text_size * 0.7 } },
+    LocalStorage: class {
+      constructor() { if (storageFailures > 0) { storageFailures -= 1; throw new Error('storage unavailable') } }
+      getItem(key) { return storage.get(key) }
+      setItem(key, value) { storage.set(key, value) }
+    },
     createWidget(kind, options) {
       return { kind, options: { visible: true, ...options }, setProperty(property, value) {
-        if (property === 'more') Object.assign(this.options, value); else this.options[property] = value
+        if (property === 'more' || property === 'update-data') Object.assign(this.options, value); else this.options[property] = value
       } }
     },
-    widget: { FILL_RECT: 1, TEXT: 2, BUTTON: 3 }, align: { CENTER_H: 1 }, text_style: { WRAP: 1 },
-    prop: { TEXT: 'text', VISIBLE: 'visible', MORE: 'more' }, Date: class extends Date { static now() { return 1700000000000 } },
+    widget: { FILL_RECT: 1, TEXT: 2, BUTTON: 3, SCROLL_LIST: 4 }, align: { CENTER_H: 1, CENTER_V: 2 }, text_style: { WRAP: 1 },
+    prop: { TEXT: 'text', VISIBLE: 'visible', MORE: 'more', UPDATE_DATA: 'update-data' },
+    onGesture({ callback }) { interaction.gesture = callback }, offGesture() { interaction.offGesture += 1 },
+    onKey({ callback }) { interaction.key = callback }, offKey() { interaction.offKey += 1 },
+    GESTURE_RIGHT: 10, KEY_BACK: 20, KEY_EVENT_CLICK: 21,
+    Date: class extends Date { static now() { return 1700000000000 } },
     console: { log() {} }
   })
   const calls = []
   page.request = (payload, options) => { calls.push({ payload, options }); return request(payload, options) }
   page.build()
-  return { page, replacements, storage, calls }
+  return { page, replacements, storage, calls, interaction, timers, clock, statusBar }
 }
 
 const project = { id: '/work/crm', label: 'CRM' }
@@ -56,17 +83,20 @@ test('project menu dictates with the chosen mode and can continue a saved sessio
   f.page.items.find(item => item.label === 'План').action()
   assert.equal(f.page.items[1].label, 'Режим: План')
   f.page.items[0].action()
-  assert.deepEqual(JSON.parse(f.storage.get('voice-destination')), { target: 'claude', project: '/work/crm', label: 'CRM', mode: 'plan', modeLabel: 'План' })
+  assert.deepEqual(JSON.parse(f.storage.get('voice-destination')), { target: 'claude', project: '/work/crm', label: 'CRM', mode: 'plan', modeLabel: 'План', startFresh: true })
   assert.equal(f.replacements.at(-1).url, 'page/voice')
   f.page.project(project)
   f.page.items[2].action(); await flush()
   assert.equal(f.page.items[0].label, 'Починить оплату')
   f.page.items[0].action()
-  assert.equal(JSON.parse(f.storage.get('voice-destination')).sessionId, 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa')
+  assert.deepEqual(JSON.parse(f.storage.get('voice-destination')), {
+    target: 'claude', project: '/work/crm', label: 'CRM', mode: 'plan', modeLabel: 'План',
+    sessionId: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', startFresh: true
+  })
   assert.equal(f.calls.some(c => c.payload.method === 'CLAUDE_SEND'), false)
 })
 
-test('sleep restores project, voice and history screens; last task reopens the voice page', () => {
+test('sleep restores project, voice and history screens; last task reopens the voice page', async () => {
   const storage = new Map([['claude-resume', JSON.stringify({ screen: 'project', project })]])
   const a = fixture({ storage })
   assert.equal(a.page.items[0].label, 'Задача / вопрос')
@@ -74,13 +104,33 @@ test('sleep restores project, voice and history screens; last task reopens the v
   assert.equal(b.replacements.at(-1).url, 'page/history')
   const c = fixture({ storage: new Map([['claude-resume', JSON.stringify({ screen: 'voice' })]]) })
   assert.equal(c.page.items[0].label, 'Проекты')
-  const d = fixture({ storage: new Map([['voice-destination', JSON.stringify({ target: 'claude', project: '/work/crm' })]]) })
+  const d = fixture({ storage: new Map([['voice-destination', JSON.stringify({
+    target: 'claude', project: '/work/crm', jobId: 'last-job'
+  })]]) })
   d.page.items[1].action()
   assert.equal(d.replacements.at(-1).url, 'page/voice')
+  assert.deepEqual(JSON.parse(d.storage.get('voice-destination')), {
+    target: 'claude', project: '/work/crm', jobId: 'last-job', resumeJob: true, startFresh: false
+  })
+  const noExactJob = fixture({ storage: new Map([['voice-destination', JSON.stringify({
+    target: 'claude', project: '/work/crm', sessionId: 'draft-only'
+  })]]) })
+  noExactJob.page.items[1].action()
+  await flush()
+  assert.equal(noExactJob.replacements.length, 0)
+  assert.equal(noExactJob.calls.some(call => call.payload.method === 'CLAUDE_PROJECTS'), true)
   const e = fixture()
   e.page.items[2].action()
   assert.equal(e.replacements.at(-1).url, 'page/history')
   assert.deepEqual(JSON.parse(e.storage.get('claude-history-view')), { screen: 'home' })
+
+  const exact = { target: 'claude', project: '/work/crm', label: 'CRM', sessionId: 'selected-session',
+    jobId: '1700000000000-9', aliasId: '1700000000000-9', startFresh: true }
+  const x = fixture({ storage: new Map([['voice-destination', JSON.stringify(exact)]]) })
+  x.page.items[1].action()
+  assert.deepEqual(JSON.parse(x.storage.get('voice-destination')), {
+    ...exact, resumeJob: true, startFresh: false
+  })
 })
 
 test('codex menu uses CODEX methods, its own storage keys and mode labels', async () => {
@@ -123,10 +173,14 @@ test('night shift screen lists waiting tasks, starts or stops the shift, and que
   assert.equal(f.page.items[0].label, 'Запустить сейчас')
   assert.equal(f.page.items[1].label, 'CRM · Прогони тесты')
   assert.deepEqual(JSON.parse(f.storage.get('claude-resume')), { screen: 'night' })
-  f.page.items[0].action(); await flush(); await flush()
+  f.page.items[0].action()
+  assert.equal(f.page.mutationPending, true)
+  await flush(); await flush()
   assert.equal(f.page.note.options.text, 'Идёт сейчас · задач: 1')
   assert.equal(f.page.items[0].label, 'Остановить смену')
-  f.page.items[0].action(); await flush(); await flush()
+  f.page.items[0].action()
+  assert.deepEqual([...f.page.items.map(item => item.label)], ['Отмена', 'Остановить'])
+  f.page.items[1].action(); await flush(); await flush()
   assert.equal(f.page.items[0].label, 'Запустить сейчас')
   f.page.items[1].action()
   assert.equal(f.page.items[0].label, 'Убрать из смены')
@@ -137,7 +191,7 @@ test('night shift screen lists waiting tasks, starts or stops the shift, and que
   assert.equal(f.page.items[0].label, 'В ночную смену')
   f.page.items[0].action()
   assert.deepEqual(JSON.parse(f.storage.get('voice-destination')),
-    { target: 'claude', project: '/work/crm', label: 'CRM', mode: 'auto', modeLabel: 'Авто · ночью', night: true })
+    { target: 'claude', project: '/work/crm', label: 'CRM', mode: 'auto', modeLabel: 'Авто · ночью', night: true, startFresh: true })
   assert.equal(f.replacements.at(-1).url, 'page/voice')
   const back = fixture({ storage: new Map([['claude-resume', JSON.stringify({ screen: 'night' })]]),
     request: async () => ({ ok: true, active: false, at: '', count: 0, jobs: [], nextCursor: null }) })
@@ -153,11 +207,11 @@ test('research screen dictates a topic for one agent or both', async () => {
   assert.deepEqual([...f.page.items.map(i => i.label)], ['Быстрое: Claude', 'Быстрое: Claude + Codex', 'Большое: Claude'])
   f.page.items[2].action()
   assert.deepEqual(JSON.parse(f.storage.get('voice-destination')),
-    { target: 'claude', project: 'research', label: 'Исследование', mode: 'auto', modeLabel: 'Большое · Claude', kind: 'deep', both: false })
+    { target: 'claude', project: 'research', label: 'Исследование', mode: 'auto', modeLabel: 'Большое · Claude', kind: 'deep', both: false, startFresh: true })
   f.page.research()
   f.page.items[1].action()
   assert.deepEqual(JSON.parse(f.storage.get('voice-destination')),
-    { target: 'claude', project: 'research', label: 'Исследование', mode: 'auto', modeLabel: 'Claude + Codex', kind: 'research', both: true })
+    { target: 'claude', project: 'research', label: 'Исследование', mode: 'auto', modeLabel: 'Claude + Codex', kind: 'research', both: true, startFresh: true })
   assert.equal(f.replacements.at(-1).url, 'page/voice')
   const g = fixture({ kind: 'codex' })
   g.page.nextAction(); g.page.items[1].action()
@@ -223,7 +277,7 @@ test('Dozor screen lists checks, adds a site by voice or a project CI, checks an
   assert.equal(f.page.note.options.text, 'Проверок: 1')
   f.page.items[0].action()
   f.page.items[0].action()
-  assert.deepEqual(JSON.parse(f.storage.get('voice-destination')), { target: 'claude', project: 'watch', label: 'Дозор', mode: 'auto', modeLabel: 'Адрес сайта словами', kind: 'watch' })
+  assert.deepEqual(JSON.parse(f.storage.get('voice-destination')), { target: 'claude', project: 'watch', label: 'Дозор', mode: 'auto', modeLabel: 'Адрес сайта словами', kind: 'watch', startFresh: true })
 })
 
 test('PR review offers open pull requests of the project or the number by voice', async () => {
@@ -261,7 +315,8 @@ test('home note turns into the cross-agent summary line', async () => {
   assert.equal(f.page.note.options.text, 'Работают 2 · ждут решения 1 · готово 3')
   const g = fixture({ request: async ({ method }) => method === 'SUMMARY' ? { ok: false, error: 'нет моста' } : replies[method] })
   await flush(); await flush()
-  assert.equal(g.page.note.options.text, 'Claude в проектах на Mac')
+  assert.equal(g.page.note.options.text, 'Mac не ответил. Проверь Zepp и повтори связь.')
+  assert.equal(g.page.items[0].label, 'Повторить связь')
 })
 
 test('question screen lists the options and sends the choice, then returns to the task', async () => {
@@ -277,8 +332,183 @@ test('question screen lists the options and sends the choice, then returns to th
   f.page.nextAction()
   assert.deepEqual([...f.page.items.map(i => i.label)], ['Жёлтый'])
   f.page.backAction()
+  f.page.items[1].action()
+  assert.equal(f.page.heading.options.text, 'Ответить так?')
+  assert.equal(f.page.note.options.text, 'Синий')
+  assert.deepEqual([...f.page.items.map(i => i.label)], ['Отмена', 'Ответить'])
   f.page.items[1].action(); await flush(); await flush()
   assert.deepEqual(sent, [{ id: 'job-1', approvalId: '0123456789abcdef', allow: true, answer: 'Синий' }])
   assert.deepEqual(JSON.parse(f.storage.get('claude-resume')), { screen: 'voice' })
   assert.equal(f.replacements.at(-1).url, 'page/voice')
+})
+
+test('full access requires confirmation and remains scoped to one project', async () => {
+  const shop = { id: '/work/shop', label: 'Shop' }
+  const f = fixture({ request: async ({ method }) => method === 'CLAUDE_MODES'
+    ? { ok: true, modes: [{ id: 'auto', label: 'Авто' }, { id: 'bypass', label: 'Без ограничений' }], nextCursor: null }
+    : replies[method] })
+
+  f.page.project(project)
+  f.page.items[1].action(); await flush()
+  f.page.items.find(item => item.label === 'Без ограничений').action()
+  assert.equal(f.page.heading.options.text, 'Без ограничений?')
+  assert.match(f.page.note.options.text, /только для проекта\nCRM/i)
+  assert.equal(f.storage.has('claude-mode:/work/crm'), false)
+  f.page.items[0].action(); await flush()
+  f.page.items.find(item => item.label === 'Без ограничений').action()
+  f.page.items[1].action()
+  assert.equal(f.storage.get('claude-mode:/work/crm'), 'bypass')
+  assert.equal(f.page.items[1].label, 'Режим: Без ограничений')
+
+  f.page.project(shop)
+  assert.equal(f.page.items[1].label, 'Режим: Авто')
+  assert.equal(f.storage.has('claude-mode:/work/shop'), false)
+})
+
+test('preset mutation persists its exact id and blocks Back until the receipt is known', async () => {
+  let finishSend
+  const send = new Promise(resolve => { finishSend = resolve })
+  const f = fixture({ request: async ({ method, params }) => {
+    if (method === 'CLAUDE_QUICK_LIST') return replies.CLAUDE_QUICK_LIST
+    if (method === 'CLAUDE_SEND') return send
+    return replies[method]
+  } })
+  f.page.project(project)
+  f.page.nextAction(); await flush()
+  f.page.items[1].action()
+  const pending = JSON.parse(f.storage.get('voice-destination'))
+  assert.equal(pending.pendingSend, true)
+  assert.equal(pending.resumeJob, true)
+  assert.match(pending.jobId, /^\d+-\d+$/)
+  assert.deepEqual(JSON.parse(f.storage.get('claude-resume')), { screen: 'voice' })
+  assert.equal(f.page.mutationPending, true)
+  assert.equal(f.page.back.options.visible, false)
+  assert.equal(f.interaction.gesture(10), true)
+  assert.equal(f.interaction.key(20, 21), true)
+  assert.equal(f.replacements.length, 0)
+
+  finishSend({ ok: true, job: { id: pending.jobId, state: 'queued' } })
+  await flush(); await flush()
+  const accepted = JSON.parse(f.storage.get('voice-destination'))
+  assert.equal(accepted.jobId, pending.jobId)
+  assert.equal(accepted.pendingSend, false)
+  assert.equal(f.replacements.at(-1).url, 'page/voice')
+})
+
+test('soft ping failure is visible and can recover without leaving home', async () => {
+  let online = false
+  const f = fixture({ request: async ({ method }) => method === 'SUMMARY'
+    ? online ? { ok: true, text: 'Mac на связи' } : { ok: false, error: 'offline' }
+    : replies[method] })
+  await flush(); await flush()
+  assert.equal(f.page.items[0].label, 'Повторить связь')
+  online = true
+  f.page.items[0].action()
+  await flush(); await flush()
+  assert.equal(f.page.note.options.text, 'Mac на связи')
+  assert.equal(f.page.items[0].label, 'Проекты')
+})
+
+test('native Back, scroll rows and controls stay usable on supported compact and wide sizes', () => {
+  for (const device of [{ width: 390, height: 450 }, { width: 432, height: 514 }, { width: 390, height: 400 }]) {
+    const longQuestion = 'Какой вариант выбрать для очень длинного вопроса '.repeat(5)
+    const longOption = '👩‍💻 مرحبًا. Первый длинный вариант ответа '.repeat(4)
+    const saved = { screen: 'question', jobId: 'job-1', approvalId: '0123456789abcdef',
+      question: longQuestion, options: [longOption, 'Второй', 'Третий'] }
+    const f = fixture({ device, storage: new Map([['claude-resume', JSON.stringify(saved)]]) })
+    assert.ok(f.page.menuList.options.item_config[0].item_height >= 44)
+    assert.ok(f.page.back.options.h >= 44)
+    assert.ok(f.page.next.options.h >= 44)
+    assert.ok(f.page.back.options.x >= 0 && f.page.back.options.x + f.page.back.options.w <= device.width)
+    assert.ok(f.page.next.options.x >= 0 && f.page.next.options.x + f.page.next.options.w <= device.width)
+    assert.ok(f.page.back.options.y + f.page.back.options.h <= device.height)
+    assert.ok(f.page.next.options.y + f.page.next.options.h <= device.height)
+    assert.equal(f.page.noteScroll.options.visible, true)
+    assert.ok(f.page.noteScroll.options.data_count > 2)
+    assert.equal(f.page.menuList.options.data_array[0].label, longOption)
+    f.page.items[0].action()
+    assert.equal(f.page.note.options.text, longOption)
+    assert.equal(f.page.noteScroll.options.data_array.map(row => row.text).join(''), longOption)
+    f.page.backAction()
+    assert.equal(f.interaction.gesture(10), true)
+    assert.equal(f.replacements.at(-1).url, 'page/voice')
+    f.page.onDestroy()
+    assert.equal(f.interaction.offGesture, 1)
+    assert.equal(f.interaction.offKey, 1)
+    assert.deepEqual(f.statusBar, [false, true])
+  }
+})
+
+test('an unresolved mutation expires at the outer deadline and reconciles without sending twice', async () => {
+  const never = new Promise(() => {})
+  const f = fixture({ request: async ({ method }) => method === 'WATCH_CHECK' ? never : replies[method] })
+  f.page.watchItem({ id: 'watch-1', label: 'Site', state: 'down', detail: 'timeout' })
+  f.page.items[0].action()
+  await flush()
+  assert.equal(f.page.mutationPending, true)
+  assert.equal([...f.timers.values()].some(timer => timer.delay === 18000), true)
+  f.clock.expire(18000)
+  await flush(); await flush()
+  assert.equal(f.page.mutationPending, false)
+  assert.equal(f.page.items[0].label, 'Проверить статус')
+  assert.equal(f.calls.filter(call => call.payload.method === 'WATCH_CHECK').length, 1)
+  f.page.items[0].action()
+  assert.equal(f.calls.filter(call => call.payload.method === 'WATCH_CHECK').length, 1)
+})
+
+test('new views and destroy cancel pending outer deadlines', async () => {
+  const f = fixture({ request: async ({ method }) => ['CLAUDE_PROJECTS', 'SUMMARY'].includes(method) ? new Promise(() => {}) : replies[method] })
+  f.page.projects()
+  await flush()
+  assert.equal([...f.timers.values()].some(timer => timer.delay === 18000), true)
+  f.page.home()
+  assert.equal([...f.timers.values()].some(timer => timer.delay === 18000), false)
+  await flush()
+  assert.equal([...f.timers.values()].some(timer => timer.delay === 10000), true)
+  f.page.onDestroy()
+  assert.equal(f.timers.size, 0)
+})
+
+test('cursor Back reloads the previous page instead of leaving the list', async () => {
+  const seen = []
+  const f = fixture({ request: async ({ method, params }) => {
+    if (method === 'CLAUDE_PROJECTS') {
+      seen.push(params.cursor)
+      return params.cursor === 'page-2'
+        ? { ok: true, projects: [{ id: '/two', label: 'Two' }], nextCursor: null }
+        : { ok: true, projects: [{ id: '/one', label: 'One' }], nextCursor: 'page-2' }
+    }
+    return replies[method]
+  } })
+  f.page.projects(); await flush(); await flush()
+  f.page.nextAction(); await flush(); await flush()
+  assert.equal(f.page.items[0].label, 'Two')
+  f.page.backAction(); await flush(); await flush()
+  assert.equal(f.page.items[0].label, 'One')
+  assert.deepEqual(seen, [undefined, 'page-2', undefined])
+})
+
+test('storage construction failure renders retry and exit actions', () => {
+  const f = fixture({ storageThrows: 2 })
+  assert.equal(f.page.heading.options.text, 'Не удалось')
+  assert.deepEqual([...f.page.items.map(item => item.label)], ['Повторить', 'Выйти'])
+  f.page.items[0].action()
+  assert.equal(f.page.heading.options.text, 'Не удалось')
+  f.page.items[1].action()
+  assert.deepEqual(f.replacements.at(-1), { back: true })
+})
+
+test('authoritative preset rejection clears only its pending context and returns to commands', async () => {
+  const f = fixture({ request: async ({ method, params }) => {
+    if (method === 'CLAUDE_QUICK_LIST') return replies.CLAUDE_QUICK_LIST
+    if (method === 'CLAUDE_SEND') return { ok: false, retryable: false, error: `rejected ${params.id}` }
+    return replies[method]
+  } })
+  f.page.project(project)
+  f.page.nextAction(); await flush(); await flush()
+  f.page.items[1].action(); await flush(); await flush()
+  assert.equal(f.storage.get('voice-destination'), '')
+  assert.equal(f.page.heading.options.text, 'Не удалось')
+  assert.equal(f.page.items[0].label, 'Вернуться к командам')
+  assert.equal(f.calls.filter(call => call.payload.method === 'CLAUDE_SEND').length, 1)
 })

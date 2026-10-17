@@ -3,13 +3,13 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Мусафир · предпросмотр часов</title>
+  <title>Агенты · предпросмотр часов</title>
   <link rel="stylesheet" href="/preview/styles.css">
 </head>
 <body>
   <div class="preview-banner">Предпросмотр · демонстрация, команды не отправляются</div>
   <main>
-    <section class="stage" aria-label="Экран часов Мусафир">
+    <section class="stage" aria-label="Экран приложения на часах">
       <div class="watch-shell">
         <div class="watch-screen" id="watch-screen">
           <div class="os-header" aria-hidden="true">
@@ -31,13 +31,15 @@
         <select id="app-select">
           <option value="musafir">Мусафир</option>
           <option value="orca">Orca</option>
+          <option value="claude">Claude</option>
+          <option value="codex">Codex</option>
         </select>
       </div>
 
       <label for="state-select">Состояние</label>
       <div class="select-wrap">
         <select id="state-select">
-          <option value="ready">Главная: недавние чаты</option>
+          <option value="ready">Главное меню</option>
           <option value="home-error">Главная: ошибка связи</option>
           <option value="compose">Новая задача: голос или текст</option>
           <option value="heroes">Все пять героев</option>
@@ -46,11 +48,12 @@
           <option value="transcribing">Распознавание</option>
           <option value="review">Проверка текста</option>
           <option value="approval">Запрос разрешения</option>
-          <option value="job">Мусафир работает</option>
+          <option value="job">Агент работает</option>
           <option value="result">Длинный ответ</option>
           <option value="report">Полный отчёт</option>
+          <option value="history">История: полный ответ</option>
           <option value="offline">Телефон не отвечает</option>
-          <option value="error">Ошибка записи</option>
+          <option value="error">Ошибка ответа</option>
         </select>
       </div>
 
@@ -69,7 +72,7 @@
 
       <div class="hint">
         <span class="hint-dot"></span>
-        <p><strong>Попробуйте сценарий:</strong> «Новая задача» → «Надиктовать» или «Написать» → проверка текста → «Отправить». Проверьте отмену и возврат на каждом шаге. Все данные синтетические.</p>
+        <p><strong>Попробуйте сценарий:</strong> выберите приложение, затем «Новая задача» → «Надиктовать» или «Написать» → проверка текста → «Отправить». Проверьте отмену, возврат и полный ответ. Все данные синтетические.</p>
       </div>
 
       <dl class="snapshot" id="snapshot">

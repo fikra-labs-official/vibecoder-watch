@@ -43,6 +43,10 @@ class FakeCli:
         self.malformed_first = None
         self.fail_on_dispatch = None
         self.reply_delay = 0
+        self.abandon_confirmed = True
+        self.interrupt_accepted = True
+        self.worker_start_entered = None
+        self.worker_start_release = None
 
     def run(self, argv, timeout=None):
         self.calls.append(tuple(argv))
@@ -71,6 +75,9 @@ class FakeCli:
         if argv[:2] == ["orchestration", "run-create"]:
             return self._env({"run": {"id": "run-1"}})
         if argv[:2] == ["orchestration", "worker-start"]:
+            if self.worker_start_entered is not None:
+                self.worker_start_entered.set()
+                self.worker_start_release.wait(3)
             terminal = argv[argv.index("--terminal") + 1]
             role = "worker" if terminal == WORKER else "reviewer"
             expected_role, report = self.plans.pop(0)
@@ -138,9 +145,11 @@ class FakeCli:
         if argv[:2] == ["orchestration", "worker-retain"]:
             return self._env({"retained": True})
         if argv[:2] == ["orchestration", "worker-abandon"]:
-            return self._env({"abandoned": True, "dispatchId": argv[argv.index("--dispatch") + 1]})
+            return self._env({"abandoned": self.abandon_confirmed,
+                              "dispatchId": argv[argv.index("--dispatch") + 1]})
         if argv[:2] == ["terminal", "send"]:
-            return self._env({"send": {"accepted": True, "handle": argv[argv.index("--terminal") + 1]}})
+            return self._env({"send": {"accepted": self.interrupt_accepted,
+                                        "handle": argv[argv.index("--terminal") + 1]}})
         raise AssertionError(argv)
 
     def _message(self, message):
@@ -544,6 +553,55 @@ class OrcaServiceTests(unittest.TestCase):
         self.service.rpc("ORCA_SEND", {"id": "job-t", "textId": "text-t", "pairId": pair["id"]}, lambda _: "Новая")
         self.assertEqual(self.wait("job-t")["state"], "completed")
 
+    def test_stop_with_rejected_interrupt_is_unknown_and_fences_late_completion(self):
+        self.fake.question_first = True
+        self.fake.interrupt_accepted = False
+        pair = self.bind()
+        self.service.rpc("ORCA_SEND", {
+            "id": "job-u", "textId": "text-u", "pairId": pair["id"]}, lambda _: "Задача")
+        self.wait("job-u", states=("question",))
+        stopped = self.service.rpc("ORCA_STOP", {"id": "job-u"})["job"]
+        self.assertEqual((stopped["state"], stopped["stage"]), ("unknown", "stop_unconfirmed"))
+        self.assertNotEqual(stopped["error"], "Остановлено с часов")
+        self.assertIn("не подтвердила прерывание", stopped["error"])
+        self.service._save("job-u", state="completed", stage="completed", result="late")
+        self.assertEqual(self.service._job("job-u")["state"], "unknown")
+        self.assertEqual(self.service._job("job-u")["stage"], "stop_unconfirmed")
+
+    def test_stop_with_unconfirmed_abandon_or_active_terminal_is_unknown(self):
+        self.fake.question_first = True
+        self.fake.abandon_confirmed = False
+        pair = self.bind()
+        self.service.rpc("ORCA_SEND", {
+            "id": "job-v", "textId": "text-v", "pairId": pair["id"]}, lambda _: "Задача")
+        self.wait("job-v", states=("question",))
+        self.fake.idle[REVIEWER] = False
+        stopped = self.service.rpc("ORCA_STOP", {"id": "job-v"})["job"]
+        self.assertEqual((stopped["state"], stopped["stage"]), ("unknown", "stop_unconfirmed"))
+        self.assertIn("dispatch не отгорожен", stopped["error"])
+        self.assertIn("всё ещё активен", stopped["error"])
+
+    def test_stop_during_worker_start_is_unknown_and_late_dispatch_cannot_reopen_job(self):
+        entered, release = threading.Event(), threading.Event()
+        self.fake.worker_start_entered = entered
+        self.fake.worker_start_release = release
+        pair = self.bind()
+        self.service.rpc("ORCA_SEND", {
+            "id": "job-race", "textId": "text-race", "pairId": pair["id"]}, lambda _: "Задача")
+        self.assertTrue(entered.wait(2))
+        stopped = self.service.rpc("ORCA_STOP", {"id": "job-race"})["job"]
+        self.assertEqual((stopped["state"], stopped["stage"]), ("unknown", "stop_unconfirmed"))
+        self.assertIn("до сохранения dispatch ID", stopped["error"])
+        self.assertFalse(any(call[:2] == ("terminal", "send") for call in self.fake.calls))
+        release.set()
+        for _ in range(200):
+            if self.fake.dispatches and "job-race" not in self.service.dispatching:
+                break
+            time.sleep(0.005)
+        row = self.service._job("job-race")
+        self.assertEqual((row["state"], row["stage"]), ("unknown", "stop_unconfirmed"))
+        self.assertFalse(json.loads(row["data"]).get("activeDispatch"))
+
     def test_stop_before_dispatch_needs_no_orca_calls(self):
         pair = self.bind()
         self.service.rpc("ORCA_PAUSE", {"id": "job-p", "paused": True}) if False else None
@@ -796,6 +854,8 @@ class HistoryTests(unittest.TestCase):
         self.assertTrue(rest["complete"])
         self.assertEqual(page["content"] + rest["content"], self.service._job("j1")["result"])
         self.assertEqual(page["total"], rest["total"])
+        self.assertEqual(page["context"], {"target": "orca", "pairId": "pair_a", "label": "Проект",
+                          "jobId": "j1", "resumeJob": True, "autoRecord": False})
         self.assertEqual(self.rpc("ORCA_HISTORY_DETAIL", id="j1", field="text")["content"], "Первая задача")
         self.assertEqual(self.rpc("ORCA_HISTORY_DETAIL", id="j2", field="result")["content"], "Ошибка агента")
         with self.assertRaises(ValueError):

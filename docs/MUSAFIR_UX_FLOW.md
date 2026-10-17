@@ -1,4 +1,4 @@
-# Musafir 0.10: navigation and explicit input
+# Musafir 0.11: navigation and explicit input
 
 The watch is a remote for the owner's Hermes agent on their computer. Audio is
 transcribed by the local bridge; only a separate, confirmed `SEND_TEXT` starts an
@@ -19,7 +19,7 @@ agent task. The phone and Tailscale are transport, not another agent identity.
 | Submitting / status unknown | Inspect same job | Preserve receipt recovery; never resend automatically |
 | Running / awaiting permission | Stop task, allow/deny where applicable | Leave task running; no implicit approval |
 | Result | Full answer, Continue | Originating chat or Home |
-| Full answer | Page arrows | Exact originating task; separate Home shortcut |
+| Full answer | Continuous vertical scroll, automatic continuation | Exact originating task; separate Home shortcut |
 | Hero picker | Scroll all five portraits, select | Return to the preceding screen |
 
 New task, Research and Continue open Compose. Persisted legacy `autoRecord` must
@@ -44,7 +44,7 @@ submission. Blank or invalid text cannot be submitted.
 ## Native UI constraints
 
 Every secondary screen has a visible Back control and equivalent right-swipe / Back
-key behavior. Document-page arrows are not named Back. Keyboard input owns its
+key behavior. Text readers have no page arrows. Keyboard input owns its
 events while it is open. Event registrations are removed during page destruction.
 
 Native buttons have at least 44 px touch height, complete nonoverlapping hit areas

@@ -110,8 +110,13 @@ class CodexServiceTests(unittest.TestCase):
         self.assertIn('approval_policy="never"', argv)
         self.assertIn("--skip-git-repo-check", argv)
         self.assertEqual(self.launches[0]["cwd"], str(self.crm))
-        self.assertEqual(self.service.rpc("CODEX_HISTORY_DETAIL", {"id": "1-1", "field": "text"})["content"],
-                         "Что в проекте?")
+        detail = self.service.rpc("CODEX_HISTORY_DETAIL", {"id": "1-1", "field": "text"})
+        self.assertEqual(detail["content"], "Что в проекте?")
+        self.assertEqual(detail["context"], {
+            "target": "codex", "project": str(self.crm), "label": "CRM",
+            "sessionId": "01a0e48f-981b-7422-b8e8-75ce82b663a8", "mode": "read-only",
+            "jobId": "1-1", "openJob": True, "resumeJob": True, "autoRecord": False,
+        })
         self.assertEqual(self.service.rpc(
             "CODEX_SEND", {"id": "1-1", "textId": "1-1", "project": str(self.crm), "mode": "read-only"},
             lambda _: "wrong")["job"]["state"], "completed")
@@ -140,6 +145,16 @@ class CodexServiceTests(unittest.TestCase):
         self.assertIn("rmcp", self.wait("2-2")["error"])
         history = self.service.rpc("CODEX_HISTORY_LIST", {"limit": 3})["items"]
         self.assertEqual([h["id"] for h in history], ["2-2", "2-1"])
+
+    def test_result_persists_beyond_the_watch_reader_cap_without_silent_truncation(self):
+        result = "начало🙂" + "z" * 200_500 + "END!!"
+        self.process = FakeProcess(events("01a0e48f-981b-7422-b8e8-75ce82b663a8", result))
+        self.service.rpc("CODEX_SEND", {"id": "2-9", "textId": "2-9", "project": str(self.crm)}, lambda _: "x")
+        self.assertEqual(self.wait("2-9")["state"], "completed")
+        self.assertEqual(self.service._job("2-9")["result"], result)
+        tail = self.service.rpc("CODEX_HISTORY_DETAIL", {
+            "id": "2-9", "field": "result", "offset": len(result) - 5, "limit": 5})
+        self.assertEqual((tail["content"], tail["total"], tail["complete"]), ("END!!", len(result), True))
 
 
 if __name__ == "__main__":

@@ -1,3 +1,4 @@
+import { textRows } from '../shared/text-rows.js'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
@@ -18,6 +19,18 @@ const voiceSource = fs.readFileSync(new URL('../shared/voice-page.js', import.me
 const entrySource = "Page(BasePage(createVoicePage({ kind: 'musafir', icon: 'brand-mark.png', title: 'Мусафир', version: '0.9.0' })))"
 const source = `${alertSource}\n${voiceSource}\n${entrySource}`
 const flush = () => new Promise(resolve => setImmediate(resolve))
+const scrollText = scroll => (scroll.options.data_array || [])
+  .map(row => String(row.text == null ? row.display || '' : row.text) + String(row.separator || '')).join('')
+const assertReaderText = (page, expected) => {
+  assert.equal(page.readerScroll.options.visible, true)
+  assert.equal(page.bodyWidget.options.visible, false)
+  assert.equal(scrollText(page.readerScroll), expected)
+}
+const assertReviewText = (page, expected) => {
+  assert.equal(page.reviewScroll.options.visible, true)
+  assert.equal(page.bodyWidget.options.visible, false)
+  assert.equal(page.reviewRows.map(row => row.text + row.separator).join(''), expected)
+}
 
 export function pageFixture({ media = () => { throw Error('recorder unavailable') }, layout,
   width = 390, height = 450, files = {}, reply, storage = new Map(),
@@ -55,7 +68,7 @@ export function pageFixture({ media = () => { throw Error('recorder unavailable'
   vm.runInNewContext(executable, {
     Page(value) { page = value }, BasePage: value => value,
     createWatchClient, MAX_AUDIO_BYTES, createOrcaVoiceRoute, createFolderVoiceRoute, createClaudeVoiceRoute, createCodexVoiceRoute,
-    createMusafirVoiceRoute, normalizeContext, heroById, MUSAFIR_CONTEXT_KEY, MUSAFIR_HERO_KEY,
+    createMusafirVoiceRoute, normalizeContext, heroById, MUSAFIR_CONTEXT_KEY, MUSAFIR_HERO_KEY, textRows,
     replace(value) { replacements.push(value) },
     ...display, keyboardUI,
     interaction: {
@@ -208,7 +221,7 @@ test('Musafir result exposes full report and Continue returns to compose without
     } })
   f.page.build()
   await flush()
-  assert.equal(f.page.bodyWidget.options.text, 'Начало ответа')
+  assertReaderText(f.page, 'Начало ответа')
   assert.equal(f.page.menuButton.options.text, 'Полный ответ')
   f.page.menuButton.options.click_func()
   assert.equal(f.storage.get('musafir-report-job'), id)
@@ -363,7 +376,8 @@ test('Orca voice uses Orca branding and never sends Hermes status methods', asyn
   assert.equal(f.page.statusWidget.options.text, 'Задача для Orca')
   assert.equal(f.page.stageWidget.options.text, 'Проект')
   assert.equal(f.page.brandWidget.options.src, 'orca-mark.png')
-  assert.equal(f.page.menuButton.options.visible, true)
+  assert.equal(f.page.menuButton.options.visible, false)
+  assert.equal(f.page.backButton.options.visible, true)
   assert.equal(f.page.bodyWidget.options.text.includes('Мусафир'), false)
   f.page.onDestroy()
 })
@@ -394,8 +408,10 @@ test('Orca stop needs two taps, fences the task and shows the final state', asyn
   f.page.primaryButton.options.click_func()
   await flush(); await flush()
   assert.equal(f.requests.filter(r => r.method === 'ORCA_STOP').length, 1)
-  assert.equal(f.page.statusWidget.options.text, 'Не удалось продолжить')
-  assert.match(f.page.bodyWidget.options.text, /Остановлено с часов/)
+  assert.equal(f.page.client.getState().state, 'cancelled')
+  assert.equal(f.page.statusWidget.options.text, 'Остановлено')
+  assert.equal(f.page.stageWidget.options.text, 'Остановка подтверждена')
+  assertReaderText(f.page, 'Остановлено с часов')
   assert.equal(f.page.stopArmed, false)
   f.page.onDestroy()
 })
@@ -426,7 +442,7 @@ test('Orca question screen labels the role and hands a proposed prompt to the wo
   g.page.build()
   await flush()
   assert.equal(g.page.statusWidget.options.text, 'Ответ агента')
-  assert.match(g.page.bodyWidget.options.text, /этапе 2/)
+  assert.match(scrollText(g.page.readerScroll), /этапе 2/)
   assert.equal(g.page.secondaryButton.options.text, 'Боевому')
   assert.equal(handed.length, 0)
   g.page.secondaryButton.options.click_func()
@@ -463,8 +479,10 @@ test('Claude voice needs a project destination, shows the mode, runs the task an
   assert.equal(f.page.stageWidget.options.text, 'CRM')
   assert.match(f.page.bodyWidget.options.text, /Режим: План/)
   assert.equal(f.page.menuButton.options.text, 'Claude')
+  assert.equal(f.page.menuButton.options.visible, false)
+  assert.equal(f.page.backButton.options.visible, true)
   assert.equal(JSON.parse(storage.get('claude-resume')).screen, 'voice')
-  f.page.menuButton.options.click_func()
+  f.page.backButton.options.click_func()
   assert.deepEqual(JSON.parse(storage.get('claude-resume')), { screen: 'project', project: { id: '/work/crm', label: 'CRM' } })
   assert.equal(f.replacements.at(-1).url, 'page/index')
   f.page.onDestroy()
@@ -487,8 +505,12 @@ test('Claude voice needs a project destination, shows the mode, runs the task an
   g.page.primaryButton.options.click_func()
   await flush(); await flush()
   assert.equal(g.requests.filter(r => r.method === 'CLAUDE_STOP').length, 1)
-  assert.match(g.page.bodyWidget.options.text, /Остановлено с часов/)
-  assert.equal(g.page.secondaryButton.options.text, 'Claude')
+  assert.equal(g.page.client.getState().state, 'cancelled')
+  assert.equal(g.page.statusWidget.options.text, 'Остановлено')
+  assert.equal(g.page.stageWidget.options.text, 'Остановка подтверждена')
+  assertReaderText(g.page, 'Остановлено с часов')
+  assert.equal(g.page.secondaryButton.options.text, 'История')
+  assert.equal(g.page.backButton.options.visible, true)
   g.page.onDestroy()
 })
 
@@ -511,8 +533,12 @@ test('Codex voice mirrors Claude with its own methods, keys and title', async ()
   f.page.primaryButton.options.click_func(); f.page.primaryButton.options.click_func()
   await flush(); await flush()
   assert.equal(f.requests.filter(r => r.method === 'CODEX_STOP').length, 1)
-  assert.equal(f.page.secondaryButton.options.text, 'Codex')
-  f.page.secondaryButton.options.click_func()
+  assert.equal(f.page.client.getState().state, 'cancelled')
+  assert.equal(f.page.statusWidget.options.text, 'Остановлено')
+  assert.equal(f.page.stageWidget.options.text, 'Остановка подтверждена')
+  assertReaderText(f.page, 'Остановлено с часов')
+  assert.equal(f.page.secondaryButton.options.text, 'История')
+  f.page.backButton.options.click_func()
   assert.deepEqual(JSON.parse(storage.get('codex-resume')), { screen: 'project', project: { id: '/work/shop', label: 'Shop' } })
   f.page.onDestroy()
   const home = pageFixture({ kind: 'codex', storage: new Map([['voice-destination', JSON.stringify({ target: 'codex', project: '/work/shop', label: 'Shop', mode: 'read-only', modeLabel: 'Только чтение' })]]), reply: () => ({ ok: true, job: null }) })
@@ -535,7 +561,7 @@ test('folder voice presents a general brief, then separates transcript review fr
 
   f.page.render({ phase: 'review', text: 'Сделай учебный тренажёр' })
   assert.equal(f.page.primaryButton.options.text, 'Разобрать')
-  assert.match(f.page.stageWidget.options.text, /Разобрать задачу/)
+  assertReviewText(f.page, 'Сделай учебный тренажёр')
 
   Object.assign(f.page.destination, { approvalKind: 'plan', currentApprovalId: 'approval-1' })
   f.page.render({ phase: 'approval', id: 'plan-1', jobId: 'plan-1',
@@ -543,7 +569,7 @@ test('folder voice presents a general brief, then separates transcript review fr
   assert.equal(f.page.statusWidget.options.text, 'План проекта')
   assert.equal(f.page.primaryButton.options.text, 'Создать')
   assert.equal(f.page.secondaryButton.options.text, 'Изменить')
-  assert.match(f.page.bodyWidget.options.text, /gpt-5.*sonnet/)
+  assert.match(scrollText(f.page.readerScroll), /gpt-5.*sonnet/)
   f.page.onDestroy()
 })
 
@@ -587,7 +613,7 @@ test('a Claude permission prompt is answered from the watch', async () => {
   await flush()
   assert.equal(f.page.statusWidget.options.text, 'Нужно разрешение')
   assert.equal(f.page.stageWidget.options.text, 'Действие Claude на Mac')
-  assert.equal(f.page.bodyWidget.options.text, 'Bash:\nnpm test')
+  assertReaderText(f.page, 'Bash:\nnpm test')
   assert.equal(f.page.primaryButton.options.text, 'Разрешить')
   assert.equal(f.page.secondaryButton.options.text, 'Отказать')
   f.page.primaryButton.options.click_func()
@@ -610,7 +636,7 @@ test('a Claude question with options hands the choice to the menu page', async (
   await flush()
   assert.equal(f.page.statusWidget.options.text, 'Вопрос от Claude')
   assert.equal(f.page.stageWidget.options.text, 'Вопрос 1/2 · вариантов: 2')
-  assert.equal(f.page.bodyWidget.options.text, 'Какой цвет?')
+  assertReaderText(f.page, 'Какой цвет?')
   assert.equal(f.page.primaryButton.options.text, 'Выбрать…')
   assert.equal(f.page.secondaryButton.options.text, 'Отказать')
   f.page.primaryButton.options.click_func()
@@ -770,13 +796,16 @@ test('long approval remains complete and polling preserves the reader page', asy
   f.page.build()
   await flush()
   assert.ok(text.length > 3066)
-  assert.equal(f.page.textPages.join(''), text)
-  f.page.turnPage(1)
-  const page = f.page.bodyWidget.options.text
+  assertReaderText(f.page, text)
+  assert.equal(f.page.previousButton.options.visible, false)
+  assert.equal(f.page.nextButton.options.visible, false)
+  const updates = f.page.readerScroll.updates.filter(update => update.key === 'update-data').length
   f.tick(3000)
   await flush()
-  assert.equal(f.page.textPage, 1)
-  assert.equal(f.page.bodyWidget.options.text, page)
+  assertReaderText(f.page, text)
+  assert.equal(f.page.readerScroll.updates.filter(update => update.key === 'update-data').length, updates,
+    'unchanged approval must preserve the native reader position')
+  assert.equal(f.requests.some(request => request.params && request.params.cursor != null), false)
   assert.equal(f.vibrationCalls.filter(x => x.name === 'start').length, 1)
   f.page.onDestroy()
 })
@@ -866,7 +895,7 @@ test('unavailable recorder reports an actionable error after pressing record', a
   await flush()
   assert.doesNotThrow(() => f.page.startRecording())
   assert.equal(f.page.client.getState().phase, 'error')
-  assert.match(f.page.bodyWidget.options.text, /микрофон|запись/)
+  assert.match(scrollText(f.page.readerScroll), /микрофон|запись/)
   assert.equal(f.page.primaryButton.options.visible, true)
   f.page.onDestroy()
 })
@@ -878,7 +907,7 @@ test('missing text layout API cannot prevent requests or hide recovery buttons',
   assert.deepEqual(f.requests.map(x => x.method), ['STATUS', 'LATEST_JOB'])
   assert.equal(f.page.client.getState().phase, 'ready')
   assert.equal(f.page.primaryButton.options.visible, true)
-  assert.ok(f.page.textPages.join('').includes('Нажмите'))
+  assert.match(f.page.bodyWidget.options.text, /Голос|клавиатура/)
   f.page.onDestroy()
 })
 
@@ -982,7 +1011,7 @@ test('baseline Recorder without event APIs records, flushes, uploads and reaches
   f.tick(2000)
   await flush()
   assert.equal(f.page.client.getState().phase, 'review')
-  assert.equal(f.page.bodyWidget.options.text, 'Проверка')
+  assertReviewText(f.page, 'Проверка')
   assert.equal(f.requests.some(x => x.method === 'SEND_TEXT'), false)
   f.page.onDestroy()
   assert.equal(f.timers.size, 0)
@@ -1169,7 +1198,7 @@ test('Repeat reopens the saved file using its original id after a failed open', 
   f.tick(2000)
   await flush()
   assert.equal(f.page.client.getState().phase, 'review')
-  assert.equal(f.page.bodyWidget.options.text, 'Проверка')
+  assertReviewText(f.page, 'Проверка')
   f.page.onDestroy()
 })
 
@@ -1224,7 +1253,7 @@ test('sleep on transcript restores draft instead of an older result, without sen
   reopened.page.build()
   await flush()
   assert.equal(reopened.page.client.getState().phase, 'review')
-  assert.equal(reopened.page.bodyWidget.options.text, 'Проверка')
+  assertReviewText(reopened.page, 'Проверка')
   assert.equal(reopened.requests.some(x => ['SEND_TEXT', 'AUDIO_BEGIN'].includes(x.method)), false)
   reopened.page.onDestroy()
   latest = { id, state: 'completed', result: 'Новый ответ' }
@@ -1232,7 +1261,7 @@ test('sleep on transcript restores draft instead of an older result, without sen
   accepted.page.build()
   await flush()
   assert.equal(accepted.page.client.getState().phase, 'review')
-  assert.equal(accepted.page.bodyWidget.options.text, 'Проверка')
+  assertReviewText(accepted.page, 'Проверка')
   assert.equal(JSON.parse(storage.get('pending-audio')).accepted, true)
   assert.equal([...accepted.timers.values()].some(t => t.delay === 0), false)
   accepted.page.onDestroy()
@@ -1312,20 +1341,19 @@ test('upload progress comes from acknowledged bytes; transcription animates with
   f.page.onDestroy()
 })
 
-test('reader pagination preserves every character and splits at word boundaries when possible', async () => {
+test('native reader scroll preserves every character and polling does not reset unchanged text', async () => {
   const f = pageFixture({ layout: text => ({ height: Math.ceil(text.length / 24) * 25 }) })
   f.page.build()
   await flush()
   const text = 'Ответ Мусафира. Сохраняем слова целиком, знаки и пробелы.\n'.repeat(10)
   f.page.render({ phase: 'result', result: text })
-  assert.equal(f.page.textPages.join(''), text)
-  assert.ok(f.page.textPages.length > 1)
-  for (const part of f.page.textPages.slice(0, -1)) assert.match(part, /\s$/)
+  assertReaderText(f.page, text)
+  assert.ok(f.page.readerScroll.options.data_count > 1)
   assert.equal(f.page.previousButton.options.visible, false)
-  f.page.turnPage(1)
-  assert.equal(f.page.previousButton.options.visible, true)
-  assert.equal(f.page.bodyWidget.options.text, f.page.textPages[1])
-  assert.equal(f.page.bodyWidget.options.align_h, 3)
+  assert.equal(f.page.nextButton.options.visible, false)
+  const updates = f.page.readerScroll.updates.filter(update => update.key === 'update-data').length
+  f.page.render({ phase: 'result', result: text })
+  assert.equal(f.page.readerScroll.updates.filter(update => update.key === 'update-data').length, updates)
   f.page.onDestroy()
 })
 
@@ -1389,7 +1417,7 @@ test('sleep after an approval recovers the completed answer without resending or
   reopened.page.build()
   await flush()
   assert.equal(reopened.page.client.getState().phase, 'result')
-  assert.equal(reopened.page.bodyWidget.options.text, job.result)
+  assertReaderText(reopened.page, job.result)
   assert.deepEqual(reopened.requests.map(r => r.method), ['STATUS', 'LATEST_JOB'])
   assert.equal(first.requests.filter(r => r.method === 'JOB_APPROVE').length, 1)
   assert.equal(storage.get('acknowledged-result-id'), undefined)
@@ -1407,9 +1435,8 @@ test('sleep after an approval recovers the completed answer without resending or
   afterHome.page.build()
   await flush()
   assert.equal(afterHome.page.client.getState().phase, 'ready')
-  assert.equal(afterHome.page.secondaryButton.options.text, 'Ответ')
-  afterHome.page.secondaryAction()
-  assert.equal(afterHome.page.bodyWidget.options.text, job.result)
+  assert.equal(afterHome.page.secondaryButton.options.text, 'Написать')
+  assert.equal(afterHome.page.readerScroll.options.visible, false)
   afterHome.page.onDestroy()
 })
 
@@ -1457,7 +1484,7 @@ test('native display and storage failures still allow the saved answer to open',
   assert.doesNotThrow(() => f.page.build())
   await flush()
   assert.equal(f.page.client.getState().phase, 'result')
-  assert.equal(f.page.bodyWidget.options.text, 'Ответ сохранён')
+  assertReaderText(f.page, 'Ответ сохранён')
   assert.doesNotThrow(() => f.page.secondaryAction())
   assert.doesNotThrow(() => f.page.onDestroy())
 })
@@ -1536,15 +1563,14 @@ for (const kind of ['musafir', 'orca', 'claude', 'codex']) {
     f.page.client.resumeAudio(id)
     await flush()
     assert.equal(f.page.editButton.options.visible, true)
-    assert.equal(f.page.textPages.join(''), original)
-    f.page.turnPage(1)
+    assertReviewText(f.page, original)
     f.page.editButton.options.click_func()
     assert.equal(f.keyboard().text, original, 'editor receives every page, including the off-screen text')
     assert.equal(f.keyboard().inputType, 4, 'enabled custom keyboard is preferred')
     const changed = 'Проверь исправленные слова 🕌.\n' + original
     f.keyboard().onComplete(null, { data: changed })
     assert.equal(f.page.client.getState().text, changed)
-    assert.equal(f.page.textPages.join(''), changed)
+    assertReviewText(f.page, changed)
     assert.equal(f.page.client.getState().phase, 'review')
     assert.equal(JSON.parse(storage.get(f.page.draftStorageKey)).text, changed)
     assert.equal(f.requests.some(x => /SEND|TEXT_(BEGIN|PART|FINISH)/.test(x.method)), false)
@@ -1570,10 +1596,108 @@ test('missing or failing keyboard keeps the review and all original text', async
     f.page.client.getState = () => ({ phase: 'review', text: 'Полный исходный текст', id: '1700000000000-1' })
     f.page.render(f.page.client.getState())
     assert.doesNotThrow(() => f.page.editTranscript())
-    assert.equal(f.page.pageSource, 'Полный исходный текст')
+    assertReviewText(f.page, 'Полный исходный текст')
     assert.equal(f.page.keyboardOpen, false)
     assert.match(f.page.stageWidget.options.text, /клавиатур/i)
     f.page.onDestroy()
+  }
+})
+
+const agentProfiles = [
+  { kind: 'orca', prefix: 'ORCA', context: { target: 'orca', pairId: 'pair-typed', label: 'Проект' } },
+  { kind: 'claude', prefix: 'CLAUDE', context: { target: 'claude', project: '/work/typed', label: 'Typed', mode: 'auto' } },
+  { kind: 'codex', prefix: 'CODEX', context: { target: 'codex', project: '/work/typed', label: 'Typed', mode: 'read-only' } }
+]
+
+test('Orca, Claude and Codex typed compose cancel safely, persist drafts and honor every Back path', async () => {
+  for (const profile of agentProfiles) {
+    const storage = new Map([['voice-destination', JSON.stringify(profile.context)]])
+    const reply = ({ method }) => method === profile.prefix + '_LATEST'
+      ? { ok: true, job: null } : { ok: true, job: null }
+    const f = pageFixture({ kind: profile.kind, storage, reply })
+    f.page.build(); await flush()
+    assert.equal(f.page.secondaryButton.options.text, 'Написать')
+    f.page.secondaryButton.options.click_func()
+    f.keyboard().onCancel()
+    assert.equal(f.page.client.getState().phase, 'ready')
+
+    const text = `  Черновик ${profile.kind} 🙂\n`
+    f.page.secondaryButton.options.click_func()
+    f.keyboard().onComplete(null, { data: text })
+    assert.equal(f.page.client.getState().phase, 'review')
+    assertReviewText(f.page, text)
+    assert.equal(JSON.parse(storage.get(f.page.draftStorageKey)).text, text)
+    assert.equal(f.requests.some(request => /SEND|TEXT_(BEGIN|PART|FINISH)/.test(request.method)), false)
+    f.page.backButton.options.click_func()
+    assert.equal(f.replacements.at(-1).url, 'page/index')
+    assert.equal(JSON.parse(storage.get(f.page.draftStorageKey)).text, text)
+    f.page.onDestroy()
+
+    const reopened = pageFixture({ kind: profile.kind, storage, reply })
+    reopened.page.build(); await flush()
+    assert.equal(reopened.page.client.getState().phase, 'review')
+    assertReviewText(reopened.page, text)
+    assert.equal(reopened.gesture(), true)
+    assert.equal(reopened.replacements.at(-1).url, 'page/index')
+    assert.equal(reopened.key(), true)
+    assert.equal(reopened.replacements.at(-1).url, 'page/index')
+    assert.equal(JSON.parse(storage.get(reopened.page.draftStorageKey)).text, text)
+    reopened.page.onDestroy()
+  }
+})
+
+test('Orca, Claude and Codex show the first result chunk and open exact full-answer history context', async () => {
+  for (const profile of agentProfiles) {
+    const id = `${profile.kind}-job-1`
+    const context = { ...profile.context, jobId: id, aliasId: id, resumeJob: true }
+    const storage = new Map([['voice-destination', JSON.stringify(context)]])
+    const f = pageFixture({ kind: profile.kind, storage, reply: ({ method, params }) => {
+      assert.equal(method, profile.prefix + '_JOB')
+      assert.deepEqual({ ...params }, { id })
+      return { ok: true, job: { id, state: 'completed', stage: 'completed',
+        result: 'Первая часть', resultLength: 12000 } }
+    } })
+    f.page.build(); await flush()
+    assertReaderText(f.page, 'Первая часть')
+    assert.equal(f.requests.length, 1, 'voice result must not eagerly fetch history pages')
+    assert.equal(f.page.menuButton.options.visible, true)
+    assert.equal(f.page.menuButton.options.text, 'Полный ответ')
+    f.page.menuButton.options.click_func()
+    assert.deepEqual(JSON.parse(storage.get(profile.kind + '-history-view')),
+      { screen: 'detail', id, field: 'result', offset: 0 })
+    assert.deepEqual(JSON.parse(storage.get(profile.kind + '-resume')), { screen: 'history' })
+    if (profile.kind === 'orca') {
+      assert.deepEqual(JSON.parse(storage.get('orca-history-pair')), {
+        id: 'pair-typed', projectLabel: 'Проект', workerAgent: '', reviewerAgent: ''
+      })
+    }
+    assert.equal(f.replacements.at(-1).url, 'page/history')
+    f.page.primaryButton.options.click_func()
+    assert.equal(f.page.client.getState().phase, 'ready')
+    assert.equal(f.page.primaryButton.options.text, 'Надиктовать')
+    assert.equal(f.page.secondaryButton.options.text, 'Написать')
+    const saved = JSON.parse(storage.get('voice-destination'))
+    assert.equal(saved.startFresh, true)
+    assert.equal(saved.resumeJob, false)
+    f.page.onDestroy()
+  }
+})
+
+test('all agent compose footers remain in bounds with at least 44px controls', async () => {
+  for (const profile of agentProfiles) {
+    for (const [width, height] of [[390, 450], [432, 514], [390, 400]]) {
+      const storage = new Map([['voice-destination', JSON.stringify(profile.context)]])
+      const f = pageFixture({ kind: profile.kind, width, height, storage,
+        reply: () => ({ ok: true, job: null }) })
+      f.page.build(); await flush()
+      for (const control of [f.page.backButton, f.page.primaryButton, f.page.secondaryButton]) {
+        const box = control.options
+        assert.ok(box.h >= 44, `${profile.kind} control height at ${width}x${height}`)
+        assert.ok(box.x >= 0 && box.y >= 0 && box.x + box.w <= width && box.y + box.h <= height,
+          `${profile.kind} control bounds at ${width}x${height}`)
+      }
+      f.page.onDestroy()
+    }
   }
 })
 
@@ -1876,7 +2000,7 @@ test('an edited draft and its pending audio cannot be restored into a different 
   assert.equal(JSON.parse(storage.get(first.page.draftStorageKey)).text, 'Исправлено только для A')
   second.page.primaryButton.options.click_func()
   assert.equal(second.page.client.getState().phase, 'error')
-  assert.match(second.page.bodyWidget.options.text, /другой задачи.*не потерять/s)
+  assert.match(scrollText(second.page.readerScroll), /другой задачи.*не потерять/s)
   assert.equal(second.page.primaryButton.options.text, 'Claude')
   assert.equal(second.mediaCalls(), 0)
   assert.equal(storage.get('pending-audio'), savedPending)
@@ -2014,4 +2138,59 @@ test('Musafir row boundaries keep skin tones, flag pairs and spacing marks with 
     }
   }
   f.page.onDestroy()
+})
+
+test('Orca handoff persists one ID before dispatch and reconciles a lost receipt without another mutation', async () => {
+  const sourceId = '1700000000000-1'
+  const storage = new Map([['voice-destination', JSON.stringify({ target: 'orca', pairId: 'pair-1',
+    label: 'Проект', jobId: sourceId, resumeJob: true })]])
+  let release
+  const f = pageFixture({ kind: 'orca', storage, reply: payload => {
+    if (payload.method === 'ORCA_HANDOFF') {
+      assert.equal(JSON.parse(storage.get('voice-destination')).pendingHandoff.id, payload.params.newId)
+      return new Promise(resolve => { release = resolve })
+    }
+    if (payload.method === 'ORCA_JOB' && payload.params.id !== sourceId) return {
+      ok: true, job: { id: payload.params.id, state: 'queued' }
+    }
+    return { ok: true, job: { id: sourceId, state: 'completed', result: 'План готов', mode: 'ask', handoff: true } }
+  } })
+  f.page.build(); await flush()
+  f.page.handoffOrca(); f.page.handoffOrca(); await flush()
+  assert.equal(f.requests.filter(x => x.method === 'ORCA_HANDOFF').length, 1)
+  const newId = JSON.parse(storage.get('voice-destination')).pendingHandoff.id
+  f.tick(18000); await flush()
+  assert.equal(f.page.controlBusy, false)
+  assert.match(f.page.stageWidget.options.text, /не подтверждена/)
+  f.page.handoffOrca(); await flush()
+  assert.equal(f.requests.filter(x => x.method === 'ORCA_HANDOFF').length, 1)
+  assert.equal(f.requests.at(-1).method, 'ORCA_JOB')
+  assert.equal(f.requests.at(-1).params.id, newId)
+  assert.equal(JSON.parse(storage.get('voice-destination')).jobId, newId)
+  assert.equal(JSON.parse(storage.get('voice-destination')).pendingHandoff, null)
+  release({ ok: true, job: { id: newId, state: 'queued' } }); await flush()
+  assert.equal(f.replacements.length, 1)
+  f.page.onDestroy()
+  assert.equal(f.timers.size, 0)
+})
+
+test('Continue stores the next draft under the newly returned agent session', async () => {
+  const sessionId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+  const storage = new Map([['voice-destination', JSON.stringify({ target: 'codex', project: '/project', label: 'Проект', jobId: '123-1', resumeJob: true })]])
+  const reply = () => ({ ok: true, job: { id: '123-1', state: 'completed', result: 'Готово', sessionId } })
+  const f = pageFixture({ kind: 'codex', storage, reply })
+  f.page.build(); await flush()
+  f.page.primaryAction()
+  assert.equal(f.page.client.getState().phase, 'ready')
+  f.page.secondaryAction()
+  f.keyboard().onComplete(null, { data: 'Продолжение в той же сессии' })
+  const key = f.page.draftStorageKey
+  assert.ok(key.endsWith(sessionId))
+  f.page.onDestroy()
+  const g = pageFixture({ kind: 'codex', storage, reply })
+  g.page.build(); await flush()
+  assert.equal(g.page.client.getState().phase, 'review')
+  assert.equal(g.page.client.getState().text, 'Продолжение в той же сессии')
+  assert.equal(g.requests.some(x => x.method === 'CODEX_SEND'), false)
+  g.page.onDestroy()
 })

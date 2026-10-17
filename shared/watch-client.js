@@ -747,6 +747,13 @@ export function createWatchClient({
             return
           }
           assertActive(operation)
+          if (!validReply(reply) && reply && reply.retryable === false) {
+            const restored = { ...review, pendingSend: false }
+            if (!persistDraft(restored)) throw new Error('Не удалось сохранить черновик')
+            emit({ ...restored, phase: 'review', jobId: null, busy: false,
+              error: reply.error || 'Mac отклонил отправку. Проверьте задачу.' })
+            return
+          }
           if (!validReply(reply)) {
             emit({ phase: 'unknown', state: 'unknown', id, jobId: id, text, textId: review.textId,
               edited: review.edited, draftId: review.draftId,

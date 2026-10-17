@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import vm from 'node:vm'
+import { textRows } from '../shared/text-rows.js'
 
 const stripImports = value => value.replace(/^import[\s\S]*?from ['"][^'"]+['"]\n/gm, '')
 const source = stripImports(fs.readFileSync(new URL('../shared/musafir-report-page.js', import.meta.url), 'utf8'))
@@ -23,6 +24,7 @@ function fixture(text = '', reply, { width = 432, height = 514, storage } = {}) 
   ])
   let nextTimer = 0
   const page = vm.runInNewContext(source + '\ncreateMusafirReportPage()', {
+    textRows,
     getDeviceInfo: () => ({ width, height }),
     setStatusBarVisible: value => statusBars.push(value),
     LocalStorage: class {
@@ -30,10 +32,10 @@ function fixture(text = '', reply, { width = 432, height = 514, storage } = {}) 
       setItem(key, value) { values.set(key, value) }
     },
     replace(value) { replacements.push(value) },
-    widget: { FILL_RECT: 1, TEXT: 2, BUTTON: 3 },
+    widget: { FILL_RECT: 1, TEXT: 2, BUTTON: 3, SCROLL_LIST: 4 },
     align: { CENTER_H: 1, CENTER_V: 2, LEFT: 3, TOP: 4 },
     text_style: { WRAP: 1 },
-    prop: { TEXT: 'text', MORE: 'more', VISIBLE: 'visible' },
+    prop: { TEXT: 'text', MORE: 'more', VISIBLE: 'visible', UPDATE_DATA: 'data' },
     createWidget(kind, options) {
       const item = {
         kind,
@@ -43,6 +45,7 @@ function fixture(text = '', reply, { width = 432, height = 514, storage } = {}) 
           if (kind === 3 && property === 'more') {
             for (const key of ['x', 'y', 'w', 'h']) assert.equal(Number.isFinite(value[key]), true, `BUTTON MORE ${key}`)
           }
+          if (property === 'data') { Object.assign(this.options, value); return }
           if (property === 'more') Object.assign(this.options, value)
           else this.options[property] = value
         }
@@ -95,36 +98,66 @@ function assertGeometry(f, width, height) {
     }
   }
   const body = f.page.body.options
-  const nav = f.page.next.options
+  const nav = f.page.retry.options
   assert.equal(body.y + body.h <= nav.y, true)
 }
 
-test('full report preserves Unicode while paging bounded chunks in both directions', async () => {
+async function drain(f) {
+  for (let n = 0; n < 250; n++) {
+    await flush()
+    const next = [...f.timers.entries()].find(([, timer]) => timer.delay === 0)
+    if (!next) return
+    f.timers.delete(next[0]); next[1].callback()
+  }
+  throw new Error('unbounded report loading')
+}
+const rowText = f => f.page.rows.map(row => row.text + row.separator).join('')
+
+test('full report loads automatically into one Unicode scroll list without page controls', async () => {
   const text = 'Русский текст 🙂 العربية\n'.repeat(130)
   const f = fixture(text)
-  await flush()
-  let collected = ''
-  while (true) {
-    collected += f.page.pages.join('')
-    if (f.page.nextOffset === null) break
-    f.page.page = f.page.pages.length - 1
-    f.page.turn(1)
-    await flush()
-  }
-  assert.equal(collected, text)
+  await drain(f)
+  assert.equal(rowText(f), text)
+  assert.equal(f.page.content, text)
   assert.ok(f.calls.length > 2)
   assert.equal(f.page.total, Array.from(text).length)
-  const offset = f.page.offset
-  f.page.page = 0
-  f.page.turn(-1)
-  await flush()
-  assert.equal(f.page.offset, offset - 1000)
-  assert.equal(f.page.page, f.page.pages.length - 1)
-  assert.equal(f.page.previous.options.text, '‹')
-  assert.equal(f.page.next.options.text, '›')
+  assert.equal(f.page.body.options.on_page, 1)
+  assert.equal(f.page.retry.options.visible, false)
+  assert.equal(f.widgets.filter(w => w.kind === 3 && ['‹', '›'].includes(w.options.text)).length, 0)
   f.page.onDestroy()
   assert.equal(f.timers.size, 0)
   assert.deepEqual(f.statusBars, [false, true])
+})
+
+test('failed continuation retains loaded text and retries exactly the unread offset', async () => {
+  let failed = true
+  const text = 'А'.repeat(1000) + 'Конец 🙂'
+  const f = fixture(text, async ({ params }) => {
+    if (params.offset && failed) return { ok: false, error: 'Нет связи' }
+    const chars = Array.from(text), end = Math.min(chars.length, params.offset + params.limit)
+    return { ok: true, id, offset: params.offset, text: chars.slice(params.offset, end).join(''),
+      textLength: chars.length, nextOffset: end < chars.length ? end : null, truncated: false }
+  })
+  await drain(f)
+  assert.equal(rowText(f), 'А'.repeat(1000))
+  assert.equal(f.page.retry.options.visible, true)
+  failed = false
+  f.page.retry.options.click_func()
+  await drain(f)
+  assert.equal(rowText(f), text)
+  assert.deepEqual(f.calls.map(x => x.params.offset), [0, 1000, 1000])
+})
+
+test('Back cancels automatic continuation before navigation', async () => {
+  const f = fixture('А'.repeat(3000))
+  await flush()
+  const queued = [...f.timers.values()].find(x => x.delay === 0)
+  assert.ok(queued)
+  f.page.back.options.click_func()
+  queued.callback()
+  await flush()
+  assert.equal(f.calls.length, 1)
+  assert.equal(f.timers.size, 0)
 })
 
 test('Back restores the exact report job; Home clears the pending return view', async () => {
@@ -156,7 +189,7 @@ test('right swipe and KEY_BACK use report Back and invalid context falls home', 
   ])
   const invalid = fixture('', null, { storage })
   assert.equal(invalid.calls.length, 0)
-  assert.equal(invalid.page.body.options.text, 'Откройте ответ из выбранного чата.')
+  assert.equal(rowText(invalid), 'Откройте ответ из выбранного чата.')
   invalid.page.back.options.click_func()
   assert.equal(invalid.replacements.at(-1).url, 'page/index')
   assert.equal(storage.get('musafir-return-view'), '')
@@ -166,21 +199,19 @@ test('loading, success, errors and all three device sizes keep compact safe geom
   for (const [width, height] of [[432, 514], [390, 450], [390, 400]]) {
     let finish
     const f = fixture('', () => new Promise(resolve => { finish = resolve }), { width, height })
-    assert.equal(f.page.counter.options.text, '')
     assertGeometry(f, width, height)
     await flush()
     finish({ ok: true, id, offset: 0, text: 'Ответ', textLength: 5, nextOffset: null, truncated: false })
     await flush()
     assertGeometry(f, width, height)
-    assert.equal(f.page.body.options.y + f.page.body.options.h <= f.page.next.options.y, true)
+    assert.equal(f.page.body.options.y + f.page.body.options.h <= f.page.retry.options.y, true)
     f.page.onDestroy()
     assert.equal(f.interaction.offGesture, 1)
     assert.equal(f.interaction.offKey, 1)
 
     const error = fixture('', async () => ({ ok: false, error: 'Нет связи с Mac' }), { width, height })
     await flush()
-    assert.equal(error.page.next.options.text, 'Повторить')
-    assert.equal(error.page.counter.options.text, '')
+    assert.equal(error.page.retry.options.text, 'Повторить загрузку')
     assertGeometry(error, width, height)
     error.page.onDestroy()
   }
@@ -193,9 +224,8 @@ test('malformed report and timeout clear the counter and expose a bounded retry'
     }))
     await flush()
     assert.equal(f.page.error, true)
-    assert.equal(f.page.counter.options.text, '')
-    assert.equal(f.page.next.options.text, 'Повторить')
-    assert.equal(f.page.next.options.visible, true)
+    assert.equal(f.page.retry.options.text, 'Повторить загрузку')
+    assert.equal(f.page.retry.options.visible, true)
     f.page.onDestroy()
   }
 
@@ -206,9 +236,21 @@ test('malformed report and timeout clear the counter and expose a bounded retry'
   timer.callback()
   await flush()
   assert.equal(f.page.error, true)
-  assert.equal(f.page.counter.options.text, '')
   f.page.onDestroy()
   finish({ ok: true, id, text: 'late', offset: 0, textLength: 4, nextOffset: null, truncated: false })
   await flush()
-  assert.notEqual(f.page.body.options.text, 'late')
+  assert.notEqual(rowText(f), 'late')
+})
+
+test('incremental rows preserve Unicode and exact source offsets without rewrapping loaded content', () => {
+  const content = ('Русский е\u0301 👨‍👩‍👧‍👦 العربية\n\n').repeat(2000)
+  const chars = Array.from(content)
+  let rows = [], measurements = 0
+  for (let offset = 0; offset < chars.length; offset += 37) {
+    rows = textRows(chars.slice(offset, offset + 37).join(''), 350, 20,
+      () => { measurements++; return null }, rows)
+  }
+  assert.equal(rows.map(row => row.text + row.separator).join(''), content)
+  for (const row of rows) assert.equal(content.slice(row.start, row.end), row.text)
+  assert.ok(measurements < chars.length, 'work scales with new text, not all previously loaded text')
 })

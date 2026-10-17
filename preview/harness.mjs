@@ -1,6 +1,8 @@
+import { textRows } from '/shared/text-rows.js'
 import { forwardVoiceRequest } from '/shared/bridge-client.js'
 import { MAX_AUDIO_BYTES, createWatchClient } from '/shared/watch-client.js'
 import { createFolderVoiceRoute, createOrcaVoiceRoute } from '/shared/orca-voice.js'
+import { createClaudeVoiceRoute, createCodexVoiceRoute } from '/shared/claude-voice.js'
 import {
   createMusafirVoiceRoute, normalizeContext, heroById, MUSAFIR_HEROES,
   MUSAFIR_CONTEXT_KEY, MUSAFIR_HERO_KEY
@@ -37,6 +39,12 @@ let audioStatusCalls = 0
 let jobStatusCalls = 0
 let gestureCallback = null
 let keyCallback = null
+const PROFILES = Object.freeze({
+  musafir: { title: 'Мусафир', menu: 'page/index', voice: 'page/voice', history: 'page/history' },
+  orca: { title: 'Orca', menu: 'page/orca', voice: 'page/voice-orca', history: 'page/history-orca' },
+  claude: { title: 'Claude', menu: 'page/claude', voice: 'page/voice-claude', history: 'page/history-claude' },
+  codex: { title: 'Codex', menu: 'page/codex', voice: 'page/voice-codex', history: 'page/history-codex' }
+})
 const interaction = {
   GESTURE_RIGHT: 'right', GESTURE_LEFT: 'left', GESTURE_UP: 'up', GESTURE_DOWN: 'down',
   KEY_BACK: 'back', KEY_HOME: 'home', KEY_EVENT_CLICK: 'click',
@@ -59,19 +67,14 @@ const submittedJobs = new Map()
 const submittedChats = new Map()
 
 const reviewText = 'Проверь состояние проекта. Исправь две опечатки в названии экрана. Перед началом покажи, что задание принято. После выполнения пришли результат на часы. '.repeat(3)
-const fullReport = [
-  'Проверка завершена.',
-  '',
-  'Найдены две опечатки в названии экрана. В локальной демонстрации файлы и команды не изменяются.',
-  '',
-  'Что проверено:',
-  '• главный экран с недавними чатами;',
-  '• продолжение выбранной темы;',
-  '• запись, распознавание и просмотр текста;',
-  '• возврат к чатам и чтение полного ответа.',
-  '',
-  'Это синтетический отчёт для browser preview. Hermes, bridge и реальные агенты не запускались.'
-].join('\n')
+const reportParagraph = [
+  'Проверка завершена: русский текст, العربية، 中文, emoji 🧭✅ и составные символы é отображаются вместе.',
+  'Проверены меню, возврат, отмена, редактирование, ожидание, ошибка и восстановление.',
+  'Это синтетический отчёт browser preview. Файлы, команды, bridge и реальные агенты не затрагиваются.'
+].join(' ')
+const fullReport = Array.from({ length: 16 }, (_, index) =>
+  `${index + 1}. ${reportParagraph}`).join('\n\n') +
+  '\n\nФИНАЛ ПРЕДПРОСМОТРА · конец полного ответа ✅'
 
 function makeMusafirJob(id, state, values = {}) {
   const report = values.report || fullReport
@@ -103,11 +106,17 @@ const demoTerminals = [
 const demoPair = {
   id: 'pair-demo', projectLabel: 'Демо проект', workerAgent: 'codex', reviewerAgent: 'claude'
 }
-const historyDemo = [0, 1, 2, 3].map(i => ({
-  id: `170000000000${i}-1`, created: 1700000000 - i * 3600, state: 'completed', deleted: false,
-  text: ['Покажи мой план на сегодня', 'Что мы обсуждали вчера?', 'Подготовь список дел', 'Напомни мой вопрос'][i],
-  result: 'Это пример сохранённого ответа для просмотра интерфейса. '.repeat(15)
-}))
+const historyDemo = [
+  {
+    id: RESULT_JOB_ID, created: 1700000500, state: 'completed', deleted: false,
+    text: reviewText, result: fullReport
+  },
+  ...[0, 1, 2, 3].map(i => ({
+    id: `170000000000${i}-1`, created: 1700000000 - i * 3600, state: 'completed', deleted: false,
+    text: ['Покажи мой план на сегодня', 'Что мы обсуждали вчера?', 'Подготовь список дел', 'Напомни мой вопрос'][i],
+    result: 'Это пример сохранённого ответа для просмотра интерфейса. '.repeat(15)
+  }))
+]
 
 const scenarios = {
   ready: null,
@@ -185,7 +194,7 @@ function imageSource(value) {
 }
 
 function setWatchGeometry() {
-  const [width, height] = appKind === 'musafir' ? geometrySelect.value.split('x').map(Number) : [390, 450]
+  const [width, height] = geometrySelect.value.split('x').map(Number)
   document.documentElement.style.setProperty('--watch-width', `${width}px`)
   document.documentElement.style.setProperty('--watch-height', `${height}px`)
   screen.dataset.app = appKind
@@ -201,7 +210,7 @@ function applyGeometry(node, options) {
   }
 }
 
-function applyWidget(record) {
+function applyWidget(record, forceListRender = false) {
   const { node, type, options } = record
   applyGeometry(node, options)
   node.hidden = options.visible === false
@@ -232,9 +241,12 @@ function applyWidget(record) {
     }
   }
   if (type === widget.SCROLL_LIST) {
-    if (record.renderedData === options.data_array) return
+    if (!forceListRender && record.renderedData === options.data_array &&
+        record.renderedCount === options.data_count) return
     record.renderedData = options.data_array
-    const scrollTop = options.on_page === 1 ? node.scrollTop : 0
+    record.renderedCount = options.data_count
+    const scrollTop = record.preserveListPosition ? node.scrollTop : 0
+    record.preserveListPosition = false
     node.replaceChildren()
     for (let index = 0; index < (options.data_count || 0); index++) {
       const data = options.data_array[index]
@@ -285,9 +297,15 @@ function createWidget(type, initial = {}) {
           (property !== prop.MORE || !['x', 'y', 'w', 'h'].every(key => Number.isFinite(value?.[key])))) {
         throw new Error('Native BUTTON update requires complete x,y,w,h: ' + String(this.options.text))
       }
-      if ((property === prop.MORE || property === prop.UPDATE_DATA) && value && typeof value === 'object') Object.assign(this.options, value)
+      if ((property === prop.MORE || property === prop.UPDATE_DATA) && value && typeof value === 'object') {
+        if (property === prop.UPDATE_DATA) {
+          this.preserveListPosition = value.on_page === 1
+          this.options.on_page = this.preserveListPosition ? 1 : 0
+        }
+        Object.assign(this.options, value)
+      }
       else this.options[property] = value
-      applyWidget(this)
+      applyWidget(this, property === prop.UPDATE_DATA)
       updateSnapshot()
     }
   }
@@ -443,6 +461,7 @@ function syntheticBridge(payload) {
       }
       case 'HISTORY_DETAIL': {
         const entry = historyDemo.find(x => x.id === params.id)
+        if (!entry || !['text', 'result'].includes(params.field)) { resolve({ ok: false, error: 'Запись не найдена' }); return }
         const chars = Array.from(entry[params.field])
         resolve({ ok: true, ...entry, field: params.field, offset: params.offset,
           content: chars.slice(params.offset, params.offset + params.limit).join(''), total: chars.length,
@@ -468,6 +487,7 @@ function syntheticBridge(payload) {
       }
       case 'ORCA_HISTORY_DETAIL': {
         const entry = historyDemo.find(x => x.id === params.id)
+        if (!entry || !['text', 'result'].includes(params.field)) { resolve({ ok: false, error: 'Запись не найдена' }); return }
         const chars = Array.from(entry[params.field])
         resolve({ ok: true, ...entry, field: params.field, offset: params.offset,
           content: chars.slice(params.offset, params.offset + params.limit).join(''), total: chars.length,
@@ -691,7 +711,24 @@ function syntheticBridge(payload) {
           summary: 'Синтетическая задача принята' } })
         return
       case 'ORCA_JOB':
+        if (scenario === 'offline') { reject(new Error('Телефон не ответил')); return }
+        if (scenario === 'error') { resolve({ ok: false, error: 'Не удалось получить статус Orca' }); return }
         jobStatusCalls += 1
+        if (scenario === 'approval') {
+          resolve({ ok: true, job: { id: params.id, state: 'question', stage: 'reviewer_question',
+            questionId: '1700000001300-1', question: 'Какой вариант выбрать для синтетической проверки?' } })
+          return
+        }
+        if (scenario === 'job') {
+          resolve({ ok: true, job: { id: params.id, state: 'running', stage: 'worker_working',
+            summary: 'Синтетический агент работает' } })
+          return
+        }
+        if (scenario === 'result') {
+          resolve({ ok: true, job: { id: params.id, state: 'completed', stage: 'completed',
+            result: 'Синтетический итог Orca. Откройте полный ответ.', resultLength: Array.from(fullReport).length } })
+          return
+        }
         resolve(jobStatusCalls < 2
           ? { ok: true, job: { id: params.id, state: 'running', stage: 'worker_working',
             summary: 'Синтетический агент работает' } }
@@ -717,6 +754,93 @@ function syntheticBridge(payload) {
       case 'ORCA_PAUSE':
         resolve({ ok: true, job: { id: params.id, state: 'running',
           stage: params.paused ? 'paused' : 'worker_working' } })
+        return
+      case 'CLAUDE_PROJECTS':
+      case 'CODEX_PROJECTS':
+        resolve({ ok: true, projects: [{ id: '/local/demo', label: 'Демо проект' }], nextCursor: null })
+        return
+      case 'CLAUDE_MODES':
+      case 'CODEX_MODES':
+        resolve({ ok: true, modes: [{ id: 'auto', label: 'Авто' }, { id: 'read-only', label: 'Только чтение' }], nextCursor: null })
+        return
+      case 'CLAUDE_SESSIONS':
+      case 'CODEX_SESSIONS':
+        resolve({ ok: true, sessions: [{ id: 'session-demo', label: 'Синтетическая сессия' }], nextCursor: null })
+        return
+      case 'CLAUDE_LATEST':
+      case 'CODEX_LATEST':
+      case 'CLAUDE_JOB':
+      case 'CODEX_JOB': {
+        if (scenario === 'offline') { reject(new Error('Телефон не ответил')); return }
+        if (scenario === 'error') { resolve({ ok: false, error: `Не удалось получить статус ${PROFILES[appKind].title}` }); return }
+        if (scenario === 'compose' || scenario === 'ready' || scenario === 'review') {
+          resolve({ ok: true, job: null }); return
+        }
+        const id = params.id || RESULT_JOB_ID
+        if (scenario === 'approval') {
+          resolve({ ok: true, job: { id, state: 'approval', result: '', resultLength: 0,
+            approval: { id: '1700000001300-1', text: 'Разрешить синтетическое действие?',
+              question: 'Как продолжить?', options: ['Разрешить', 'Отклонить'] } } })
+          return
+        }
+        if (scenario === 'job') {
+          resolve({ ok: true, job: { id, state: 'running', result: '', resultLength: 0 } }); return
+        }
+        resolve({ ok: true, job: { id, state: 'completed',
+          result: `Синтетический итог ${PROFILES[appKind].title}. Откройте полный ответ.`,
+          resultLength: Array.from(fullReport).length, sessionId: 'session-demo' } })
+        return
+      }
+      case 'CLAUDE_SEND':
+      case 'CODEX_SEND':
+        resolve({ ok: true, job: { id: params.id, state: 'completed',
+          result: `Синтетический итог ${PROFILES[appKind].title}.`,
+          resultLength: Array.from(fullReport).length, sessionId: 'session-demo' } })
+        return
+      case 'CLAUDE_APPROVE':
+      case 'CODEX_APPROVE':
+        resolve({ ok: true, job: { id: params.id, state: params.allow ? 'completed' : 'error',
+          result: params.allow ? 'Синтетическое действие разрешено.' : '',
+          error: params.allow ? '' : 'Действие отклонено', resultLength: params.allow ? Array.from(fullReport).length : 0 } })
+        return
+      case 'CLAUDE_STOP':
+      case 'CODEX_STOP':
+        resolve({ ok: true, job: { id: params.id, state: 'error', error: 'Остановлено с часов', resultLength: 0 } })
+        return
+      case 'CLAUDE_HISTORY_LIST':
+      case 'CODEX_HISTORY_LIST': {
+        const items = historyDemo.filter(x => x.deleted === params.trash)
+        resolve({ ok: true, items: items.slice(params.offset, params.offset + params.limit), hasMore: items.length > params.offset + params.limit })
+        return
+      }
+      case 'CLAUDE_HISTORY_DETAIL':
+      case 'CODEX_HISTORY_DETAIL': {
+        const entry = historyDemo.find(x => x.id === params.id)
+        if (!entry || !['text', 'result'].includes(params.field)) { resolve({ ok: false, error: 'Запись не найдена' }); return }
+        const chars = Array.from(entry[params.field])
+        const content = chars.slice(params.offset, params.offset + params.limit).join('')
+        resolve({ ok: true, ...entry, field: params.field, offset: params.offset, content,
+          total: chars.length, complete: params.offset + Array.from(content).length >= chars.length })
+        return
+      }
+      case 'CLAUDE_HISTORY_SET_DELETED':
+      case 'CODEX_HISTORY_SET_DELETED': {
+        const entry = historyDemo.find(x => x.id === params.id)
+        if (!entry) { resolve({ ok: false, error: 'Запись не найдена' }); return }
+        entry.deleted = params.deleted
+        resolve({ ok: true, id: entry.id, deleted: entry.deleted })
+        return
+      }
+      case 'CLAUDE_HISTORY_EMPTY_TRASH':
+      case 'CODEX_HISTORY_EMPTY_TRASH': {
+        const removed = historyDemo.filter(x => x.deleted).length
+        historyDemo.forEach(x => { if (x.deleted) x.deleted = false })
+        resolve({ ok: true, removed })
+        return
+      }
+      case 'SUMMARY':
+        if (scenario === 'offline' || scenario === 'home-error') { reject(new Error('Телефон не ответил')); return }
+        resolve({ ok: true, text: `${PROFILES[appKind].title}: синтетическая среда готова` })
         return
       default:
         resolve({ ok: false, error: `Неизвестный локальный метод: ${payload.method}` })
@@ -790,30 +914,33 @@ function evaluatePage(source, sourcePath) {
   let prefix = ''
   if (sourcePath === 'page/index') {
     prefix = executableSource(pageSources.get('shared/musafir-page'), 'createMusafirPage')
-  } else if (sourcePath === 'page/voice' || sourcePath === 'page/voice-orca') {
+  } else if (sourcePath === 'page/claude' || sourcePath === 'page/codex') {
+    prefix = executableSource(pageSources.get('shared/agent-menu'), 'createAgentMenuPage')
+  } else if (sourcePath.startsWith('page/voice')) {
     prefix = executableSource(pageSources.get('shared/watch-alerts'), 'createWatchAlerts') + '\n' +
       executableSource(pageSources.get('shared/voice-page'), 'createVoicePage')
   } else if (sourcePath === 'page/report') {
     prefix = executableSource(pageSources.get('shared/musafir-report-page'), 'createMusafirReportPage')
-  } else if (sourcePath === 'page/history' || sourcePath === 'page/history-orca') {
+  } else if (sourcePath.startsWith('page/history')) {
     prefix = executableSource(pageSources.get('shared/history-page'), 'createHistoryPage')
   }
   const executable = `${prefix}\n${executableSource(source)}`
   const names = [
-    'createWidget', 'widget', 'align', 'text_style', 'prop', 'event', 'getTextLayout', 'setStatusBarVisible',
+    'textRows', 'createWidget', 'widget', 'align', 'text_style', 'prop', 'event', 'getTextLayout', 'setStatusBarVisible',
     'getDeviceInfo', 'setTimeout', 'clearTimeout', 'codec', 'create', 'mediaId',
     'closeSync', 'openSync', 'O_RDONLY', 'readSync', 'rmSync', 'statSync',
     'BasePage', 'MAX_AUDIO_BYTES', 'createWatchClient', 'createFolderVoiceRoute',
-    'createOrcaVoiceRoute', 'createMusafirVoiceRoute', 'normalizeContext', 'heroById',
+    'createOrcaVoiceRoute', 'createClaudeVoiceRoute', 'createCodexVoiceRoute',
+    'createMusafirVoiceRoute', 'normalizeContext', 'heroById',
     'MUSAFIR_HEROES', 'MUSAFIR_CONTEXT_KEY', 'MUSAFIR_HERO_KEY',
-    'replace', 'Page', 'LocalStorage', 'setWakeUpRelaunch',
+    'replace', 'routerBack', 'Page', 'LocalStorage', 'setWakeUpRelaunch',
     'setPageBrightTime', 'resetPageBrightTime', 'pauseDropWristScreenOff',
     'resetDropWristScreenOff', 'Vibrator', 'VIBRATOR_SCENE_SHORT_STRONG', 'keyboardUI',
     'deleteWidget', 'interaction', 'onGesture', 'offGesture', 'onKey', 'offKey',
     'GESTURE_RIGHT', 'KEY_BACK', 'KEY_EVENT_CLICK'
   ]
   const values = [
-    createWidget, widget, align, text_style, prop, { CLICK_UP: 'click' }, getTextLayout,
+    textRows, createWidget, widget, align, text_style, prop, { CLICK_UP: 'click' }, getTextLayout,
     visible => { document.querySelector('.os-header').hidden = !visible },
     () => setWatchGeometry(),
     window.setTimeout.bind(window), window.clearTimeout.bind(window),
@@ -822,9 +949,10 @@ function evaluatePage(source, sourcePath) {
     ({ path: file }) => ({ size: files.get(file)?.byteLength || 0 }),
     definition => ({ request: localRequest, ...definition }),
     MAX_AUDIO_BYTES, createWatchClient, createFolderVoiceRoute, createOrcaVoiceRoute,
-    createMusafirVoiceRoute, normalizeContext, heroById, MUSAFIR_HEROES,
+    createClaudeVoiceRoute, createCodexVoiceRoute, createMusafirVoiceRoute,
+    normalizeContext, heroById, MUSAFIR_HEROES,
     MUSAFIR_CONTEXT_KEY, MUSAFIR_HERO_KEY,
-    localReplace, instantiatePage,
+    localReplace, () => navigate('page/index'), instantiatePage,
     class {
       getItem(key) { return storage.has(key) ? storage.get(key) : null }
       setItem(key, value) { storage.set(key, value) }
@@ -850,15 +978,16 @@ function destroyPage() {
 }
 
 async function navigate(path) {
-  const sourcePath = appKind === 'orca' && path === 'page/index' ? 'page/orca'
-    : appKind === 'orca' && path === 'page/voice' ? 'page/voice-orca'
-      : appKind === 'orca' && path === 'page/history' ? 'page/history-orca' : path
+  const profile = PROFILES[appKind]
+  const sourcePath = path === 'page/index' ? profile.menu
+    : path === 'page/voice' ? profile.voice
+      : path === 'page/history' ? profile.history : path
   const source = pageSources.get(sourcePath)
   if (!source) throw new Error(`Нет страницы ${path}`)
   destroyPage()
   currentPath = path
   lastState = {
-    phase: sourcePath === 'page/orca' ? 'menu'
+    phase: ['page/orca', 'page/claude', 'page/codex'].includes(sourcePath) ? 'menu'
       : sourcePath === 'page/index' ? 'home'
         : sourcePath === 'page/report' ? 'report' : 'booting'
   }
@@ -920,6 +1049,13 @@ function musafirContext({ chatId = CHAT_ID, mode = 'task', jobId = null, openJob
 }
 
 function seedMusafirScenario(name) {
+  if (name === 'history') {
+    storage.set('musafir-history-view', JSON.stringify({
+      screen: 'detail', id: RESULT_JOB_ID, field: 'result', offset: 0
+    }))
+    storage.set('musafir-resume', 'history')
+    return 'page/history'
+  }
   if (name === 'review') {
     storage.set(MUSAFIR_CONTEXT_KEY, JSON.stringify(musafirContext()))
     storage.set('pending-audio', JSON.stringify({
@@ -973,6 +1109,49 @@ function seedMusafirScenario(name) {
   return 'page/index'
 }
 
+function destinationForProfile(name) {
+  if (appKind === 'orca') {
+    return {
+      target: 'orca', pairId: demoPair.id, label: demoPair.projectLabel,
+      workerAgent: demoPair.workerAgent, reviewerAgent: demoPair.reviewerAgent,
+      jobId: ['approval', 'job', 'result', 'offline', 'error'].includes(name) ? RESULT_JOB_ID : null,
+      aliasId: RESULT_JOB_ID, resumeJob: ['approval', 'job', 'result', 'offline', 'error'].includes(name),
+      startFresh: !['approval', 'job', 'result', 'offline', 'error'].includes(name)
+    }
+  }
+  return {
+    target: appKind, project: '/local/demo', label: 'Демо проект', mode: 'auto', modeLabel: 'Авто',
+    jobId: ['approval', 'job', 'result', 'offline', 'error'].includes(name) ? RESULT_JOB_ID : null,
+    aliasId: RESULT_JOB_ID, resumeJob: ['approval', 'job', 'result', 'offline', 'error'].includes(name),
+    startFresh: !['approval', 'job', 'result', 'offline', 'error'].includes(name)
+  }
+}
+
+function destinationDraftKey(destination) {
+  return `voice-draft:${destination.target}:${destination.pairId || destination.project || destination.rootId}:${destination.sessionId || ''}`
+}
+
+function seedAgentScenario(name) {
+  if (['ready', 'heroes', 'home-error'].includes(name)) return 'page/index'
+  const destination = destinationForProfile(name)
+  storage.set('voice-destination', JSON.stringify(destination))
+  if (name === 'review') {
+    storage.set('pending-audio', JSON.stringify({
+      id: REVIEW_AUDIO_ID, fileName: `${appKind}-review.opus`, totalBytes: 8192, accepted: true,
+      destinationKey: destinationDraftKey(destination)
+    }))
+  }
+  if (name === 'history' || name === 'report') {
+    if (appKind === 'orca') storage.set('orca-history-pair', JSON.stringify(demoPair))
+    storage.set(`${appKind}-history-view`, JSON.stringify({
+      screen: 'detail', id: RESULT_JOB_ID, field: 'result', offset: 0
+    }))
+    storage.set(`${appKind}-resume`, JSON.stringify({ screen: 'history' }))
+    return 'page/history'
+  }
+  return 'page/voice'
+}
+
 async function rebuild(nextScenario) {
   destroyPage()
   scenario = nextScenario
@@ -980,25 +1159,20 @@ async function rebuild(nextScenario) {
   jobStatusCalls = 0
   resetSyntheticRuntime()
   setWatchGeometry()
-  if (appKind === 'orca') {
-    storage.set('voice-destination', JSON.stringify({
-      target: 'orca', pairId: demoPair.id, label: demoPair.projectLabel,
-      workerAgent: demoPair.workerAgent, reviewerAgent: demoPair.reviewerAgent
-    }))
-    await navigate('page/voice')
-  } else {
-    await navigate(seedMusafirScenario(nextScenario))
-  }
+  await navigate(appKind === 'musafir' ? seedMusafirScenario(nextScenario) : seedAgentScenario(nextScenario))
   const expectedPhase = {
-    ready: appKind === 'musafir' ? 'home' : 'ready',
+    ready: appKind === 'musafir' ? 'home' : 'menu',
     compose: 'ready', recording: 'ready', uploading: 'ready', transcribing: 'ready',
     review: 'review', approval: 'approval', job: 'job', result: 'result',
-    report: 'report', offline: 'error', error: 'error'
+    report: appKind === 'musafir' ? 'report' : 'history', history: 'history',
+    offline: 'error', error: 'error'
   }[nextScenario]
   if (expectedPhase === 'home') {
     await waitFor(() => currentPath === 'page/index' && currentPage && currentPage.items && currentPage.items.length > 0, 1800)
   } else if (expectedPhase === 'report') {
     await waitFor(() => currentPath === 'page/report' && currentPage && currentPage.loading === false, 1800)
+  } else if (expectedPhase === 'history') {
+    await waitFor(() => currentPath === 'page/history' && currentPage && currentPage.reading === false, 5000)
   } else if (expectedPhase) {
     await waitForPhase(expectedPhase, nextScenario === 'review' ? 3200 : 1800)
   }
@@ -1009,7 +1183,7 @@ async function previewShow(name = 'ready') {
   select.value = name
 
   if (name === 'recording') {
-    await rebuild(appKind === 'musafir' ? 'recording' : 'ready')
+    await rebuild('recording')
     await waitForPhase('ready')
     currentPage.startRecording()
     // ponytail: one honest demo offset makes the timer and pulse visible immediately.
@@ -1029,7 +1203,7 @@ async function previewShow(name = 'ready') {
     return window.previewState()
   }
   if (name === 'uploading' || name === 'transcribing') {
-    await rebuild(appKind === 'musafir' ? name : 'ready')
+    await rebuild(name)
     await waitForPhase('ready')
     currentPage.client.close()
     const state = name === 'uploading'
@@ -1071,8 +1245,8 @@ screen.addEventListener('pointerup', event => {
   pointerStart = null
 })
 appSelect.addEventListener('change', async () => {
-  appKind = appSelect.value === 'orca' ? 'orca' : 'musafir'
-  appName.textContent = appKind === 'orca' ? 'Orca' : 'Мусафир'
+  appKind = Object.prototype.hasOwnProperty.call(PROFILES, appSelect.value) ? appSelect.value : 'musafir'
+  appName.textContent = PROFILES[appKind].title
   scenario = 'ready'
   select.value = 'ready'
   destroyPage()
@@ -1086,8 +1260,8 @@ updateClock()
 
 try {
   const sources = await Promise.all([
-    'page/index', 'page/voice', 'page/report', 'page/orca', 'page/history',
-    'shared/voice-page', 'shared/watch-alerts', 'shared/history-page',
+    'page/index', 'page/voice', 'page/report', 'page/orca', 'page/claude', 'page/codex', 'page/history',
+    'shared/voice-page', 'shared/watch-alerts', 'shared/history-page', 'shared/agent-menu',
     'shared/musafir-page', 'shared/musafir-report-page'
   ].map(async path => {
     const response = await fetch(`/${path}.js`, { cache: 'no-store' })
@@ -1096,9 +1270,13 @@ try {
   }))
   for (const [path, source] of sources) pageSources.set(path, source)
   pageSources.set('page/voice-orca', `Page(BasePage(createVoicePage({
-    kind: 'orca', icon: 'orca-mark.png', title: 'Orca', version: '0.3.7'
+    kind: 'orca', icon: 'orca-mark.png', title: 'Orca', version: '0.4.0'
   })))`)
+  pageSources.set('page/voice-claude', "Page(BasePage(createVoicePage({ kind: 'claude', icon: 'claude-mark.png', title: 'Claude', version: '0.2.0' })))")
+  pageSources.set('page/voice-codex', "Page(BasePage(createVoicePage({ kind: 'codex', icon: 'codex-mark.png', title: 'Codex', version: '0.2.0' })))")
   pageSources.set('page/history-orca', "Page(BasePage(createHistoryPage({ kind: 'orca' })))")
+  pageSources.set('page/history-claude', "Page(BasePage(createHistoryPage({ kind: 'claude' })))")
+  pageSources.set('page/history-codex', "Page(BasePage(createHistoryPage({ kind: 'codex' })))")
   setWatchGeometry()
   await previewShow('ready')
 } catch (error) {

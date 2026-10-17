@@ -1,3 +1,4 @@
+import { textRows } from './text-rows'
 import { createWidget, widget, align, text_style, prop, getTextLayout, setStatusBarVisible } from '@zos/ui'
 import * as keyboardUI from '@zos/ui'
 import { getDeviceInfo } from '@zos/device'
@@ -30,51 +31,7 @@ const LEGACY_COLORS = { background: 0x0b0b0c, gold: 0xeac477, text: 0xf4eee3,
 function clockText(seconds) {
   return `${Math.floor(seconds / 60).toString().padStart(2, '0')}:${(seconds % 60).toString().padStart(2, '0')}`
 }
-function reviewRows(value, width, textSize) {
-  const glyphs = Array.from(value)
-  const widths = new Map()
-  let marks
-  try { marks = new RegExp('\\p{Mark}', 'u') }
-  catch (error) { marks = /[\u0300-\u036f\u0610-\u061a\u064b-\u065f\u0670\u06d6-\u06ed\u093a-\u094f\u1ab0-\u1aff\u1dc0-\u1dff\u20d0-\u20ff\ufe20-\ufe2f]/u }
-  const joinsPrevious = glyph => marks.test(glyph) || /[\u200d\ufe00-\ufe0f]/u.test(glyph) ||
-    (glyph.codePointAt(0) >= 0x1f3fb && glyph.codePointAt(0) <= 0x1f3ff)
-  const regional = glyph => glyph && glyph.codePointAt(0) >= 0x1f1e6 && glyph.codePointAt(0) <= 0x1f1ff
-  const glyphWidth = glyph => {
-    if (joinsPrevious(glyph)) return 0
-    if (widths.has(glyph)) return widths.get(glyph)
-    let measured = 0
-    try {
-      const layout = getTextLayout(glyph, { text_size: textSize, text_width: 0, wrapped: 0 })
-      if (layout && layout.result !== -1 && layout.width > 0 && layout.width <= textSize * 2) measured = layout.width
-    } catch (error) {}
-    const fallback = textSize * (/\s/u.test(glyph) ? 0.4 : /[MWmwЖШЩЮФжшщюф]|[^\u0000-\u052f]/u.test(glyph) ? 1.05 : 0.68)
-    const result = Math.max(measured, fallback) + 0.5
-    widths.set(glyph, result)
-    return result
-  }
-  const rows = []
-  let index = 0, offset = 0
-  while (index < glyphs.length) {
-    let end = index, used = 0, wordEnd = -1, regionalRun = 0
-    while (end < glyphs.length && glyphs[end] !== '\n') {
-      const next = glyphWidth(glyphs[end])
-      const joined = end > index && (glyphs[end - 1] === '\u200d' || joinsPrevious(glyphs[end]) ||
-        (regional(glyphs[end]) && regionalRun % 2 === 1))
-      if (end > index && used + next > width && !joined) break
-      used += next
-      regionalRun = regional(glyphs[end]) ? regionalRun + 1 : 0
-      end++
-      if (/\s/u.test(glyphs[end - 1])) wordEnd = end
-    }
-    if (end < glyphs.length && glyphs[end] !== '\n' && wordEnd > index + (end - index) / 2) end = wordEnd
-    const text = glyphs.slice(index, end).join('')
-    const separator = glyphs[end] === '\n' ? '\n' : ''
-    rows.push({ text, display: text.trim() ? text : '↵', start: offset, end: offset + text.length, separator })
-    offset += text.length + separator.length
-    index = end + separator.length
-  }
-  return rows
-}
+
 function pagesFor(value, width, px, height = 146) {
   const characters = Array.from(String(value || ''))
   if (!characters.length) return ['']
@@ -129,7 +86,7 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
   const logName = isOrca ? 'orca' : isClaude ? kind : 'musafer'
   return {
   build() {
-    if (isMusafir) setStatusBarVisible(false)
+    setStatusBarVisible(false)
     const { width, height } = getDeviceInfo()
     // Keep layout in the actual app window, including compatibility mode.
     const scale = Math.min(width / 390, height / 450)
@@ -170,6 +127,9 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
     this.pendingResumeTimer = null
     this.stopArmed = false
     this.stopTimer = null
+    this.controlTimer = null
+    this.cancelControl = null
+    this.controlBusy = false
     this.displayRenewedAt = 0
     let legacyOrcaContext = false
     if (isMenuApp) {
@@ -227,17 +187,19 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
     createWidget(widget.FILL_RECT, {
       x: 0, y: 0, w: width, h: height, color: COLORS.background
     })
-    this.backButton = isMusafir ? createWidget(widget.BUTTON, {
+    this.backButton = createWidget(widget.BUTTON, {
       x: px(24), y: px(12), w: Math.max(112, px(112)), h: Math.max(48, px(48)), radius: px(12),
       normal_color: COLORS.surface, press_color: COLORS.pressed, color: COLORS.text,
       text_size: px(18), text: '‹ Назад', click_func: () => this.handleMusafirBack()
-    }) : null
+    })
+    const statusY = px(12) + Math.max(48, px(48)) + 4
+    const stageY = statusY + px(32) + 2
     this.statusWidget = createWidget(widget.TEXT, {
-      ...centered, y: px(60), h: px(36), color: COLORS.gold,
+      ...centered, y: statusY, h: px(32), color: COLORS.gold,
       text_size: px(24), text: 'Подключение'
     })
     this.stageWidget = createWidget(widget.TEXT, {
-      ...centered, y: px(99), h: px(25), color: COLORS.muted,
+      ...centered, y: stageY, h: px(25), color: COLORS.muted,
       text_size: px(17), text: ''
     })
     this.brandWidget = createWidget(widget.IMG, {
@@ -303,17 +265,18 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
       x: px(110), y: px(302), w: width - px(220), h: px(38), radius: px(12),
       normal_color: COLORS.surface, press_color: COLORS.pressed, color: COLORS.gold,
       text_size: px(18), text: isOrca ? 'Orca' : isClaude ? title : 'История',
-      click_func: () => isMenuApp ? this.openOrca()
+      click_func: () => this.fullAnswerVisible ? this.openFullAnswer()
+        : this.cancelPlanVisible ? this.client.approve(false) : isMenuApp ? this.handleMusafirBack()
         : isMusafir && this.client && this.client.getState().phase === 'approval'
           ? this.stopMusafir() : isMusafir && this.client && this.client.getState().reportLength > 0
             ? this.openMusafirReport() : this.openHistory()
     })
     if (this.menuButton) this.menuButton.setProperty(prop.VISIBLE, false)
-    if (isMusafir) {
+    {
       const footerHeight = Math.max(44, px(54))
       const editHeight = Math.max(44, px(44))
       const editY = height - 16 - footerHeight - 10 - editHeight
-      const listY = px(139)
+      const listY = Math.max(px(139), stageY + px(25) + 8)
       const listWidth = width - px(48)
       this.reviewEditLayout = { x: px(24), y: editY, w: listWidth, h: editHeight }
       this.reviewTextWidth = listWidth - 24
@@ -332,6 +295,15 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
         item_click_func: (_list, index) => this.editReviewRow(index)
       })
       this.reviewScroll.setProperty(prop.VISIBLE, false)
+      this.readerScroll = createWidget(widget.SCROLL_LIST, {
+        x: px(24), y: listY, w: listWidth, h: editY - listY - 10,
+        item_space: 0, snap_to_center: false, item_enable_horizon_drag: false,
+        item_config: [{ type_id: 1, item_height: rowHeight, item_bg_color: COLORS.background,
+          text_view: [{ x: 6, y: 0, w: this.reviewTextWidth, h: rowHeight,
+            key: 'display', color: COLORS.text, text_size: this.reviewTextSize }], text_view_count: 1 }],
+        item_config_count: 1, data_array: [{ display: '' }], data_count: 1
+      })
+      this.readerScroll.setProperty(prop.VISIBLE, false)
     }
     this.hideNavigation()
     this.setButtons(null, null)
@@ -399,7 +371,7 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
   },
 
   registerInteraction() {
-    if (!isMusafir || this.interactionRegistered) return
+    if (this.interactionRegistered) return
     try {
       if (typeof interaction.onGesture === 'function') {
         interaction.onGesture({ callback: event => {
@@ -420,7 +392,7 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
   },
 
   unregisterInteraction() {
-    if (!isMusafir || !this.interactionRegistered) return
+    if (!this.interactionRegistered) return
     try { if (typeof interaction.offGesture === 'function') interaction.offGesture() } catch (error) {}
     try { if (typeof interaction.offKey === 'function') interaction.offKey() } catch (error) {}
     this.interactionRegistered = false
@@ -437,7 +409,7 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
   },
 
   handleMusafirBack() {
-    if (!isMusafir || this.closed || this.keyboardOpen || !this.client) return false
+    if (this.closed || this.keyboardOpen || !this.client) return false
     const state = this.client.getState()
     if (['recording', 'stopping', 'canceling'].includes(state.phase) || this.recording) {
       this.cancelRecording()
@@ -451,9 +423,42 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
       // Both dictated and typed reviews are persisted before they are shown.
       this.saveMusafirPending()
     }
+    if (!isMusafir) { this.persistAgentExit(); this.openOrca(); return true }
     this.persistMusafirExit(this.client.getState())
     replace({ url: 'page/index' })
     return true
+  },
+
+  persistAgentExit() {
+    if (!this.destination || !this.resultStorage || !this.client) return
+    const state = this.client.getState()
+    // Keep actual backend identity; the client id may alias a reply or handoff.
+    if (this.destination.jobId && ['sending', 'job', 'approval', 'result', 'unknown', 'error'].includes(state.phase)) {
+      this.destination.resumeJob = true
+    }
+    this.destination.autoRecord = false
+    this.resultStorage.setItem(DESTINATION_KEY, JSON.stringify(this.destination))
+  },
+
+  continueAgent() {
+    if (!this.client || this.client.getState().phase !== 'result') return
+    Object.assign(this.destination, { startFresh: true, resumeJob: false, autoRecord: false })
+    this.resultStorage.setItem(DESTINATION_KEY, JSON.stringify(this.destination))
+    this.draftStorageKey = DRAFT_KEY + ':' + [this.destination.target, this.destination.pairId || this.destination.project || this.destination.rootId, this.destination.sessionId || ''].join(':')
+    this.client.home()
+  },
+
+  openFullAnswer() {
+    if (isMusafir) { this.openMusafirReport(); return }
+    if (!this.destination || !this.destination.jobId || !this.resultStorage) return
+    this.persistAgentExit()
+    if (isOrca) this.resultStorage.setItem('orca-history-pair', JSON.stringify({
+      id: this.destination.pairId, projectLabel: this.destination.label,
+      workerAgent: this.destination.workerAgent || '', reviewerAgent: this.destination.reviewerAgent || '' }))
+    this.resultStorage.setItem(kind + '-history-view', JSON.stringify({
+      screen: 'detail', id: this.destination.jobId, field: 'result', offset: 0 }))
+    this.resultStorage.setItem(kind + '-resume', JSON.stringify({ screen: 'history' }))
+    replace({ url: 'page/history' })
   },
 
   openMusafirHome() {
@@ -523,7 +528,7 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
   showReviewText(text) {
     if (text !== this.reviewSource) {
       this.reviewSource = text
-      this.reviewRows = reviewRows(text, this.reviewTextWidth, this.reviewTextSize)
+      this.reviewRows = textRows(text, this.reviewTextWidth, this.reviewTextSize, getTextLayout)
       this.reviewScroll.setProperty(prop.UPDATE_DATA, {
         data_array: this.reviewRows, data_count: this.reviewRows.length, on_page: this.reviewKeepPosition ? 1 : 0
       })
@@ -535,7 +540,7 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
   },
 
   writeTask() {
-    if (!isMusafir || this.closed || this.keyboardOpen || !this.client ||
+    if (this.closed || this.keyboardOpen || !this.client ||
         this.client.getState().phase !== 'ready') return
     this.openKeyboard('', value => this.client.createTypedReview(value))
   },
@@ -616,6 +621,7 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
 
   openOrca() {
     try {
+      this.persistAgentExit()
       const target = this.destination
       if (isClaude) {
         this.resultStorage.setItem(kind + '-resume', JSON.stringify(target && target.target === kind
@@ -663,33 +669,74 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
     else this.openOrca()
   },
 
-  handoffOrca() {
+  async controlRequest(payload) {
+    if (this.closed || this.controlBusy) throw new Error('Дождитесь подтверждения')
+    this.controlBusy = true
+    this.stageWidget.setProperty(prop.TEXT, 'Жду подтверждение Mac…')
+    return new Promise((resolve, reject) => {
+      let settled = false
+      const finish = (error, reply) => {
+        if (settled) return
+        settled = true
+        if (this.controlTimer !== null) clearTimeout(this.controlTimer)
+        this.controlTimer = null
+        this.cancelControl = null
+        this.controlBusy = false
+        if (error) reject(error); else resolve(reply)
+      }
+      this.cancelControl = () => finish(new Error('Экран закрыт'))
+      this.controlTimer = setTimeout(() => finish(new Error('Нет подтверждения Mac. Обновите статус.')), 18000)
+      Promise.resolve().then(() => this.request(payload, { timeout: 15000 }))
+        .then(reply => finish(null, reply), error => finish(error))
+    })
+  },
+
+  async handoffOrca() {
     const current = this.destination
-    if (!current || !current.jobId || !current.handoff) return
-    const newId = this.client.createId()
-    this.request({ method: 'ORCA_HANDOFF', params: { id: current.jobId, newId } }, { timeout: 15000 })
-      .then(reply => {
-        if (!reply || !reply.ok || !reply.job || typeof reply.job.id !== 'string') {
-          throw new Error(reply && reply.error || 'Не удалось передать промпт')
+    if (!current || !current.jobId || !current.handoff || this.controlBusy || this.closed) return
+    const pending = current.pendingHandoff
+    const transfer = pending || { id: this.client.createId(), sourceId: current.jobId }
+    if (!/^\d{1,16}-\d{1,8}$/.test(transfer.id || '') || transfer.sourceId !== current.jobId) {
+      this.stageWidget.setProperty(prop.TEXT, 'Не удалось проверить сохранённую передачу')
+      return
+    }
+    try {
+      current.pendingHandoff = transfer
+      this.resultStorage.setItem(DESTINATION_KEY, JSON.stringify(current))
+      let reply
+      if (pending) {
+        reply = await this.controlRequest({ method: 'ORCA_JOB', params: { id: transfer.id } })
+        if (this.closed) return
+        if (!reply || !reply.ok) {
+          if (!reply || reply.retryable !== false) throw new Error(reply && reply.error || 'Передача не подтверждена')
+          reply = null
         }
-        Object.assign(current, { jobId: reply.job.id, aliasId: reply.job.id, resumeJob: true, handoff: false, mode: 'task' })
-        this.resultStorage.setItem(DESTINATION_KEY, JSON.stringify(current))
-        replace({ url: 'page/voice' })
-      })
-      .catch(error => { if (!this.closed) this.bodyWidget.setProperty(prop.TEXT, error.message || 'Нет связи с Mac') })
+      }
+      if (!reply) reply = await this.controlRequest({ method: 'ORCA_HANDOFF', params: { id: transfer.sourceId, newId: transfer.id } })
+      if (this.closed) return
+      if (!reply || !reply.ok || !reply.job || reply.job.id !== transfer.id) {
+        throw new Error(reply && reply.error || 'Не удалось подтвердить передачу')
+      }
+      Object.assign(current, { jobId: reply.job.id, aliasId: reply.job.id, resumeJob: true,
+        handoff: false, pendingHandoff: null, mode: 'task', startFresh: false })
+      this.resultStorage.setItem(DESTINATION_KEY, JSON.stringify(current))
+      replace({ url: 'page/voice' })
+    } catch (error) {
+      if (!this.closed) this.stageWidget.setProperty(prop.TEXT, 'Передача не подтверждена · нажмите «Боевому»')
+    }
   },
 
   async pauseOrca() {
-    if (!this.destination || !this.destination.jobId) return
+    if (this.closed || this.controlBusy || !this.destination || !this.destination.jobId) return
     try {
-      const reply = await this.request({ method: 'ORCA_PAUSE', params: { id: this.destination.jobId, paused: !this.destination.paused } }, { timeout: 15000 })
+      const reply = await this.controlRequest({ method: 'ORCA_PAUSE', params: { id: this.destination.jobId, paused: !this.destination.paused } })
       if (!reply || !reply.ok) throw new Error(reply && reply.error || 'Не удалось изменить паузу')
-      this.client.refresh()
-    } catch (error) { this.bodyWidget.setProperty(prop.TEXT, error.message || 'Нет связи с Mac') }
+      if (!this.closed) this.client.refresh()
+    } catch (error) { if (!this.closed) this.stageWidget.setProperty(prop.TEXT, error.message || 'Нет связи с Mac') }
   },
 
   stopOrca() {
-    if (!this.destination || !this.destination.jobId) return
+    if (this.closed || this.controlBusy || !this.destination || !this.destination.jobId) return
     if (!this.stopArmed) {
       // Two taps within 6 s: a stop interrupts the agent and closes the task for good.
       this.stopArmed = true
@@ -699,12 +746,12 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
       return
     }
     this.disarmStop()
-    this.request({ method: isClaude ? kind.toUpperCase() + '_STOP' : 'ORCA_STOP', params: { id: this.destination.jobId } }, { timeout: 15000 })
+    this.controlRequest({ method: isClaude ? kind.toUpperCase() + '_STOP' : 'ORCA_STOP', params: { id: this.destination.jobId } })
       .then(reply => {
         if (!reply || !reply.ok) throw new Error(reply && reply.error || 'Не удалось остановить')
-        this.client.refresh()
+        if (!this.closed) this.client.refresh()
       })
-      .catch(error => { if (!this.closed) this.bodyWidget.setProperty(prop.TEXT, error.message || 'Нет связи с Mac') })
+      .catch(error => { if (!this.closed) this.stageWidget.setProperty(prop.TEXT, error.message || 'Нет связи с Mac') })
   },
 
   disarmStop() {
@@ -747,17 +794,19 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
   setButtons(primary, secondary) {
     const px = this.px
     this.primaryAction = primary && (() => {
+      if (this.controlBusy) return
       this.alerts.silence()
       primary.action()
     })
     this.secondaryAction = secondary && (() => {
+      if (this.controlBusy) return
       this.alerts.silence()
       secondary.action()
     })
     this.primaryButton.setProperty(prop.VISIBLE, Boolean(primary))
     this.secondaryButton.setProperty(prop.VISIBLE, Boolean(secondary))
-    const height = isMusafir ? Math.max(44, px(54)) : px(62)
-    const y = isMusafir ? this.height - 16 - height : px(350)
+    const height = Math.max(44, px(54))
+    const y = this.height - 16 - height
     const margin = px(24)
     const gap = px(10)
     const half = Math.floor((this.width - margin * 2 - gap) / 2)
@@ -1102,14 +1151,33 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
         secondary = null
       }
     }
-    const reportButton = isMusafir && ['result', 'error'].includes(state.phase) && state.jobId && state.reportLength > 0
+    if (!isMusafir) {
+      if (home) {
+        body = body.replace('Нажмите «Запись» и говорите.', 'Голос или клавиатура.').replace('Спросите агента голосом.', 'Введите вопрос.')
+        primary = { text: 'Надиктовать', action: () => this.startRecording() }
+        secondary = { text: 'Написать', action: () => this.writeTask() }
+      } else if (state.phase === 'recording') {
+        primary = { text: 'Распознать', action: () => this.stopRecording(false) }
+      } else if (['stopping', 'uploading', 'transcribing'].includes(state.phase)) {
+        primary = { text: 'Отмена', action: () => state.phase === 'stopping' ? this.cancelRecording() : this.cancelPendingAudio() }
+      } else if (state.phase === 'review') {
+        secondary = { text: 'Отмена', action: () => this.discardReview() }
+      } else if (state.phase === 'result' && this.destination && this.destination.target !== 'folder') {
+        if (state.state === 'cancelled') { status = 'Остановлено'; stage = 'Остановка подтверждена' }
+        primary = { text: 'Продолжить', action: () => this.continueAgent() }
+      }
+    }
+    const reportButton = ['result', 'error'].includes(state.phase) && state.jobId && state.reportLength > 0 &&
+      (!this.destination || this.destination.target !== 'folder')
+    this.fullAnswerVisible = Boolean(reportButton)
+    this.cancelPlanVisible = Boolean(isOrca && state.phase === 'approval' && this.destination.approvalKind === 'plan')
     const stopApproval = isMusafir && state.phase === 'approval'
     if (this.menuButton) {
-      this.menuButton.setProperty(prop.VISIBLE, reportButton || stopApproval || (!isMusafir && home && !this.pendingAudio))
-      if (isMusafir) this.menuButton.setProperty(prop.MORE, {
-        x: px(24), w: this.width - px(48), y: px(296), h: px(44),
+      this.menuButton.setProperty(prop.VISIBLE, reportButton || stopApproval || this.cancelPlanVisible || (!isMusafir && !isMenuApp && home && !this.pendingAudio))
+      this.menuButton.setProperty(prop.MORE, {
+        ...this.reviewEditLayout,
         text: reportButton ? state.phase === 'error' ? 'Сохранённый ответ' : 'Полный ответ'
-          : stopApproval ? this.stopArmed ? 'Подтвердить остановку' : 'Остановить задание' : 'Чаты'
+          : this.cancelPlanVisible ? 'Отменить план' : stopApproval ? this.stopArmed ? 'Подтвердить остановку' : 'Остановить задание' : isMenuApp ? title : 'История'
       })
     }
 
@@ -1145,7 +1213,8 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
     })
     this.pageWidget.setProperty(prop.MORE, { y: navigationY, h: px(38) })
     this.editButton.setProperty(prop.VISIBLE, review)
-    if (isMusafir && review) {
+    this.readerScroll.setProperty(prop.VISIBLE, false)
+    if (review) {
       this.showReviewText(state.text)
       if (!state.error) this.stageWidget.setProperty(prop.TEXT, 'Листайте · нажмите строку для правки')
     } else {
@@ -1154,7 +1223,17 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
         this.reviewSource = null
       }
       this.bodyWidget.setProperty(prop.VISIBLE, true)
-      this.setBody(body, reader, review || reportButton || stopApproval ? 108 : 146)
+      if (reader) {
+        const source = String(body || '')
+        if (source !== this.readerSource) {
+          this.readerSource = source
+          const rows = textRows(source, this.reviewTextWidth, this.reviewTextSize, getTextLayout)
+          this.readerScroll.setProperty(prop.UPDATE_DATA, { data_array: rows, data_count: rows.length, on_page: 0 })
+        }
+        this.readerScroll.setProperty(prop.VISIBLE, true)
+        this.bodyWidget.setProperty(prop.VISIBLE, false)
+        this.hideNavigation()
+      } else this.setBody(body, false)
     }
     this.setButtons(primary, secondary)
     if (active) this.animate()
@@ -1573,7 +1652,7 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
   },
 
   onDestroy() {
-    if (isMusafir) setStatusBarVisible(true)
+    setStatusBarVisible(true)
     try { if (isMusafir && this.client && this.resultStorage) {
       const state = this.client.getState()
       if (state.jobId && ['job', 'approval', 'result', 'unknown', 'sending'].includes(state.phase)) {
@@ -1583,6 +1662,7 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
         this.resultStorage.setItem(MUSAFIR_CONTEXT_KEY, JSON.stringify(this.destination))
       }
     } } catch (error) {}
+    if (!isMusafir) { try { this.persistAgentExit() } catch (error) {} }
     this.unregisterInteraction()
     if (this.recording && (!this.recording.stopping || this.recording.canceled ||
         this.recording.uploadConsent !== true)) {
@@ -1595,6 +1675,7 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
       this.recording = null
     }
     this.closed = true
+    if (this.cancelControl) this.cancelControl()
     this.closeKeyboard()
     // Zepp also destroys the page on sleep. Keep wake-up relaunch enabled:
     // the next build recovers the same accepted job without resending it.

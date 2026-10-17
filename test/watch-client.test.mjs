@@ -1414,3 +1414,29 @@ test('closing during stop suppresses a late invalid reply', async () => {
   assert.equal(f.states.length, count)
   assert.equal(f.clock.count(), 0)
 })
+
+test('definite nonretryable send rejection returns the exact draft to review and survives reopen', async () => {
+  let draft = { id: '123-1', text: 'Сохранить точный текст 🙂', textId: '123-1',
+    edited: false, draftId: null, typed: false, sourceId: '123-1', pendingSend: false }
+  const handler = async payload => {
+    if (payload.method === 'STATUS') return { ok: true, agent: 'Test' }
+    if (payload.method === 'SEND_TEXT') return { ok: false, retryable: false, error: 'Выбранная связка недоступна' }
+    throw Error(payload.method)
+  }
+  const persistence = { readDraft: () => draft, writeDraft: value => { draft = value } }
+  const f = fixture(handler, persistence)
+  f.client.start(); await flush()
+  f.client.sendText(); await flush()
+  assert.equal(f.client.getState().phase, 'review')
+  assert.equal(f.client.getState().jobId, null)
+  assert.equal(f.client.getState().text, 'Сохранить точный текст 🙂')
+  assert.equal(draft.pendingSend, false)
+  assert.equal(f.sent.filter(x => x.payload.method === 'SEND_TEXT').length, 1)
+  f.client.close()
+  const g = fixture(handler, persistence)
+  g.client.start(); await flush()
+  assert.equal(g.client.getState().phase, 'review')
+  assert.equal(g.client.getState().text, draft.text)
+  assert.equal(g.sent.some(x => x.payload.method === 'SEND_TEXT'), false)
+  g.client.close()
+})

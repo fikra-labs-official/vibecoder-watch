@@ -14,7 +14,7 @@ from pathlib import Path
 import re
 import time
 
-from claude_sessions import ClaudeService, MAX_RESULT, SESSION_ID, _first_records
+from claude_sessions import ClaudeService, SESSION_ID, _first_records
 
 CODEX_MODES = (
     ("auto", "Авто", ("-c", 'sandbox_mode="workspace-write"', "-c", 'approval_policy="never"')),
@@ -153,5 +153,5 @@ class CodexService(ClaudeService):
         if returncode != 0 or not answer.strip():
             reason = failures[-1] if failures else " ".join(err.split())[-300:] or f"код {returncode}"
             raise ValueError(reason)
-        result = answer.strip()[:MAX_RESULT]
+        result = answer.strip()
         return result, session

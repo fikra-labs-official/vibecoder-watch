@@ -1,4 +1,4 @@
-import { createWidget, widget, align, text_style, prop, getTextLayout, setStatusBarVisible } from '@zos/ui'
+import { createWidget, widget, align, prop, getTextLayout, setStatusBarVisible } from '@zos/ui'
 import { getDeviceInfo } from '@zos/device'
 import { replace } from '@zos/router'
 import { LocalStorage } from '@zos/storage'
@@ -7,6 +7,8 @@ import {
   onGesture, offGesture, GESTURE_RIGHT,
   onKey, offKey, KEY_BACK, KEY_EVENT_CLICK
 } from '@zos/interaction'
+
+import { textRows } from './text-rows.js'
 
 const LOCAL_ID = /^\d{1,16}-\d{1,8}$/
 const CONTEXT_KEY = 'musafir-context'
@@ -19,28 +21,6 @@ const COLOR = {
   white: 0xf3f6fa,
   muted: 0xa8b3c3,
   pressed: 0x26313e
-}
-
-function splitText(text, fits) {
-  const chars = Array.from(text)
-  const pages = []
-  let offset = 0
-  while (offset < chars.length) {
-    let low = 1, high = Math.min(600, chars.length - offset), count = 1
-    while (low <= high) {
-      const n = Math.floor((low + high) / 2)
-      if (fits(chars.slice(offset, offset + n).join(''))) { count = n; low = n + 1 }
-      else high = n - 1
-    }
-    if (offset + count < chars.length && !/\s/.test(chars[offset + count])) {
-      for (let n = count - 1; n > count / 2; n--) {
-        if (/\s/.test(chars[offset + n])) { count = n + 1; break }
-      }
-    }
-    pages.push(chars.slice(offset, offset + count).join(''))
-    offset += count
-  }
-  return pages.length ? pages : ['Ответ пуст']
 }
 
 function exactReportContext(raw, jobId) {
@@ -77,8 +57,9 @@ export function createMusafirReportPage() {
       this.requestTimer = null
       this.cancelRequest = null
       this.offset = 0
-      this.page = 0
-      this.pages = []
+      this.content = ''
+      this.rows = []
+      this.continueTimer = null
       this.total = null
       this.nextOffset = null
       this.storage = null
@@ -107,44 +88,26 @@ export function createMusafirReportPage() {
         text: '', text_size: Math.max(15, Math.round(16 * this.scale)),
         color: COLOR.muted, align_h: align.CENTER_H
       })
-      const navY = height - this.bottom - this.controlHeight
-      const bodyY = 132
-      this.body = createWidget(widget.TEXT, {
-        x: this.margin, y: bodyY, w: width - this.margin * 2, h: Math.max(96, navY - bodyY - 8),
-        text: '', text_size: Math.max(18, Math.round(21 * this.scale)), color: COLOR.white,
-        text_style: text_style.WRAP, align_h: align.LEFT, align_v: align.TOP
+      const footerY = height - this.bottom - this.controlHeight
+      this.textSize = Math.max(18, Math.round(21 * this.scale))
+      this.textWidth = width - this.margin * 2 - 16
+      const rowHeight = Math.max(36, Math.round(40 * this.scale))
+      this.body = createWidget(widget.SCROLL_LIST, {
+        x: this.margin, y: 132, w: width - this.margin * 2, h: footerY - 140,
+        item_space: 0, snap_to_center: false, item_enable_horizon_drag: false,
+        item_config: [{ type_id: 1, item_height: rowHeight,
+          item_bg_color: COLOR.bg, item_bg_radius: 0,
+          text_view: [{ x: 6, y: 0, w: this.textWidth, h: rowHeight,
+            key: 'display', color: COLOR.white, text_size: this.textSize }], text_view_count: 1 }],
+        item_config_count: 1, data_array: [{ display: '' }], data_count: 1
       })
-      this.fits = text => {
-        try {
-          const layout = getTextLayout(text, {
-            text_size: Math.max(18, Math.round(21 * this.scale)),
-            text_width: width - this.margin * 2,
-            wrapped: 1
-          })
-          if (layout && Number.isFinite(layout.height)) {
-            return layout.result !== -1 && layout.height <= this.bodyHeight()
-          }
-        } catch (error) {}
-        return Array.from(text).length <= 180 && text.split('\n').length <= 8
-      }
-      const arrowWidth = 92
-      this.previous = createWidget(widget.BUTTON, {
-        x: this.margin, y: navY, w: arrowWidth, h: this.controlHeight, radius: 13,
-        text: '‹', text_size: 24, normal_color: COLOR.surface,
-        press_color: COLOR.pressed, color: COLOR.white, click_func: () => this.turn(-1)
+      this.retry = createWidget(widget.BUTTON, {
+        x: this.margin, y: footerY, w: width - this.margin * 2, h: this.controlHeight,
+        radius: 13, text: 'Повторить загрузку', text_size: 18,
+        normal_color: COLOR.surface, press_color: COLOR.pressed, color: COLOR.white,
+        click_func: () => this.load(this.offset)
       })
-      this.counter = createWidget(widget.TEXT, {
-        x: this.margin + arrowWidth, y: navY,
-        w: width - this.margin * 2 - arrowWidth * 2, h: this.controlHeight,
-        text: '', text_size: 17, color: COLOR.muted,
-        align_h: align.CENTER_H, align_v: align.CENTER_V
-      })
-      this.next = createWidget(widget.BUTTON, {
-        x: width - this.margin - arrowWidth, y: navY, w: arrowWidth, h: this.controlHeight, radius: 13,
-        text: '›', text_size: 24, normal_color: COLOR.surface,
-        press_color: COLOR.pressed, color: COLOR.white,
-        click_func: () => this.error ? this.load(this.offset) : this.turn(1)
-      })
+      this.retry.setProperty(prop.VISIBLE, false)
 
       this.gestureCallback = gesture => {
         if (gesture !== GESTURE_RIGHT) return false
@@ -159,16 +122,8 @@ export function createMusafirReportPage() {
       onGesture({ callback: this.gestureCallback })
       onKey({ callback: this.keyCallback })
 
-      this.setButton(this.back, true, { x: this.margin, y: 14, w: 116, h: 48 }, '‹ Назад')
-      this.setButton(this.home, true, { x: width - this.margin - 92, y: 14, w: 92, h: 48 }, 'Домой')
-      this.setButton(this.previous, false,
-        { x: this.margin, y: navY, w: arrowWidth, h: this.controlHeight }, '‹')
-      this.setButton(this.next, false,
-        { x: width - this.margin - arrowWidth, y: navY, w: arrowWidth, h: this.controlHeight }, '›')
       if (!this.reportContext) {
-        this.note.setProperty(prop.TEXT, '')
-        this.setCounter('')
-        this.body.setProperty(prop.TEXT, 'Откройте ответ из выбранного чата.')
+        this.display('Откройте ответ из выбранного чата.')
         return
       }
       this.load(0)
@@ -184,29 +139,22 @@ export function createMusafirReportPage() {
       try { this.storage.setItem(key, value); return true } catch (error) { return false }
     },
 
-    bodyHeight() {
-      const navY = this.height - this.bottom - this.controlHeight
-      return Math.max(96, navY - 132 - 8)
+    display(text, keepPosition = false) {
+      this.rows = textRows(text || 'Ответ пуст', this.textWidth, this.textSize, getTextLayout, keepPosition ? this.rows : [])
+      this.body.setProperty(prop.UPDATE_DATA, {
+        data_array: this.rows, data_count: this.rows.length, on_page: keepPosition ? 1 : 0
+      })
     },
 
-    setButton(button, visible, rectangle, text) {
-      button.setProperty(prop.MORE, {
-        x: rectangle.x, y: rectangle.y, w: rectangle.w, h: rectangle.h, text
-      })
-      button.setProperty(prop.VISIBLE, Boolean(visible))
-    },
-
-    setCounter(text, rightWidth = 92) {
-      this.counter.setProperty(prop.MORE, {
-        x: this.margin + 92,
-        y: this.height - this.bottom - this.controlHeight,
-        w: this.width - this.margin * 2 - 92 - rightWidth,
-        h: this.controlHeight,
-        text
-      })
+    stopReading() {
+      ++this.generation
+      if (this.continueTimer !== null) clearTimeout(this.continueTimer)
+      this.continueTimer = null
+      if (this.cancelRequest) this.cancelRequest()
     },
 
     backToTask() {
+      this.stopReading()
       if (!this.reportContext || !this.write(CONTEXT_KEY, JSON.stringify(this.reportContext))) {
         this.goHome()
         return
@@ -215,24 +163,19 @@ export function createMusafirReportPage() {
     },
 
     goHome() {
+      this.stopReading()
       this.write(RETURN_KEY, '')
       replace({ url: 'page/index' })
     },
 
-    async load(offset, lastPage = false) {
+    async load(offset) {
+      if (this.closed || this.loading) return
       const generation = ++this.generation
-      if (this.cancelRequest) this.cancelRequest()
       this.offset = offset
       this.error = false
       this.loading = true
-      this.note.setProperty(prop.TEXT, 'Читаю сохранённый ответ…')
-      this.setCounter('')
-      this.body.setProperty(prop.TEXT, '')
-      const navY = this.height - this.bottom - this.controlHeight
-      this.setButton(this.previous, false,
-        { x: this.margin, y: navY, w: 92, h: this.controlHeight }, '‹')
-      this.setButton(this.next, false,
-        { x: this.width - this.margin - 92, y: navY, w: 92, h: this.controlHeight }, '›')
+      this.retry.setProperty(prop.VISIBLE, false)
+      this.note.setProperty(prop.TEXT, this.content ? 'Читаю продолжение…' : 'Читаю сохранённый ответ…')
       try {
         const reply = await new Promise((resolve, reject) => {
           let settled = false
@@ -266,47 +209,34 @@ export function createMusafirReportPage() {
         this.total = reply.textLength
         this.nextOffset = reply.nextOffset
         this.truncated = reply.truncated
-        this.pages = splitText(reply.text, this.fits)
-        this.page = lastPage ? this.pages.length - 1 : 0
+        const keepPosition = this.content.length > 0
+        this.content += reply.text
+        this.offset = offset + length
+        this.display(keepPosition ? reply.text : this.content, keepPosition)
         this.loading = false
-        this.show()
+        this.note.setProperty(prop.TEXT, reply.nextOffset === null
+          ? (this.truncated ? 'Предел длины · полный текст на Mac' : 'Весь ответ · листайте вверх и вниз')
+          : 'Читаю продолжение…')
+        if (reply.nextOffset !== null) {
+          this.continueTimer = setTimeout(() => {
+            this.continueTimer = null
+            if (!this.closed && generation === this.generation) this.load(reply.nextOffset)
+          }, 0)
+        }
       } catch (error) {
         if (this.closed || generation !== this.generation) return
         this.loading = false
         this.error = true
-        this.note.setProperty(prop.TEXT, 'Часть ответа не загружена')
-        this.setCounter('', 116)
-        this.body.setProperty(prop.TEXT, error.message || 'Нет связи с Mac')
-        this.setButton(this.next, true,
-          { x: this.width - this.margin - 116, y: navY, w: 116, h: this.controlHeight }, 'Повторить')
+        this.note.setProperty(prop.TEXT, this.content ? 'Продолжение не загружено' : 'Не удалось загрузить ответ')
+        if (!this.content) this.display(error.message || 'Нет связи с Mac')
+        this.retry.setProperty(prop.VISIBLE, true)
       }
-    },
-
-    show() {
-      const navY = this.height - this.bottom - this.controlHeight
-      this.body.setProperty(prop.TEXT, this.pages[this.page])
-      this.note.setProperty(prop.TEXT,
-        `Часть ${Math.floor(this.offset / 1000) + 1}${this.truncated ? ' · есть ограничение длины' : ''}`)
-      this.setCounter(`${this.page + 1}/${this.pages.length}`)
-      this.setButton(this.previous, this.offset > 0 || this.page > 0,
-        { x: this.margin, y: navY, w: 92, h: this.controlHeight }, '‹')
-      this.setButton(this.next, this.page < this.pages.length - 1 || this.nextOffset !== null,
-        { x: this.width - this.margin - 92, y: navY, w: 92, h: this.controlHeight }, '›')
-    },
-
-    turn(direction) {
-      if (this.loading || this.error) return
-      const next = this.page + direction
-      if (next >= 0 && next < this.pages.length) { this.page = next; this.show() }
-      else if (direction > 0 && this.nextOffset !== null) this.load(this.nextOffset)
-      else if (direction < 0 && this.offset > 0) this.load(Math.max(0, this.offset - 1000), true)
     },
 
     onDestroy() {
       setStatusBarVisible(true)
       this.closed = true
-      ++this.generation
-      if (this.cancelRequest) this.cancelRequest()
+      this.stopReading()
       offGesture()
       offKey()
     }

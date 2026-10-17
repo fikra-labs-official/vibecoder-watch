@@ -2,22 +2,23 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { forwardRequest, forwardVoiceRequest, resolveConnection } from '../shared/bridge-client.js'
 
-test('Musafir forwards explicit audio cancellation unchanged and keeps it out of other profiles', async () => {
+test('all four voice profiles forward explicit audio cancellation; Limits stays blocked', async () => {
   const payload = { method: 'AUDIO_CANCEL', params: { id: '1700000000000-1' } }
   let seen = null
   const fetchRequest = async options => {
     seen = JSON.parse(options.body)
     return { status: 200, body: { ok: true, id: payload.params.id, state: 'cancelled' } }
   }
-  const reply = await forwardVoiceRequest(payload, fetchRequest, 'https://mac.test', 'device-secret', 'musafir')
-  assert.deepEqual(seen, payload)
-  assert.equal(reply.state, 'cancelled')
-  for (const profile of ['orca', 'claude', 'codex', 'limits']) {
+  for (const profile of ['musafir', 'orca', 'claude', 'codex']) {
     seen = null
-    const blocked = await forwardRequest(payload, fetchRequest, 'https://mac.test', 'device-secret', profile)
-    assert.equal(blocked.ok, false)
-    assert.equal(seen, null)
+    const reply = await forwardVoiceRequest(payload, fetchRequest, 'https://mac.test', 'device-secret', profile)
+    assert.deepEqual(seen, payload)
+    assert.equal(reply.state, 'cancelled')
   }
+  seen = null
+  const blocked = await forwardRequest(payload, fetchRequest, 'https://mac.test', 'device-secret', 'limits')
+  assert.equal(blocked.ok, false)
+  assert.equal(seen, null)
 })
 
 test('phone forwards only allowed methods to a fixed authenticated destination', async () => {

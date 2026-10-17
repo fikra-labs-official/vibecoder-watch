@@ -4,7 +4,10 @@ import fs from 'node:fs'
 import vm from 'node:vm'
 
 const shared = fs.readFileSync(new URL('../shared/history-page.js', import.meta.url), 'utf8')
+  .replace(/import \{[\s\S]*?\} from '@zos\/interaction'\n/, '')
   .replace(/^import .*$/gm, '').replace('export function createHistoryPage', 'function createHistoryPage')
+const textRowsSource = fs.readFileSync(new URL('../shared/text-rows.js', import.meta.url), 'utf8')
+  .replace('export function textRows', 'function textRows')
 const entries = {
   musafir: fs.readFileSync(new URL('../page/history.js', import.meta.url), 'utf8').replace(/^import .*$/gm, ''),
   orca: fs.readFileSync(new URL('../apps/orca/page/history.js', import.meta.url), 'utf8').replace(/^import .*$/gm, ''),
@@ -17,27 +20,38 @@ const item = { id, text: 'Мой вопрос', created: 1700000000, state: 'com
 const detail = (params, extra = {}) => ({ ok: true, ...item, field: params.field,
   content: 'Сохранённый ответ', total: 17, offset: 0, complete: true, ...extra })
 
-export function fixture({ kind = 'musafir', width = 390, height = 450, storage = new Map(), request = async () => ({ ok: true }), layout } = {}) {
+export function fixture({ kind = 'musafir', width = 390, height = 450, storage = new Map(), request = async () => ({ ok: true }), layout,
+  storageError = false } = {}) {
   let page
-  const widgets = [], replacements = [], calls = []
-  vm.runInNewContext(shared + '\n' + entries[kind], {
+  const widgets = [], replacements = [], calls = [], statusBars = [], interaction = {}
+  vm.runInNewContext(textRowsSource + '\n' + shared + '\n' + entries[kind], {
     Page(definition) { page = definition }, BasePage: x => x,
-    getDeviceInfo: () => ({ width, height }), setWakeUpRelaunch() {},
+    getDeviceInfo: () => ({ width, height }), setWakeUpRelaunch() {}, setStatusBarVisible: value => statusBars.push(value),
     replace: value => replacements.push(value),
-    LocalStorage: class { getItem(k) { return storage.get(k) } setItem(k, v) { storage.set(k, v) } },
-    getTextLayout: layout || (text => ({ height: text.split('\n').reduce((n, l) => n + Math.max(1, Math.ceil(Array.from(l).length / 24)), 0) * 25 })),
+    LocalStorage: class {
+      constructor() { if (storageError) throw Error('storage') }
+      getItem(k) { if (storageError) throw Error('storage'); return storage.get(k) }
+      setItem(k, v) { if (storageError) throw Error('storage'); storage.set(k, v) }
+    },
+    getTextLayout: layout || (text => ({ result: 0, width: Array.from(text).length * 12,
+      height: text.split('\n').reduce((n, l) => n + Math.max(1, Math.ceil(Array.from(l).length / 24)), 0) * 25 })),
     createWidget(kind, options) {
-      const w = { kind, options: { visible: true, ...options }, setProperty(k, v) {
-        if (k === 'more') Object.assign(this.options, v); else this.options[k] = v
+      const w = { kind, options: { visible: true, ...options }, sets: [], setProperty(k, v) {
+        this.sets.push([k, v])
+        if (k === 'more' || k === 'update') Object.assign(this.options, v); else this.options[k] = v
       } }
       widgets.push(w); return w
     },
-    widget: { FILL_RECT: 1, TEXT: 2, BUTTON: 3 }, align: { CENTER_H: 1, CENTER_V: 2 },
-    text_style: { WRAP: 1 }, prop: { TEXT: 'text', VISIBLE: 'visible', MORE: 'more' }, console
+    widget: { FILL_RECT: 1, TEXT: 2, BUTTON: 3, SCROLL_LIST: 4 }, align: { CENTER_H: 1, CENTER_V: 2 },
+    text_style: { WRAP: 1 }, prop: { TEXT: 'text', VISIBLE: 'visible', MORE: 'more', UPDATE_DATA: 'update' },
+    setTimeout, clearTimeout,
+    onGesture({ callback }) { interaction.gesture = callback }, offGesture() { interaction.gesture = null }, GESTURE_RIGHT: 10,
+    onKey({ callback }) { interaction.key = callback }, offKey() { interaction.key = null }, KEY_BACK: 20, KEY_EVENT_CLICK: 21,
+    console
   })
   page.request = payload => { calls.push(payload); return Promise.resolve().then(() => request(payload)) }
   page.build()
-  return { page, widgets, storage, calls, replacements }
+  return { page, widgets, storage, calls, replacements, statusBars, interaction }
 }
 
 test('browse question and answer then trash and restore without sending a command', async () => {
@@ -55,10 +69,10 @@ test('browse question and answer then trash and restore without sending a comman
   assert.match(f.page.items[0].label, /Мой вопрос/)
   f.page.items[0].action(); await flush()
   f.page.items[0].action(); await flush()
-  assert.equal(f.page.body.options.text, 'Мой вопрос')
+  assert.equal(f.page.reader.content, 'Мой вопрос')
   f.page.actions[0].action(); await flush()
   f.page.items[1].action(); await flush()
-  assert.equal(f.page.body.options.text, 'Ответ Мусафира')
+  assert.equal(f.page.reader.content, 'Ответ Мусафира')
   f.page.actions[0].action(); await flush()
   f.page.items[2].action()
   assert.equal(f.calls.filter(x => x.method === 'HISTORY_SET_DELETED').length, 0)
@@ -73,37 +87,31 @@ test('browse question and answer then trash and restore without sending a comman
   assert.ok(f.calls.every(x => x.method.startsWith('HISTORY_')))
 })
 
-test('long Unicode answer is read exactly across transport chunks and screen pages', async () => {
+test('long Unicode answer is loaded automatically into one native scroll list', async () => {
   const content = ('Салам 👋\nКаждый символ сохранён. ').repeat(90)
   const chars = Array.from(content)
   const f = fixture({ request: ({ params }) => detail(params, { content: chars.slice(params.offset, params.offset + 600).join(''),
     total: chars.length, offset: params.offset, complete: params.offset + 600 >= chars.length }) })
   f.page.detail(id, 'result'); await flush()
-  let actual = '', steps = 0
-  do {
-    actual += f.page.body.options.text
-    const next = f.page.actions[2]
-    if (!next) break
-    next.action(); await flush()
-    assert.ok(++steps < 100)
-  } while (true)
-  assert.equal(actual, content)
+  for (let i = 0; i < 100 && f.page.reader.content !== content; i++) await flush()
+  assert.equal(f.page.reader.content, content)
   assert.ok(f.calls.length > 1)
   assert.ok(f.calls.every(x => x.params.limit === 600))
+  assert.equal(f.page.actions.length, 1)
+  assert.equal(f.page.scroll.options.visible, true)
 })
 
-test('recent detail resumes at its page after sleep and reads from bounded cache offline', async () => {
+test('recent detail restarts at zero after sleep and reads bounded chunks from cache offline', async () => {
   const storage = new Map()
   const content = 'Длинный ответ на вопрос. '.repeat(20)
   const f = fixture({ storage, request: ({ params }) => detail(params, { content, total: content.length }) })
   f.page.detail(id, 'result'); await flush()
-  f.page.actions[2].action()
-  const shown = f.page.body.options.text
+  const shown = f.page.reader.content
   f.page.onDestroy()
   const g = fixture({ storage, request: async () => ({ ok: false, offline: true, error: 'Нет связи с Mac' }) })
   await flush()
-  assert.equal(g.page.body.options.text, shown)
-  assert.match(g.page.note.options.text, /Нет связи/)
+  assert.equal(g.page.reader.content, shown)
+  assert.match(g.page.note.options.text, /Сохранённое/)
   for (let i = 0; i < 20; i++) {
     g.page.request = async () => ({ ok: true, items: [], hasMore: false })
     g.page.list(false, i * 3); await flush()
@@ -117,7 +125,8 @@ test('server rejection never resurrects a cached page, and mutation lost receipt
   assert.equal(f.page.cache.length, 1)
   f.page.request = async () => ({ ok: false, error: 'Запрос не найден' })
   f.page.detail(id, 'result'); await flush()
-  assert.equal(f.page.heading.options.text, 'Нет данных')
+  assert.match(f.page.note.options.text, /Запрос не найден/)
+  assert.equal(f.page.reader.content, '')
   f.page.request = async () => { throw Error('Телефон не ответил') }
   f.page.setDeleted(id, true); await flush()
   assert.deepEqual(JSON.parse(f.storage.get('musafir-history-cache')), [])
@@ -151,9 +160,11 @@ test('active tasks expose Open and never delete or resubmit; return routes to ex
   assert.ok(f.calls.every(x => !['SEND_TEXT', 'JOB_APPROVE'].includes(x.method)))
 })
 
-test('all history views fit native and smaller windows with separated controls', async () => {
-  for (const [width, height] of [[390, 450], [432, 514], [390, 400]]) {
-    const f = fixture({ width, height, request: ({ method, params }) => method === 'HISTORY_LIST'
+test('all four profiles fit native and smaller windows with separated controls', async () => {
+  for (const kind of ['musafir', 'orca', 'claude', 'codex']) for (const [width, height] of [[390, 450], [432, 514], [390, 400]]) {
+    const prefix = kind === 'musafir' ? '' : kind.toUpperCase() + '_'
+    const storage = kind === 'orca' ? orcaStorage() : new Map()
+    const f = fixture({ kind, width, height, storage, request: ({ method, params }) => method === prefix + 'HISTORY_LIST'
       ? { ok: true, items: [item, { ...item, id: '1700000000001-1' }, { ...item, id: '1700000000002-1' }], hasMore: true }
       : detail(params, { total: 17 }) })
     const check = () => {
@@ -171,22 +182,14 @@ test('all history views fit native and smaller windows with separated controls',
   }
 })
 
-test('fallback pagination handles explicit newlines without losing text', () => {
-  const f = fixture({ layout: () => { throw Error('not supported') } })
-  const input = '\n'.repeat(40) + '👋'.repeat(80)
-  const pages = f.page.splitText(input)
-  assert.equal(pages.join(''), input)
-  assert.ok(pages.every(x => x.split('\n').length <= 6))
-})
-
 test('malformed online success cannot masquerade as an offline cached response', async () => {
   const f = fixture({ request: ({ params }) => detail(params) })
   f.page.detail(id, 'result'); await flush()
   assert.equal(f.page.cache.length, 1)
   f.page.request = async () => ({ ok: true, id, field: 'result', content: 'wrong' })
   f.page.detail(id, 'result'); await flush()
-  assert.equal(f.page.heading.options.text, 'Нет данных')
   assert.match(f.page.note.options.text, /Некорректный/)
+  assert.equal(f.page.reader.content, '')
 })
 
 const PAIR = { id: 'pair-1', projectLabel: 'CRM', workerAgent: 'codex', reviewerAgent: 'codex' }
@@ -220,7 +223,7 @@ test('orca history browses, trashes and restores tasks of the chosen pair only',
   f.page.items[0].action(); await flush()
   assert.equal(f.page.items[1].label, 'Отчёт Orca')
   f.page.items[1].action(); await flush()
-  assert.equal(f.page.body.options.text, 'Отчёт Orca')
+  assert.equal(f.page.reader.content, 'Отчёт Orca')
   f.page.actions[0].action(); await flush()
   f.page.items[2].action()
   assert.equal(f.calls.filter(x => x.method === 'ORCA_HISTORY_SET_DELETED').length, 0)
@@ -241,15 +244,17 @@ test('orca history browses, trashes and restores tasks of the chosen pair only',
   assert.equal(f.calls.filter(x => !x.method.startsWith('ORCA_HISTORY_')).length, 0)
 })
 
-test('orca history footer returns to the pair menu and current task opens the voice page', () => {
+test('orca history footer returns to the pair menu and current task needs an exact saved context', () => {
   const f = fixture({ kind: 'orca', storage: orcaStorage() })
   f.page.actions[0].action()
   assert.equal(f.replacements.at(-1).url, 'page/index')
   assert.deepEqual(JSON.parse(f.storage.get('orca-resume')), { screen: 'pair', pair: PAIR })
-  const g = fixture({ kind: 'orca', storage: orcaStorage() })
+  const current = { target: 'orca', pairId: 'pair-1', label: 'CRM', jobId: id, resumeJob: true, autoRecord: false }
+  const saved = orcaStorage(); saved.set('voice-destination', JSON.stringify(current))
+  const g = fixture({ kind: 'orca', storage: saved })
   g.page.items[1].action()
   assert.equal(g.replacements.at(-1).url, 'page/voice')
-  assert.equal(JSON.parse(g.storage.get('voice-destination')).pairId, 'pair-1')
+  assert.deepEqual(JSON.parse(g.storage.get('voice-destination')), current)
   assert.equal(JSON.parse(g.storage.get('orca-resume')).screen, 'voice')
   assert.equal(g.calls.length, 0)
 })
@@ -300,14 +305,16 @@ test('claude history is one global list, leaves to the menu and reopens the last
   f.page.items[0].action(); await flush()
   assert.equal(f.page.items[1].label, 'Ответ Claude')
   f.page.items[1].action(); await flush()
-  assert.equal(f.page.body.options.text, 'Готово')
+  assert.equal(f.page.reader.content, 'Готово')
   f.page.actions[0].action(); await flush(); f.page.actions[0].action(); await flush()
   f.page.actions[0].action()                                   // Меню → home
   assert.equal(f.page.actions[0].label, 'Claude')
   f.page.actions[0].action()                                   // leave to the project menu
   assert.equal(f.replacements.at(-1).url, 'page/index')
   assert.deepEqual(JSON.parse(f.storage.get('claude-resume')), { screen: 'home' })
-  const g = fixture({ kind: 'claude', storage: new Map([['voice-destination', JSON.stringify({ target: 'claude', project: '/work/crm' })]]) })
+  const current = { target: 'claude', project: '/work/crm', label: 'CRM', jobId: id,
+    openJob: true, resumeJob: true, autoRecord: false, mode: 'auto' }
+  const g = fixture({ kind: 'claude', storage: new Map([['voice-destination', JSON.stringify(current)]]) })
   g.page.items[1].action()
   assert.equal(g.replacements.at(-1).url, 'page/voice')
   assert.deepEqual(JSON.parse(g.storage.get('claude-resume')), { screen: 'voice' })
@@ -325,4 +332,112 @@ test('codex history uses CODEX methods and its own resume key', async () => {
   assert.equal(f.calls[0].method, 'CODEX_HISTORY_LIST')
   f.page.actions[0].action(); f.page.actions[0].action()
   assert.deepEqual(JSON.parse(f.storage.get('codex-resume')), { screen: 'home' })
+})
+
+test('chunk failure keeps loaded text and retry continues from the exact Unicode offset', async () => {
+  const content = '🙂'.repeat(700)
+  const chars = Array.from(content)
+  const offsets = []
+  let failed = false
+  const f = fixture({ request: ({ params }) => {
+    offsets.push(params.offset)
+    if (params.offset === 600 && !failed) { failed = true; throw Error('link down') }
+    const chunk = chars.slice(params.offset, params.offset + params.limit).join('')
+    return detail(params, { content: chunk, total: chars.length, offset: params.offset,
+      complete: params.offset + Array.from(chunk).length === chars.length })
+  } })
+  f.page.detail(id, 'result')
+  for (let i = 0; i < 100 && !f.page.actions[2]; i++) await flush()
+  assert.equal(Array.from(f.page.reader.content).length, 600)
+  assert.equal(f.page.actions[2].label, 'Повторить')
+  f.page.actions[2].action()
+  for (let i = 0; i < 20 && f.page.reader.content !== content; i++) await flush()
+  assert.equal(f.page.reader.content, content)
+  assert.deepEqual(offsets, [0, 600, 600])
+})
+
+test('leaving during a detail read fences late callbacks and restores native chrome', async () => {
+  let finish
+  const f = fixture({ request: () => new Promise(resolve => { finish = resolve }) })
+  f.page.detail(id, 'result'); await flush()
+  f.page.onDestroy()
+  finish(detail({ field: 'result' }, { content: 'late', total: 4 }))
+  await flush(); await flush()
+  assert.equal(f.page.reader.content, '')
+  assert.equal(f.page.cache.length, 0)
+  assert.deepEqual(f.statusBars, [false, true])
+  assert.equal(f.interaction.gesture, null)
+  assert.equal(f.interaction.key, null)
+})
+
+test('history entry routes only its validated backend context and rejects collisions', async () => {
+  for (const kind of ['claude', 'codex']) {
+    const stale = { target: kind === 'claude' ? 'codex' : 'claude', project: '/wrong', label: 'Wrong', jobId: id,
+      openJob: true, resumeJob: true, autoRecord: false }
+    const storage = new Map([['voice-destination', JSON.stringify(stale)]])
+    const exact = { target: kind, project: '/work/right', jobId: id, openJob: true, resumeJob: true,
+      autoRecord: false, mode: kind === 'codex' ? 'read-only' : 'plan' }
+    const f = fixture({ kind, storage, request: ({ params }) => detail(params, { state: 'running', context: exact }) })
+    f.page.entry(id); await flush()
+    f.page.items[1].action()
+    assert.equal(f.replacements.at(-1).url, 'page/voice')
+    assert.deepEqual(JSON.parse(storage.get('voice-destination')), exact)
+  }
+
+  const storage = orcaStorage()
+  storage.set('voice-destination', JSON.stringify({ target: 'orca', pairId: 'pair-old', label: 'Old', jobId: id,
+    resumeJob: true, autoRecord: false }))
+  const wrong = { target: 'orca', pairId: 'pair-old', label: 'Old', jobId: id, resumeJob: true, autoRecord: false }
+  const f = fixture({ kind: 'orca', storage, request: ({ params }) => detail(params, { state: 'running', context: wrong }) })
+  f.page.entry(id); await flush(); f.page.items[1].action()
+  assert.equal(f.page.heading.options.text, 'Не удалось открыть')
+  assert.equal(f.replacements.length, 0)
+  assert.equal(JSON.parse(storage.get('voice-destination')).pairId, 'pair-old')
+})
+
+test('saved current context requires an explicit label and storage failure never navigates', () => {
+  const missingLabel = { target: 'claude', project: '/work/right', jobId: id,
+    openJob: true, resumeJob: true, autoRecord: false }
+  const storage = new Map([['voice-destination', JSON.stringify(missingLabel)]])
+  const f = fixture({ kind: 'claude', storage })
+  f.page.items[1].action()
+  assert.equal(f.replacements.at(-1).url, 'page/index')
+
+  const g = fixture({ kind: 'claude', storageError: true })
+  g.page.openContext({ ...missingLabel, label: 'Right' })
+  assert.equal(g.replacements.length, 0)
+  assert.equal(g.page.heading.options.text, 'Не удалось открыть')
+})
+
+test('dynamic button text uses complete MORE properties', async () => {
+  const f = fixture({ request: ({ params }) => detail(params) })
+  f.page.entry(id); await flush()
+  for (const control of [...f.page.rows.filter(row => row.options.visible), ...f.page.footer.filter(row => row.options.visible)]) {
+    const update = control.sets.find(([key]) => key === 'more')?.[1]
+    assert.equal(typeof update.text, 'string')
+    for (const key of ['x', 'y', 'w', 'h', 'radius', 'normal_color', 'press_color', 'color', 'text_size', 'click_func']) {
+      assert.notEqual(update[key], undefined, key)
+    }
+  }
+})
+
+test('backend content beyond 200000 is capped with an explicit notice', async () => {
+  const f = fixture({ request: ({ params }) => {
+    const length = Math.min(params.limit, 200001 - params.offset)
+    return detail(params, { content: 'x'.repeat(length), total: 200001, offset: params.offset,
+      complete: params.offset + length === 200001 })
+  } })
+  f.page.detail(id, 'result')
+  await flush(); await flush()
+  f.page.stopReading()
+  f.page.reader.content = 'x'.repeat(199800)
+  f.page.reader.offset = 199800
+  f.page.reader.total = 200001
+  f.page.reader.deadline = Date.now() + 45000
+  await f.page.readChunk(f.page.generation)
+  assert.equal(f.page.reader.offset, 200000)
+  assert.equal(Array.from(f.page.reader.content).length, 200000)
+  assert.match(f.page.note.options.text, /Предел 200 000/)
+  assert.ok(f.calls.every(call => call.params.offset < 200000))
+  assert.ok(JSON.stringify(f.page.cache).length < 50000)
 })

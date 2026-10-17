@@ -32,7 +32,6 @@ from watchdog import origin_repo
 SESSION_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 JOB_ID = re.compile(r"^[0-9]{1,16}-[0-9]{1,8}$")
 MAX_TEXT = 30_000
-MAX_RESULT = 30_000
 PAGE_MAX = 1_000
 SCAN_TTL = 20.0
 HINT = ("Ответ прочитают с экрана часов: коротко и по делу, до 1500 символов, "
@@ -199,6 +198,7 @@ class ClaudeService:
     PROMPTS = True        # Codex has no prompt hook; it runs with approvals disabled
     KINDS = KINDS
     KEEP_AWAKE = ("caffeinate", "-i", "-s")  # the Mac must not sleep while the shift runs
+    STOP_WAIT = 2.0
 
     def __init__(self, state_dir, executable=None, projects_root=None, runner=None, notify=None, run=None,
                  timeout=1200, extra_projects=None, night_at=NIGHT_TIME, send_file=None, research_dir=None, presets=None):
@@ -514,13 +514,53 @@ class ClaudeService:
             process = self.processes.get(job_id)
             for pending in self._pending(job_id):
                 self._decide(job_id, pending["id"], False, "Задача остановлена с часов")
-            self._save(job_id, state="error", error="Остановлено с часов")
+            if process is None and job["state"] == "queued":
+                self._save(job_id, state="error", error="Остановлено с часов")
+            elif process is None:
+                self._save(job_id, state="unknown",
+                           error="Остановка запрошена, но активный процесс недоступен для подтверждения.")
         if process is not None:
-            try:
-                process.terminate()
-            except OSError:
-                pass
+            confirmed, reason = self._terminate_process(process)
+            with self.lock:
+                self._save(job_id, state="error" if confirmed else "unknown",
+                           error="Остановлено с часов" if confirmed else reason)
         return {"ok": True, "job": self._public(self._job(job_id), params)}
+
+    def _terminate_process(self, process):
+        errors = []
+        try:
+            process.terminate()
+        except Exception as exc:
+            errors.append("terminate: " + type(exc).__name__)
+        wait = getattr(process, "wait", None)
+        if callable(wait):
+            try:
+                wait(timeout=self.STOP_WAIT)
+                return True, ""
+            except subprocess.TimeoutExpired:
+                pass
+            except Exception as exc:
+                errors.append("wait: " + type(exc).__name__)
+            try:
+                process.kill()
+            except Exception as exc:
+                errors.append("kill: " + type(exc).__name__)
+            else:
+                try:
+                    wait(timeout=self.STOP_WAIT)
+                    return True, ""
+                except Exception as exc:
+                    errors.append("kill wait: " + type(exc).__name__)
+        else:
+            poll = getattr(process, "poll", None)
+            try:
+                if callable(poll) and poll() is not None:
+                    return True, ""
+            except Exception as exc:
+                errors.append("poll: " + type(exc).__name__)
+        detail = "; ".join(errors[:3])
+        return False, ("Остановка отправлена, но завершение процесса не подтверждено" +
+                       ((": " + detail) if detail else "."))[:1000]
 
     # ---- execution ---------------------------------------------------------------
 
@@ -545,13 +585,17 @@ class ClaudeService:
         with self.lock:
             current = self._job(job_id)
             if current["state"] != "submitting" or job_id in self.stopped:
-                try:
-                    process.terminate()
-                except OSError:
-                    pass
-                return
-            self.processes[job_id] = process
-            self._save(job_id, state="running")
+                stopped_before_registration = True
+            else:
+                stopped_before_registration = False
+                self.processes[job_id] = process
+                self._save(job_id, state="running")
+        if stopped_before_registration:
+            confirmed, reason = self._terminate_process(process)
+            with self.lock:
+                self._save(job_id, state="error" if confirmed else "unknown",
+                           error="Остановлено с часов" if confirmed else reason)
+            return
         if self.PROMPTS and hasattr(process, "poll") and not job["night"]:
             threading.Thread(target=self._watch_prompts, args=(job_id, process), name="prompts", daemon=True).start()
         try:
@@ -794,7 +838,7 @@ class ClaudeService:
         if returncode != 0 or not isinstance(answer, dict) or answer.get("is_error"):
             raise ValueError(str(answer.get("result")) if isinstance(answer, dict) and answer.get("result")
                              else " ".join(err.split())[-300:] or f"код {returncode}")
-        result = str(answer.get("result") or "").strip()[:MAX_RESULT] or "Готово"
+        result = str(answer.get("result") or "").strip() or "Готово"
         denials = answer.get("permission_denials")
         if denials_note and isinstance(denials, list) and denials:
             result += f"\n\nОтклонено запросов разрешений: {len(denials)}. Для таких действий выбери режим Авто или Без ограничений."
@@ -979,9 +1023,20 @@ class ClaudeService:
         if offset > len(content):
             raise ValueError("Страница за пределами истории")
         page = content[offset:offset + limit]
+        context = {
+            "target": self.KEY, "project": row["project"], "jobId": row["id"],
+            "openJob": True, "resumeJob": True, "autoRecord": False,
+        }
+        if row["label"]:
+            context["label"] = row["label"]
+        session_id = row["result_session"] or row["session_id"]
+        if session_id:
+            context["sessionId"] = session_id
+        if row["mode"]:
+            context["mode"] = row["mode"]
         return {"ok": True, "id": job_id, "field": field, "content": page, "total": len(content), "offset": offset,
                 "complete": offset + len(page) == len(content), "created": row["created"], "state": row["state"],
-                "deleted": row["deleted_at"] is not None}
+                "deleted": row["deleted_at"] is not None, "context": context}
 
     def _history_set_deleted(self, params):
         self._only(params, "id", "deleted")
@@ -1036,7 +1091,8 @@ class ClaudeService:
             body = row["result"] if row["kind"] not in RESEARCH_KINDS else (
                 self._summary(row["result"]) + "\n\nПолный отчёт: файл в Telegram и в Истории.")
         else:
-            body = row["error"] if row["state"] == "error" else self._night_note() if row["state"] == "night" else ""
+            body = (row["error"] if row["state"] in ("error", "unknown") else
+                    self._night_note() if row["state"] == "night" else "")
         if cursor > len(body):
             raise ValueError("Страница за пределами результата")
         page = body[cursor:cursor + PAGE_MAX]
