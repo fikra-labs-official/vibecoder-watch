@@ -38,7 +38,8 @@ export function createPhoneProbe({ request, report, setTimer, clearTimer }) {
       attempt.timer = setTimer(() => {
         if (closed || active !== attempt) return
         attempt.expired = true
-        report({ state: 'timeout', busy: true })
+        active = null
+        report({ state: 'timeout', busy: false })
       }, 12000)
 
       try {

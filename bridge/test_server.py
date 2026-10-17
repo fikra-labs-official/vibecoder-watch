@@ -10,7 +10,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from http.server import ThreadingHTTPServer
 
-from server import Bridge, Invalid, MAX_AUDIO, MAX_TEXT_CHARS, make_handler
+from server import Bridge, Invalid, MAX_AUDIO, MAX_TEXT_CHARS, MAX_TEXT_PART_CHARS, make_handler
 
 
 class FakeHermes:
@@ -19,8 +19,8 @@ class FakeHermes:
         self.status = {'status': 'completed', 'output': 'Готово'}
         self.failure = None
 
-    def call(self, path, body=None, request_id=None):
-        self.calls.append((path, body, request_id))
+    def call(self, path, body=None, request_id=None, timeout=12):
+        self.calls.append((path, body, request_id, timeout))
         if self.failure:
             raise self.failure
         if path == '/v1/runs':
@@ -53,13 +53,13 @@ class BridgeTests(unittest.TestCase):
         self.hermes.status = {'status': 'waiting_for_approval', 'approval': {'request_id': 'approval-1', 'command': command}}
         self.assertEqual(self.bridge.job_status('123-1')['approval']['text'], command)
         original = self.hermes.call
-        def expired(path, body=None, request_id=None):
+        def expired(path, body=None, request_id=None, timeout=12):
             if path.endswith('/approval'):
                 raise HTTPError(path, 409, 'expired', {}, None)
-            return original(path, body, request_id)
+            return original(path, body, request_id, timeout)
         self.hermes.call = expired
         result = self.bridge.rpc('JOB_APPROVE', {'id': '123-1', 'approvalId': 'approval-1', 'allow': True})
-        self.assertEqual(result['state'], 'running')
+        self.assertEqual(result['state'], 'submitting')
         self.assertNotIn('approval', result)
         with self.assertRaises(Invalid):
             self.bridge.rpc('JOB_APPROVE', {'id': '123-1', 'approvalId': 'approval-1', 'allow': True})
@@ -90,7 +90,7 @@ class BridgeTests(unittest.TestCase):
         for _ in range(100):
             with self.bridge.lock:
                 row = self.bridge._get('jobs', request_id)
-            if row['state'] not in ('queued', 'submitting'):
+            if row['run_id'] or row['state'] not in ('queued', 'submitting'):
                 return row
             time.sleep(.01)
         self.fail('worker did not finish')
@@ -427,6 +427,18 @@ class BridgeTests(unittest.TestCase):
             self.bridge.send('123-2', 'Привет')
         self.assertEqual(len(self.hermes.calls), 1)
 
+    def test_hermes_status_only_reports_running_when_remote_confirms_it(self):
+        self.hermes.status = {'status': 'queued'}
+        self.bridge.send('123-1', 'Привет')
+        self.assertEqual(self.settle()['state'], 'queued')
+        self.assertEqual(self.bridge.job_status('123-1')['state'], 'queued')
+        self.hermes.status = {'status': 'submitting'}
+        self.assertEqual(self.bridge.job_status('123-1')['state'], 'submitting')
+        self.hermes.status = {'status': 'new_remote_state'}
+        self.assertEqual(self.bridge.job_status('123-1')['state'], 'unknown')
+        self.hermes.status = {'status': 'running'}
+        self.assertEqual(self.bridge.job_status('123-1')['state'], 'running')
+
     def test_audio_order_duplicates_integrity_and_confirmation(self):
         rpc = self.bridge.rpc
         self.assertEqual(
@@ -499,6 +511,104 @@ class BridgeTests(unittest.TestCase):
         self.settle()
         submitted = next(call for call in self.hermes.calls if call[0] == '/v1/runs')
         self.assertEqual(submitted[1]['input'], text)
+
+    def test_corrected_text_is_chunked_immutable_and_sent_without_changing_raw_asr(self):
+        raw = 'Сырая расшифровка'
+        edited = '\tИсправлено 👨\u200d👩\u200d👧\u200d👦 عرب\u200cي\n'
+        with self.bridge.lock:
+            self.bridge.db.execute(
+                "INSERT INTO uploads(id,total,data,created,state,text) VALUES (?,1,X'',?,'ready',?)",
+                ('123-1', time.time(), raw))
+            self.bridge.db.commit()
+
+        begin = self.bridge.rpc('TEXT_BEGIN', {
+            'id': '123-2', 'sourceId': '123-1', 'textLength': len(edited)})
+        self.assertEqual((begin['state'], begin['receivedLength']), ('uploading', 0))
+        first, second = edited[:8], edited[8:]
+        self.assertEqual(self.bridge.rpc('TEXT_PART', {
+            'id': '123-2', 'offset': 0, 'text': first})['receivedLength'], len(first))
+        self.assertEqual(self.bridge.rpc('TEXT_PART', {
+            'id': '123-2', 'offset': 0, 'text': first})['receivedLength'], len(first))
+        with self.assertRaises(Invalid):
+            self.bridge.rpc('TEXT_PART', {'id': '123-2', 'offset': 0, 'text': first[:-1] + 'X'})
+        with self.assertRaises(Invalid):
+            self.bridge.rpc('TEXT_FINISH', {'id': '123-2'})
+        self.bridge.rpc('TEXT_PART', {'id': '123-2', 'offset': len(first), 'text': second})
+        self.assertEqual(self.bridge.rpc('TEXT_FINISH', {'id': '123-2'})['state'], 'ready')
+        self.assertEqual(self.bridge.transcript('123-2'), edited)
+        self.assertEqual(self.bridge._get('uploads', '123-1')['text'], raw)
+
+        # Exact replays remain safe after the ephemeral source row is cleaned up.
+        with self.bridge.lock:
+            self.bridge.db.execute("DELETE FROM uploads WHERE id='123-1'")
+            self.bridge.db.commit()
+        replay = self.bridge.rpc('TEXT_BEGIN', {
+            'id': '123-2', 'sourceId': '123-1', 'textLength': len(edited)})
+        self.assertEqual((replay['state'], replay['receivedLength']), ('ready', len(edited)))
+        self.assertEqual(self.bridge.rpc('TEXT_PART', {
+            'id': '123-2', 'offset': len(first), 'text': second})['state'], 'ready')
+        with self.assertRaises(Invalid):
+            self.bridge.rpc('TEXT_BEGIN', {
+                'id': '123-2', 'sourceId': '123-9', 'textLength': len(edited)})
+
+        queued = self.bridge.rpc('SEND_TEXT', {'id': '123-1', 'textId': '123-2'})
+        self.assertEqual(queued['textLength'], len(edited))
+        self.settle()
+        submitted = next(call for call in self.hermes.calls if call[0] == '/v1/runs')
+        self.assertEqual(submitted[1]['input'], edited)
+
+    def test_corrected_text_rejects_bounds_blank_unicode_and_controls(self):
+        with self.bridge.lock:
+            self.bridge.db.execute(
+                "INSERT INTO uploads(id,total,data,created,state,text) VALUES (?,1,X'',?,'ready','raw')",
+                ('123-1', time.time()))
+            self.bridge.db.commit()
+        for length in (0, MAX_TEXT_CHARS + 1, True):
+            with self.assertRaises(Invalid):
+                self.bridge.rpc('TEXT_BEGIN', {'id': '123-2', 'sourceId': '123-1', 'textLength': length})
+        self.bridge.rpc('TEXT_BEGIN', {'id': '123-2', 'sourceId': '123-1', 'textLength': 2})
+        with self.assertRaises(Invalid):
+            self.bridge.rpc('TEXT_PART', {'id': '123-2', 'offset': 0, 'text': 'x' * (MAX_TEXT_PART_CHARS + 1)})
+        with self.assertRaises(Invalid):
+            self.bridge.rpc('TEXT_PART', {'id': '123-2', 'offset': 0, 'text': '\ud800'})
+        self.bridge.rpc('TEXT_PART', {'id': '123-2', 'offset': 0, 'text': '  '})
+        with self.assertRaises(Invalid):
+            self.bridge.rpc('TEXT_FINISH', {'id': '123-2'})
+
+        self.bridge.rpc('TEXT_BEGIN', {'id': '123-3', 'sourceId': '123-1', 'textLength': 2})
+        self.bridge.rpc('TEXT_PART', {'id': '123-3', 'offset': 0, 'text': 'a\r'})
+        with self.assertRaises(Invalid):
+            self.bridge.rpc('TEXT_FINISH', {'id': '123-3'})
+
+    def test_corrected_text_resolves_for_agent_and_watch_routes(self):
+        class Adapter:
+            def __init__(self):
+                self.texts = []
+            def rpc(self, method, params, transcript_lookup):
+                self.texts.append((method, transcript_lookup(params['textId'])))
+                return {'ok': True}
+            def close(self):
+                pass
+
+        with self.bridge.lock:
+            self.bridge.db.execute(
+                "INSERT INTO uploads(id,total,data,created,state,text) VALUES (?,1,X'',?,'ready','raw')",
+                ('123-1', time.time()))
+            self.bridge.db.commit()
+        text = 'Новый текст 😀'
+        self.bridge.rpc('TEXT_BEGIN', {'id': '123-2', 'sourceId': '123-1', 'textLength': len(text)})
+        self.bridge.rpc('TEXT_PART', {'id': '123-2', 'offset': 0, 'text': text})
+        self.bridge.rpc('TEXT_FINISH', {'id': '123-2'})
+        claude, codex, orca, dog = Adapter(), Adapter(), Adapter(), Adapter()
+        self.bridge.claude, self.bridge.codex, self.bridge.orca, self.bridge.watchdog = claude, codex, orca, dog
+        self.bridge.rpc('CLAUDE_SEND', {'id': '200-1', 'textId': '123-2'})
+        self.bridge.rpc('CODEX_SEND', {'id': '200-2', 'textId': '123-2'})
+        self.bridge.rpc('ORCA_SEND', {'id': '200-3', 'textId': '123-2'})
+        self.bridge.rpc('WATCH_ADD', {'id': '200-4', 'textId': '123-2'})
+        self.assertEqual(
+            [item.texts for item in (claude, codex, orca, dog)],
+            [[('CLAUDE_SEND', text)], [('CODEX_SEND', text)],
+             [('ORCA_SEND', text)], [('WATCH_ADD', text)]])
 
     def test_failed_asr_keeps_audio_and_finish_retries(self):
         attempts = 0
@@ -586,6 +696,35 @@ class BridgeTests(unittest.TestCase):
         self.bridge.rpc('JOB_APPROVE', {'id': '123-1', 'approvalId': 'approve-1', 'allow': True})
         approvals = [c for c in self.hermes.calls if c[0].endswith('/approval')]
         self.assertEqual(approvals[0][1], {'choice': 'once', 'request_id': 'approve-1'})
+        self.assertEqual(approvals[0][3], 4)
+        self.assertTrue(any(c[0].endswith(self.bridge._get('jobs', '123-1')['run_id']) and c[3] == 4
+                            for c in self.hermes.calls))
+
+    def test_lost_approval_receipt_is_unknown_and_never_retried(self):
+        self.bridge.send('123-1', 'Привет')
+        self.settle()
+        self.hermes.status = {'status': 'waiting_for_approval',
+                              'approval': {'request_id': 'approve-1', 'command': 'command'}}
+        original = self.hermes.call
+        def lost(path, body=None, request_id=None, timeout=12):
+            if path.endswith('/approval'):
+                self.hermes.calls.append((path, body, request_id, timeout))
+                raise TimeoutError()
+            return original(path, body, request_id, timeout)
+        self.hermes.call = lost
+        result = self.bridge.rpc('JOB_APPROVE', {
+            'id': '123-1', 'approvalId': 'approve-1', 'allow': True})
+        self.assertEqual(result['state'], 'unknown')
+        self.assertIn('Не повторяйте', result['error'])
+        self.bridge.close()
+        self.bridge = Bridge(self.tmp.name, self.hermes, lambda *a: '', '/tmp/model')
+        with self.assertRaises(Invalid):
+            self.bridge.rpc('JOB_APPROVE', {
+                'id': '123-1', 'approvalId': 'approve-1', 'allow': True})
+        self.assertEqual(len([c for c in self.hermes.calls if c[0].endswith('/approval')]), 1)
+        self.hermes.status = {'status': 'completed', 'output': 'Готово'}
+        recovered = self.bridge.job_status('123-1')
+        self.assertEqual((recovered['state'], recovered['result']), ('completed', 'Готово'))
 
     def test_persisted_result_and_restart_uncertainty(self):
         self.bridge.send('123-1', 'Привет')
@@ -594,6 +733,31 @@ class BridgeTests(unittest.TestCase):
         self.bridge.close()
         self.bridge = Bridge(self.tmp.name, self.hermes, lambda *a: '', '/tmp/model')
         self.assertEqual(self.bridge.rpc('LATEST_JOB', {})['job']['result'], 'Готово')
+
+    def test_http_orca_unavailable_has_actionable_error_without_local_paths(self):
+        from orca_service import CliFailure
+        from unittest.mock import patch
+        server = ThreadingHTTPServer(('127.0.0.1', 0), make_handler(self.bridge, 's' * 43))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            for code, retryable in [('runtime_unavailable', False), ('request_deadline', True)]:
+                request = Request(f'http://127.0.0.1:{server.server_port}/rpc',
+                                  data=json.dumps({'method': 'ORCA_LIST', 'params': {}}).encode(),
+                                  headers={'Authorization': 'Bearer ' + 's' * 43, 'Content-Type': 'application/json'})
+                with patch.object(self.bridge, 'rpc', side_effect=CliFailure('/private/runtime/path', code=code)):
+                    with self.assertRaises(HTTPError) as result:
+                        urlopen(request, timeout=3)
+                    payload = json.load(result.exception)
+                    self.assertEqual(result.exception.code, 503)
+                    self.assertEqual(payload['code'], 'ORCA_' + code.upper())
+                    self.assertEqual(payload['retryable'], retryable)
+                    self.assertIn('Orca', payload['error'])
+                    self.assertNotIn('/private', payload['error'])
+                    self.assertNotIn('Мусафир', payload['error'])
+        finally:
+            server.shutdown()
+            server.server_close()
 
     def test_http_auth_payload_and_unknown_route(self):
         server = ThreadingHTTPServer(('127.0.0.1', 0), make_handler(self.bridge, 's' * 43))

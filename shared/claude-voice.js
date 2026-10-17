@@ -3,11 +3,12 @@
 // so the next dictation continues the same conversation.
 export function createAgentVoiceRoute({ request, context, save = () => {}, prefix = 'CLAUDE', agent = 'Claude' }) {
   const remember = values => { Object.assign(context, values); save(context) }
-  async function jobReply(reply, alias) {
+  async function jobReply(reply, alias, options) {
+    if (options && typeof options.onRouteProgress === 'function') options.onRouteProgress()
     if (!reply || reply.ok !== true) return reply
     const job = reply.job
     if (!job) return { ok: true, job: null }
-    if (!job.id || !['night', 'queued', 'running', 'approval', 'completed', 'error', 'unknown'].includes(job.state)) {
+    if (!job.id || !['night', 'submitting', 'queued', 'running', 'approval', 'completed', 'error', 'unknown'].includes(job.state)) {
       throw new Error(`Некорректный ответ ${agent}`)
     }
     remember({ jobId: job.id, aliasId: alias || context.aliasId || job.id, pendingSend: false,
@@ -32,12 +33,14 @@ export function createAgentVoiceRoute({ request, context, save = () => {}, prefi
     let length = Array.from(publicJob.result).length
     const seen = new Set()
     while (job.state === 'completed' && cursor != null) {
-      if (seen.has(cursor) || length > 100000) throw new Error('Ответ слишком большой. Полный текст сохранён на Mac.')
+      if (options && typeof options.onRouteProgress === 'function') options.onRouteProgress()
+      if (seen.has(cursor) || seen.size >= 128 || length > 100000) throw new Error('Ответ слишком большой. Полный текст сохранён на Mac.')
       seen.add(cursor)
-      const page = await request({ method: prefix + '_JOB', params: { id: job.id, cursor } })
+      const page = await request({ method: prefix + '_JOB', params: { id: job.id, cursor } }, options)
       if (!page || !page.ok || !page.job || page.job.id !== job.id) throw new Error('Не удалось получить продолжение ответа')
       publicJob.result += page.job.result || ''
       length += Array.from(page.job.result || '').length
+      if (length > 100000) throw new Error('Ответ слишком большой. Полный текст сохранён на Mac.')
       cursor = page.job.nextCursor
     }
     return publicJob
@@ -54,13 +57,15 @@ export function createAgentVoiceRoute({ request, context, save = () => {}, prefi
       return { ok: true, id: params.id, state: 'completed', result: reply.message || 'Дозор поставлен', text: '', error: '' }
     }
     if (method === 'LATEST_JOB') {
-      const resumeExact = context.resumeJob === true && context.jobId
-      const reply = await request(resumeExact
-        ? { method: prefix + '_JOB', params: { id: context.jobId } }
+      const pendingId = context.pendingSend === true && context.aliasId
+      const resumeId = context.resumeJob === true && context.jobId
+      const exactId = pendingId || resumeId
+      const reply = await request(exactId
+        ? { method: prefix + '_JOB', params: { id: exactId } }
         : { method: prefix + '_LATEST', params: { project: context.project } }, options)
-      if (resumeExact && reply && reply.ok) remember({ resumeJob: false })
-      if (reply && reply.ok && reply.job && context.jobId !== reply.job.id) remember({ aliasId: reply.job.id })
-      const job = await jobReply(reply)
+      if (resumeId && reply && reply.ok) remember({ resumeJob: false })
+      if (!pendingId && reply && reply.ok && reply.job && context.jobId !== reply.job.id) remember({ aliasId: reply.job.id })
+      const job = await jobReply(reply, null, options)
       return job && job.ok ? { ok: true, job: job.job === null ? null : job } : job
     }
     if (method === 'SEND_TEXT') {
@@ -73,16 +78,17 @@ export function createAgentVoiceRoute({ request, context, save = () => {}, prefi
         sendParams.kind = context.kind
         if (context.kind === 'research' && context.both === true) sendParams.both = true  // the bridge mirrors the topic to the other agent
       }
-      return jobReply(await request({ method: prefix + '_SEND', params: sendParams }, options), params.id)
+      return jobReply(await request({ method: prefix + '_SEND', params: sendParams }, options), params.id, options)
     }
     if (method === 'JOB_STATUS') {
-      return jobReply(await request({ method: prefix + '_JOB', params: { id: context.jobId || params.id } }, options), params.id)
+      const id = context.pendingSend === true && context.aliasId ? context.aliasId : context.jobId || params.id
+      return jobReply(await request({ method: prefix + '_JOB', params: { id } }, options), params.id, options)
     }
     if (method === 'JOB_APPROVE') {
       // The bridge holds Claude's prompt until this exact decision arrives.
       const decision = { id: context.jobId || params.id, approvalId: params.approvalId, allow: params.allow === true }
       if (typeof params.answer === 'string') decision.answer = params.answer
-      return jobReply(await request({ method: prefix + '_APPROVE', params: decision }, options), params.id)
+      return jobReply(await request({ method: prefix + '_APPROVE', params: decision }, options), params.id, options)
     }
     return request(payload, options)
   }

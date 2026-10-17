@@ -110,6 +110,16 @@ class CodexServiceTests(unittest.TestCase):
         self.assertIn('approval_policy="never"', argv)
         self.assertIn("--skip-git-repo-check", argv)
         self.assertEqual(self.launches[0]["cwd"], str(self.crm))
+        self.assertEqual(self.service.rpc("CODEX_HISTORY_DETAIL", {"id": "1-1", "field": "text"})["content"],
+                         "Что в проекте?")
+        self.assertEqual(self.service.rpc(
+            "CODEX_SEND", {"id": "1-1", "textId": "1-1", "project": str(self.crm), "mode": "read-only"},
+            lambda _: "wrong")["job"]["state"], "completed")
+        for changed in ({"textId": "1-9"}, {"mode": "bypass"}, {"night": True}):
+            with self.assertRaises(ValueError):
+                self.service.rpc("CODEX_SEND", {
+                    "id": "1-1", "textId": "1-1", "project": str(self.crm),
+                    "mode": "read-only", **changed}, lambda _: "Что в проекте?")
         self.process = FakeProcess(events("01a0e48f-981b-7422-b8e8-75ce82b663a8", "Продолжаю."))
         self.service.rpc("CODEX_SEND", {"id": "1-2", "textId": "1-2", "project": str(self.crm), "mode": "bypass",
                                         "sessionId": "01a0e48f-981b-7422-b8e8-75ce82b663a8"}, lambda _: "Дальше")

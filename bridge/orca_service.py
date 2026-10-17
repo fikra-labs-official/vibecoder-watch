@@ -20,6 +20,8 @@ import uuid
 ORCA = "/usr/local/bin/orca"
 MAX_TEXT = 30_000
 PAGE_MAX = 1_000
+MENU_RPC_BUDGET = 8.0
+MENU_RPC_METHODS = frozenset(("ORCA_LIST", "ORCA_TERMINALS", "ORCA_BIND"))
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 TERMINAL_RE = re.compile(r"^term_[A-Za-z0-9-]{8,80}$")
 QUICK_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
@@ -132,6 +134,7 @@ class OrcaService:
         self.notify = notify
         self.quick_commands = normalize_quick_commands(quick_commands)
         self.lock = threading.RLock()
+        self._rpc_local = threading.local()
         self.db = sqlite3.connect(self.state / "orca.sqlite3", check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.executescript("""
@@ -202,14 +205,10 @@ class OrcaService:
     def rpc(self, method, params, transcript_lookup=None):
         if not isinstance(method, str) or not isinstance(params, dict):
             raise ValueError("Некорректный запрос Orca")
-        if method == "ORCA_LIST":
-            return self._list_workspaces(params)
-        if method == "ORCA_TERMINALS":
-            return self._list_terminals(params)
+        if method in MENU_RPC_METHODS:
+            return self._menu_rpc(method, params)
         if method == "ORCA_PAIRS":
             return self._list_pairs(params)
-        if method == "ORCA_BIND":
-            return self._bind(params)
         if method == "ORCA_QUICK_LIST":
             self._only(params, "cursor", "limit")
             offset, limit = _offset(params.get("cursor")), _limit(params.get("limit"), default=3, maximum=6)
@@ -250,10 +249,26 @@ class OrcaService:
             return self._handoff(job_id, params)
         raise ValueError("Неизвестная команда Orca")
 
+    def _menu_rpc(self, method, params):
+        context = getattr(self._rpc_local, "menu", None)
+        owner = context is None
+        if owner:
+            context = {"deadline": time.monotonic() + MENU_RPC_BUDGET, "cache": {}}
+            self._rpc_local.menu = context
+        try:
+            if method == "ORCA_LIST":
+                return self._list_workspaces(params)
+            if method == "ORCA_TERMINALS":
+                return self._list_terminals(params)
+            return self._bind(params)
+        finally:
+            if owner:
+                del self._rpc_local.menu
+
     def _list_workspaces(self, params):
         self._only(params, "cursor", "limit")
         offset, limit = _offset(params.get("cursor")), _limit(params.get("limit"))
-        result, meta = self._call(["worktree", "ps", "--json"], timeout=8)
+        result, _ = self._worktree_catalog()
         rows = result.get("worktrees", []) if isinstance(result, dict) else []
         clean = []
         for row in rows:
@@ -290,7 +305,11 @@ class OrcaService:
                 continue
             try:
                 term = self._terminal(handle, workspace_id, require_idle=False)
-            except (ValueError, CliFailure):
+            except ValueError:
+                continue
+            except CliFailure as exc:
+                if exc.code == "request_deadline":
+                    raise
                 continue
             valid.append(self._public_terminal(term))
         return {"ok": True, "workspaceId": workspace_id,
@@ -324,36 +343,42 @@ class OrcaService:
         reviewer = self._terminal(reviewer_id, workspace_id, require_idle=True)
         _, meta = self._runtime_ready()
         runtime = str(meta.get("runtimeId") or worker.get("runtimeId") or "")
-        catalog, _ = self._call(["worktree", "ps", "--json"], timeout=8)
+        catalog, _ = self._worktree_catalog()
         workspace_row = next((row for row in catalog.get("worktrees", [])
                               if isinstance(row, dict) and row.get("worktreeId") == workspace_id), {})
         project_id = str(workspace_row.get("repoId") or workspace_id.split("::", 1)[0])
         project_label = str(workspace_row.get("repo") or workspace_row.get("displayName") or
                             Path(worker["worktreePath"]).name)
         with self.lock:
-            existing = self.db.execute(
-                "SELECT * FROM pairs WHERE workspace_id=? AND worker_id=? AND reviewer_id=?",
-                (workspace_id, worker_id, reviewer_id)).fetchone()
-            if existing:
-                pair_id = existing["id"]
-                self.db.execute("UPDATE pairs SET enabled=1,worker_title=?,reviewer_title=?,"
-                                "worker_agent=?,reviewer_agent=?,worker_incarnation=?,"
-                                "reviewer_incarnation=?,runtime_id=? WHERE id=?",
-                                (worker["title"], reviewer["title"], worker["agentIdentity"],
-                                 reviewer["agentIdentity"], worker["incarnationId"],
-                                 reviewer["incarnationId"], runtime, pair_id))
-            else:
-                pair_id = "pair_" + uuid.uuid4().hex
-                self.db.execute("""INSERT INTO pairs(
-                    id,workspace_id,project_id,project_label,worker_id,reviewer_id,
-                    worker_title,reviewer_title,worker_agent,reviewer_agent,
-                    worker_incarnation,reviewer_incarnation,runtime_id,created)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (pair_id, workspace_id, project_id, project_label, worker_id,
-                     reviewer_id, worker["title"], reviewer["title"],
-                     worker["agentIdentity"], reviewer["agentIdentity"],
-                     worker["incarnationId"], reviewer["incarnationId"], runtime, time.time()))
-            self.db.commit()
+            try:
+                self._request_remaining()
+                existing = self.db.execute(
+                    "SELECT * FROM pairs WHERE workspace_id=? AND worker_id=? AND reviewer_id=?",
+                    (workspace_id, worker_id, reviewer_id)).fetchone()
+                if existing:
+                    pair_id = existing["id"]
+                    self.db.execute("UPDATE pairs SET enabled=1,worker_title=?,reviewer_title=?,"
+                                    "worker_agent=?,reviewer_agent=?,worker_incarnation=?,"
+                                    "reviewer_incarnation=?,runtime_id=? WHERE id=?",
+                                    (worker["title"], reviewer["title"], worker["agentIdentity"],
+                                     reviewer["agentIdentity"], worker["incarnationId"],
+                                     reviewer["incarnationId"], runtime, pair_id))
+                else:
+                    pair_id = "pair_" + uuid.uuid4().hex
+                    self.db.execute("""INSERT INTO pairs(
+                        id,workspace_id,project_id,project_label,worker_id,reviewer_id,
+                        worker_title,reviewer_title,worker_agent,reviewer_agent,
+                        worker_incarnation,reviewer_incarnation,runtime_id,created)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (pair_id, workspace_id, project_id, project_label, worker_id,
+                         reviewer_id, worker["title"], reviewer["title"],
+                         worker["agentIdentity"], reviewer["agentIdentity"],
+                         worker["incarnationId"], reviewer["incarnationId"], runtime, time.time()))
+                self._request_remaining()
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                raise
             row = self.db.execute("SELECT * FROM pairs WHERE id=?", (pair_id,)).fetchone()
         return {"ok": True, "pair": self._public_pair(row)}
 
@@ -1023,9 +1048,30 @@ class OrcaService:
 
     # ---- Orca identity and CLI -----------------------------------------
 
+    def _request_remaining(self):
+        context = getattr(self._rpc_local, "menu", None)
+        if context is None:
+            return None
+        remaining = context["deadline"] - time.monotonic()
+        if remaining <= 0:
+            raise CliFailure(
+                "Проверка Orca заняла больше 8 секунд. Повторите запрос.",
+                code="request_deadline")
+        return remaining
+
+    def _worktree_catalog(self):
+        context = getattr(self._rpc_local, "menu", None)
+        cache = context["cache"] if context is not None else None
+        if cache is not None and "worktree_catalog" in cache:
+            return cache["worktree_catalog"]
+        catalog = self._read_call(["worktree", "ps", "--json"], timeout=8)
+        if cache is not None:
+            cache["worktree_catalog"] = catalog
+        return catalog
+
     def _workspace(self, value):
         value = self._plain(value, "рабочего каталога", 4096)
-        result, _ = self._read_call(["worktree", "ps", "--json"], timeout=8)
+        result, _ = self._worktree_catalog()
         rows = result.get("worktrees", []) if isinstance(result, dict) else []
         if not any(isinstance(row, dict) and row.get("worktreeId") == value and
                    not row.get("isArchived") for row in rows):
@@ -1054,7 +1100,7 @@ class OrcaService:
         tab_id, leaf_id = term.get("tabId"), term.get("leafId")
         if isinstance(tab_id, str) and isinstance(leaf_id, str):
             try:
-                result, _ = self._read_call(["worktree", "ps", "--json"], timeout=8)
+                result, _ = self._worktree_catalog()
                 pane_key = tab_id + ":" + leaf_id
                 workspace = next((row for row in result.get("worktrees", [])
                                   if isinstance(row, dict) and
@@ -1065,14 +1111,18 @@ class OrcaService:
                     return True
                 if agent and agent.get("state") == "working":
                     return False
-            except CliFailure:
+            except CliFailure as exc:
+                if exc.code == "request_deadline":
+                    raise
                 pass
         handle = term["handle"]
         try:
             result, _ = self._read_call([
                 "terminal", "wait", "--terminal", handle, "--for", "tui-idle",
                 "--timeout-ms", "50", "--json"], timeout=1, allow_timeout=True)
-        except CliFailure:
+        except CliFailure as exc:
+            if exc.code == "request_deadline":
+                raise
             return None
         wait = result.get("wait", result) if isinstance(result, dict) else {}
         value = wait.get("satisfied") if isinstance(wait, dict) else None
@@ -1144,6 +1194,7 @@ class OrcaService:
             except CliFailure as exc:
                 if exc.code not in ('timeout', 'transport_error') or allow_timeout:
                     raise
+                self._request_remaining()
                 if attempt:
                     raise CliFailure('Не удалось прочитать состояние Orca на Mac. Проверка связи не завершена.',
                                      code='read_unavailable') from exc
@@ -1151,10 +1202,12 @@ class OrcaService:
     def _call(self, argv, *, timeout, allow_timeout=False):
         if not isinstance(argv, list) or any(not isinstance(x, str) for x in argv):
             raise TypeError("CLI argv must be strings")
+        remaining = self._request_remaining()
+        effective_timeout = min(timeout, remaining) if remaining is not None else timeout
         try:
             if self.cli is None:
                 completed = subprocess.run([ORCA, *argv], shell=False, text=True,
-                                           capture_output=True, timeout=timeout, check=False)
+                                           capture_output=True, timeout=effective_timeout, check=False)
                 raw = completed.stdout.strip() or completed.stderr.strip()
                 try:
                     value = json.loads(raw)
@@ -1164,7 +1217,7 @@ class OrcaService:
             else:
                 runner = self.cli.run if hasattr(self.cli, "run") else self.cli
                 try:
-                    value = runner(list(argv), timeout=timeout)
+                    value = runner(list(argv), timeout=effective_timeout)
                 except TypeError:
                     value = runner(list(argv))
                 if isinstance(value, subprocess.CompletedProcess):
@@ -1172,9 +1225,11 @@ class OrcaService:
                 elif isinstance(value, str):
                     value = json.loads(value)
         except (subprocess.TimeoutExpired, TimeoutError) as exc:
+            self._request_remaining()
             if allow_timeout:
                 raise CliFailure("timeout", code="timeout") from exc
             raise CliFailure("Ответ Orca потерян", code="timeout", uncertain=True) from exc
+        self._request_remaining()
         if not isinstance(value, dict):
             raise CliFailure("Orca вернула некорректный ответ")
         meta = value.get("_meta", {}) if isinstance(value.get("_meta", {}), dict) else {}

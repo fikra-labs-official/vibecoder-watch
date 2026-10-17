@@ -19,7 +19,7 @@ const flush = () => new Promise(resolve => setImmediate(resolve))
 
 export function pageFixture({ media = () => { throw Error('recorder unavailable') }, layout,
   width = 390, height = 450, files = {}, reply, storage = new Map(),
-  storageError = false, displayError = false, vibratorError = false, kind = 'musafir' } = {}) {
+  storageError = false, displayError = false, vibratorError = false, kind = 'musafir', keyboard } = {}) {
   let page
   let mediaCalls = 0
   let nextTimer = 0
@@ -30,6 +30,13 @@ export function pageFixture({ media = () => { throw Error('recorder unavailable'
   const replacements = []
   const displayCalls = []
   const vibrationCalls = []
+  const keyboardCalls = []
+  let keyboardOptions
+  const keyboardUI = keyboard || {
+    inputType: { CHAR: 1, JSKB: 4 },
+    createKeyboard(options) { keyboardOptions = options; keyboardCalls.push({ action: 'open', options }); return {} },
+    deleteKeyboard() { keyboardCalls.push({ action: 'close' }) }
+  }
   const display = Object.fromEntries(['setWakeUpRelaunch', 'setPageBrightTime', 'resetPageBrightTime',
     'pauseDropWristScreenOff', 'resetDropWristScreenOff'].map(name => [name, value => {
     displayCalls.push({ name, ...value })
@@ -44,7 +51,7 @@ export function pageFixture({ media = () => { throw Error('recorder unavailable'
     Page(value) { page = value }, BasePage: value => value,
     createWatchClient, MAX_AUDIO_BYTES, createOrcaVoiceRoute, createFolderVoiceRoute, createClaudeVoiceRoute, createCodexVoiceRoute,
     replace(value) { replacements.push(value) },
-    ...display,
+    ...display, keyboardUI,
     LocalStorage: class {
       constructor() { if (storageError) throw Error('storage unavailable') }
       getItem(key) { return storage.get(key) }
@@ -86,7 +93,8 @@ export function pageFixture({ media = () => { throw Error('recorder unavailable'
     return Promise.resolve(reply ? reply(payload) : payload.method === 'STATUS'
       ? { ok: true, agent: 'Мусафир' } : { ok: true, job: null })
   }
-  return { page, requests, timers, widgets, displayCalls, vibrationCalls, storage, replacements, mediaCalls: () => mediaCalls,
+  return { page, requests, timers, widgets, displayCalls, vibrationCalls, keyboardCalls,
+    keyboard: () => keyboardOptions, storage, replacements, mediaCalls: () => mediaCalls,
     advance(ms) { clock += ms },
     tick(delay) {
       const match = [...timers].find(([, timer]) => timer.delay === delay)
@@ -1149,7 +1157,7 @@ test('all states have nonoverlapping widgets within native and compatibility win
     f.page.build()
     await flush()
     for (const phase of ['connecting', 'refreshing', 'ready', 'recording', 'stopping', 'canceling', 'uploading', 'transcribing',
-      'review', 'sending', 'job', 'approval', 'result', 'unknown', 'error']) {
+      'review', 'saving-text', 'sending', 'job', 'approval', 'result', 'unknown', 'error']) {
       f.page.localRecordingError = phase === 'error'
       f.page.render({ phase, text: 'Команда', result: 'Длинный ответ. '.repeat(35), error: 'Ошибка микрофона',
         approvalId: '1', approvalText: 'Разрешить действие?' })
@@ -1331,4 +1339,128 @@ test('compact large-file transfer preserves the opaque native handle and all byt
   assert.equal(f.closes(), 1)
   assert.ok(f.removed.length > 0)
   f.page.onDestroy()
+})
+
+for (const kind of ['musafir', 'orca', 'claude', 'codex']) {
+  test(`${kind}: native keyboard edits the whole transcript without submitting; cancel and destroy preserve it`, async () => {
+    const id = '1700000000000-17'
+    const original = 'Проверь пару ошибочных слов. '.repeat(20)
+    const storage = new Map(kind === 'musafir' ? [] : [['voice-destination', JSON.stringify({
+      target: kind, project: 'project-1', pairId: 'pair-1', label: 'Проект'
+    })]])
+    const f = pageFixture({ kind, storage, layout: text => ({ height: Math.ceil(text.length / 24) * 25 }),
+      reply: ({ method }) => method === 'STATUS' ? { ok: true, agent: 'Мусафир' }
+        : method === 'AUDIO_STATUS' ? { ok: true, id, state: 'ready', text: original,
+          textLength: original.length, textOffset: 0, textComplete: true }
+          : { ok: true, job: null }
+    })
+    f.page.build()
+    await flush()
+    f.page.client.resumeAudio(id)
+    await flush()
+    assert.equal(f.page.editButton.options.visible, true)
+    assert.equal(f.page.textPages.join(''), original)
+    f.page.turnPage(1)
+    f.page.editButton.options.click_func()
+    assert.equal(f.keyboard().text, original, 'editor receives every page, including the off-screen text')
+    assert.equal(f.keyboard().inputType, 4, 'enabled custom keyboard is preferred')
+    const changed = 'Проверь исправленные слова 🕌.\n' + original
+    f.keyboard().onComplete(null, { data: changed })
+    assert.equal(f.page.client.getState().text, changed)
+    assert.equal(f.page.textPages.join(''), changed)
+    assert.equal(f.page.client.getState().phase, 'review')
+    assert.equal(JSON.parse(storage.get(f.page.draftStorageKey)).text, changed)
+    assert.equal(f.requests.some(x => /SEND|TEXT_(BEGIN|PART|FINISH)/.test(x.method)), false)
+    f.page.editTranscript()
+    f.keyboard().onCancel()
+    assert.equal(f.page.client.getState().text, changed)
+    f.page.editTranscript()
+    const stale = f.keyboard()
+    f.page.onDestroy()
+    const saved = storage.get(f.page.draftStorageKey)
+    stale.onComplete(null, { data: 'late callback' })
+    assert.equal(storage.get(f.page.draftStorageKey), saved)
+    assert.equal(f.keyboardCalls.at(-1).action, 'close')
+  })
+}
+
+test('missing or failing keyboard keeps the review and all original text', async () => {
+  for (const keyboard of [{}, { inputType: { CHAR: 1, JSKB: 4 },
+    createKeyboard() { throw Error('unavailable') }, deleteKeyboard() {} }]) {
+    const f = pageFixture({ keyboard })
+    f.page.build()
+    await flush()
+    f.page.client.getState = () => ({ phase: 'review', text: 'Полный исходный текст', id: '1700000000000-1' })
+    f.page.render(f.page.client.getState())
+    assert.doesNotThrow(() => f.page.editTranscript())
+    assert.equal(f.page.pageSource, 'Полный исходный текст')
+    assert.equal(f.page.keyboardOpen, false)
+    assert.match(f.page.stageWidget.options.text, /клавиатур/i)
+    f.page.onDestroy()
+  }
+})
+
+test('accepted and submitting states never claim the agent is already working', async () => {
+  for (const kind of ['musafir', 'orca', 'claude', 'codex']) {
+    const storage = new Map(kind === 'musafir' ? [] : [['voice-destination', JSON.stringify({
+      target: kind, project: 'project-1', pairId: 'pair-1', label: 'Проект'
+    })]])
+    const f = pageFixture({ kind, storage })
+    f.page.build()
+    await flush()
+    for (const state of ['queued', 'submitting']) {
+      f.page.render({ phase: 'job', state, id: 'job-1' })
+      assert.doesNotMatch(f.page.statusWidget.options.text, /работает|думает/)
+      assert.doesNotMatch(f.page.bodyWidget.options.text, /выполняется|работает/)
+      assert.match(f.page.bodyWidget.options.text, /ожидаю/i)
+    }
+    f.page.render({ phase: 'job', state: 'running', id: 'job-1' })
+    assert.match(f.page.statusWidget.options.text, /работает/)
+    f.page.onDestroy()
+  }
+})
+
+test('a confirmed agent start vibrates once; queued status and polling do not repeat it', async () => {
+  const f = pageFixture()
+  f.page.build()
+  await flush()
+  f.page.alerts.observe({ phase: 'job', state: 'queued', id: 'start-1' })
+  assert.equal(f.vibrationCalls.filter(x => x.name === 'start').length, 0)
+  f.page.alerts.observe({ phase: 'job', state: 'running', id: 'start-1' })
+  assert.equal(f.vibrationCalls.filter(x => x.name === 'start').length, 1)
+  f.page.alerts.observe({ phase: 'refreshing' })
+  f.page.alerts.observe({ phase: 'job', state: 'running', id: 'start-1' })
+  assert.equal(f.vibrationCalls.filter(x => x.name === 'start').length, 1)
+  f.page.onDestroy()
+  const again = pageFixture({ storage: f.storage })
+  again.page.build()
+  await flush()
+  again.page.alerts.observe({ phase: 'job', state: 'running', id: 'start-1' })
+  assert.equal(again.vibrationCalls.filter(x => x.name === 'start').length, 0)
+  again.page.onDestroy()
+})
+
+test('an edited draft and its pending audio cannot be restored into a different project', async () => {
+  const id = '1700000000000-33'
+  const destination = project => JSON.stringify({ target: 'claude', project, label: project })
+  const storage = new Map([['voice-destination', destination('project-a')]])
+  const first = pageFixture({ kind: 'claude', storage, reply: ({ method }) => method === 'AUDIO_STATUS'
+    ? { ok: true, id, state: 'ready', text: 'Задание для A', textLength: 13, textOffset: 0, textComplete: true }
+    : { ok: true, job: null } })
+  first.page.build()
+  await flush()
+  first.page.client.resumeAudio(id)
+  await flush()
+  first.page.client.updateReviewText('Исправлено только для A')
+  first.page.savePendingAudio({ id, fileName: 'draft.opus', totalBytes: 1024, accepted: true })
+  first.page.onDestroy()
+  storage.set('voice-destination', destination('project-b'))
+  const second = pageFixture({ kind: 'claude', storage })
+  second.page.build()
+  await flush()
+  assert.equal(second.page.client.getState().phase, 'ready')
+  assert.equal(second.page.pendingAudio, null)
+  assert.notEqual(first.page.draftStorageKey, second.page.draftStorageKey)
+  assert.equal(JSON.parse(storage.get(first.page.draftStorageKey)).text, 'Исправлено только для A')
+  second.page.onDestroy()
 })

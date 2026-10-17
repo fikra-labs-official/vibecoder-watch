@@ -59,6 +59,118 @@ test('approval screen keeps polling and exits when remote wait finishes', async 
   f.client.close()
 })
 
+test('safe reads retry one retryable phone-to-Mac failure', async () => {
+  let statusCalls = 0
+  const f = fixture(({ method }) => {
+    if (method === 'STATUS') {
+      statusCalls += 1
+      if (statusCalls === 1) return Promise.resolve({ ok: false, code: 'BRIDGE_TRANSPORT',
+        retryable: true, error: 'Mac temporarily unavailable' })
+      return Promise.resolve({ ok: true, agent: 'Мусафир' })
+    }
+    if (method === 'LATEST_JOB') return Promise.resolve({ ok: true, job: null })
+    throw new Error(method)
+  })
+  f.client.start()
+  await flush()
+  assert.equal(statusCalls, 2)
+  assert.equal(f.client.getState().phase, 'ready')
+  f.client.close()
+})
+
+test('audio status retries one retryable bridge reply for the same recording', async () => {
+  let audioCalls = 0
+  const f = fixture(({ method, params }) => {
+    if (method === 'STATUS') return Promise.resolve({ ok: true, agent: 'Мусафир' })
+    if (method === 'LATEST_JOB') return Promise.resolve({ ok: true, job: {
+      id: '123-10', state: 'transcribing'
+    } })
+    if (method === 'AUDIO_STATUS') {
+      audioCalls += 1
+      if (audioCalls === 1) return Promise.resolve({ ok: false, code: 'BRIDGE_HTTP',
+        retryable: true, error: 'Bridge HTTP 503' })
+      return Promise.resolve({ ok: true, id: params.id, state: 'ready', text: 'Готово' })
+    }
+    throw new Error(method)
+  })
+  f.client.start()
+  await flush()
+  f.clock.fireDelay(2000)
+  await flush()
+  assert.equal(audioCalls, 2)
+  assert.equal(f.client.getState().phase, 'review')
+  assert.equal(f.client.getState().text, 'Готово')
+  f.client.close()
+})
+
+test('retryable reply flags never repeat SEND_TEXT or JOB_APPROVE mutations', async () => {
+  let sendCalls = 0
+  const send = fixture(({ method }) => {
+    if (method === 'STATUS') return Promise.resolve({ ok: true, agent: 'Мусафир' })
+    if (method === 'LATEST_JOB') return Promise.resolve({ ok: true, job: {
+      id: '123-11', state: 'ready', text: 'Команда'
+    } })
+    if (method === 'SEND_TEXT') {
+      sendCalls += 1
+      return Promise.resolve({ ok: false, code: 'BRIDGE_HTTP', retryable: true, error: 'Bridge HTTP 503' })
+    }
+    throw new Error(method)
+  })
+  send.client.start()
+  await flush()
+  assert.equal(send.client.sendText(), true)
+  await flush()
+  assert.equal(sendCalls, 1)
+  assert.equal(send.client.getState().phase, 'unknown')
+  send.client.close()
+
+  let approvalCalls = 0
+  const approval = fixture(({ method }) => {
+    if (method === 'STATUS') return Promise.resolve({ ok: true, agent: 'Claude' })
+    if (method === 'LATEST_JOB') return Promise.resolve({ ok: true, job: {
+      id: '123-12', state: 'approval', approval: { id: 'approval-12', text: 'Разрешить?' }
+    } })
+    if (method === 'JOB_APPROVE') {
+      approvalCalls += 1
+      return Promise.resolve({ ok: false, code: 'BRIDGE_TRANSPORT', retryable: true, error: 'Receipt unknown' })
+    }
+    throw new Error(method)
+  })
+  approval.client.start()
+  await flush()
+  assert.equal(approval.client.approve(true), true)
+  await flush()
+  assert.equal(approvalCalls, 1)
+  assert.equal(approval.client.getState().phase, 'error')
+  assert.equal(approval.client.getState().retryMethod, 'JOB_STATUS')
+  approval.client.close()
+})
+
+test('safe reads do not retry false or malformed retryable flags', async () => {
+  for (const reply of [
+    { ok: false, retryable: false, error: 'Rejected' },
+    { ok: false, retryable: 'true', error: 'Rejected' },
+    { ok: false, retryable: 1, error: 'Rejected' },
+    { ok: false, retryable: null, error: 'Rejected' },
+    { ok: 'false', retryable: true, error: 'Malformed' },
+    { retryable: true, error: 'Malformed' },
+    null,
+    false
+  ]) {
+    let calls = 0
+    const f = fixture(({ method }) => {
+      assert.equal(method, 'STATUS')
+      calls += 1
+      return Promise.resolve(reply)
+    })
+    f.client.start()
+    await flush()
+    assert.equal(calls, 1)
+    assert.equal(f.client.getState().phase, 'error')
+    f.client.close()
+  }
+})
+
 function timers() {
   let nextId = 1
   const active = new Map()
@@ -267,20 +379,23 @@ test('long Unicode transcript is fetched in bounded pages and submitted by store
 })
 
 test('the 20 second guard covers an unresolved handshake and ignores a late reply', async () => {
-  let resolveStatus
+  const statusResolvers = []
   const f = fixture(payload => {
     assert.equal(payload.method, 'STATUS')
-    return new Promise(resolve => { resolveStatus = resolve })
+    return new Promise(resolve => { statusResolvers.push(resolve) })
   })
 
   f.client.start()
   await flush()
   f.clock.fireDelay(HANDSHAKE_TIMEOUT_MS)
   await flush()
+  assert.equal(statusResolvers.length, 2)
+  f.clock.fireDelay(HANDSHAKE_TIMEOUT_MS)
+  await flush()
   assert.equal(f.states.at(-1).phase, 'error')
   assert.equal(f.states.at(-1).error, 'Телефон не ответил')
 
-  resolveStatus({ ok: true, agent: 'Мусафир' })
+  statusResolvers[0]({ ok: true, agent: 'Мусафир' })
   await flush()
   assert.equal(f.states.some(state => state.phase === 'ready'), false)
   f.client.close()
@@ -344,7 +459,7 @@ test('failed transcription refresh retries audio status for the same recording',
     }
     if (payload.method === 'AUDIO_STATUS') {
       audioChecks += 1
-      if (audioChecks === 1) return Promise.reject(new Error('BLE disconnected'))
+      if (audioChecks <= 2) return Promise.reject(new Error('BLE disconnected'))
       return Promise.resolve({ ok: true, id: '123-6', state: 'ready', text: 'Повтор сработал' })
     }
     throw new Error(`unexpected ${payload.method}`)
@@ -363,7 +478,7 @@ test('failed transcription refresh retries audio status for the same recording',
   assert.deepEqual(
     f.sent.filter(item => item.payload.method === 'AUDIO_STATUS')
       .map(item => item.payload.params.id),
-    ['123-6', '123-6']
+    ['123-6', '123-6', '123-6']
   )
   assert.equal(f.sent.filter(item => item.payload.method === 'LATEST_JOB').length, 1)
   assert.equal(f.sent.some(item => item.payload.method === 'JOB_STATUS'), false)
@@ -747,5 +862,294 @@ test('an agent question carries its options and the chosen answer travels with t
   await flush()
   const approval = f.sent.find(item => item.payload.method === 'JOB_APPROVE')
   assert.deepEqual(approval.payload.params, { id: '123-9', approvalId: 'q-1', allow: true, answer: 'Синий' })
+  f.client.close()
+})
+
+test('manual review edits are validated, persisted, and get a new id after every change', async () => {
+  let draft = null
+  const writes = []
+  const f = fixture(payload => {
+    if (payload.method === 'STATUS') return Promise.resolve({ ok: true, agent: 'Мусафир' })
+    if (payload.method === 'LATEST_JOB') return Promise.resolve({ ok: true, job: {
+      id: '123-1', state: 'ready', text: 'Исходный текст'
+    } })
+    throw new Error(`unexpected ${payload.method}`)
+  }, {
+    readDraft: () => draft,
+    writeDraft: value => { draft = value; writes.push(value) }
+  })
+  f.client.start()
+  await flush()
+
+  for (const invalid of ['', '   ', 'a\0b', 'a\rb', 'a\u0085b', '\ud800', 'x'.repeat(30001)]) {
+    assert.throws(() => f.client.updateReviewText(invalid))
+  }
+  assert.equal(writes.length, 0)
+
+  assert.equal(f.client.updateReviewText('Исправлено 🙂'), true)
+  const firstId = draft.draftId
+  assert.deepEqual(draft, {
+    id: '123-1', text: 'Исправлено 🙂', textId: null,
+    edited: true, draftId: firstId, pendingSend: false
+  })
+  assert.equal(f.client.getState().edited, true)
+  assert.equal(f.client.getState().text, 'Исправлено 🙂')
+
+  assert.equal(f.client.updateReviewText('Исправлено ещё раз'), true)
+  assert.notEqual(draft.draftId, firstId)
+  assert.equal(draft.text, 'Исправлено ещё раз')
+  assert.equal(f.client.updateReviewText('Строка\nс табом\tи семьёй 👨‍👩‍👧‍👦'), true)
+  assert.match(draft.text, /👨‍👩‍👧‍👦/)
+  f.client.close()
+})
+
+test('edited text is uploaded in codepoint pages and persisted before the command mutation', async () => {
+  let draft = null
+  const writes = []
+  const text = `${'а'.repeat(999)}🙂${'б'.repeat(2)}`
+  const f = fixture(payload => {
+    const { method, params } = payload
+    if (method === 'STATUS') return Promise.resolve({ ok: true, agent: 'Мусафир' })
+    if (method === 'LATEST_JOB') return Promise.resolve({ ok: true, job: {
+      id: '123-1', state: 'ready', text: 'Исходный текст'
+    } })
+    if (method === 'TEXT_BEGIN') return Promise.resolve({ ok: true, id: params.id,
+      state: 'uploading', textLength: params.textLength, receivedLength: 0 })
+    if (method === 'TEXT_PART') return Promise.resolve({ ok: true, id: params.id,
+      state: 'uploading', textLength: Array.from(text).length,
+      receivedLength: params.offset + Array.from(params.text).length })
+    if (method === 'TEXT_FINISH') return Promise.resolve({ ok: true, id: params.id,
+      state: 'ready', textLength: Array.from(text).length })
+    if (method === 'SEND_TEXT') {
+      assert.equal(draft.pendingSend, true)
+      assert.equal(draft.textId, draft.draftId)
+      assert.deepEqual(params, { id: '123-1', textId: draft.draftId })
+      return Promise.resolve({ ok: true, id: '123-1', state: 'queued' })
+    }
+    throw new Error(`unexpected ${method}`)
+  }, {
+    readDraft: () => draft,
+    writeDraft: value => { draft = value; writes.push(value && { ...value }) }
+  })
+  f.client.start()
+  await flush()
+  f.client.updateReviewText(text)
+  const draftId = draft.draftId
+  assert.equal(f.client.sendText(), true)
+  await flush()
+  await flush()
+
+  assert.deepEqual(f.sent.map(item => item.payload.method), [
+    'STATUS', 'LATEST_JOB', 'TEXT_BEGIN', 'TEXT_PART', 'TEXT_PART', 'TEXT_FINISH', 'SEND_TEXT'
+  ])
+  assert.deepEqual(f.sent.filter(item => item.payload.method === 'TEXT_PART').map(item => ({
+    offset: item.payload.params.offset,
+    length: Array.from(item.payload.params.text).length
+  })), [{ offset: 0, length: 1000 }, { offset: 1000, length: 2 }])
+  assert.deepEqual(f.sent.find(item => item.payload.method === 'TEXT_BEGIN').payload.params, {
+    id: draftId, sourceId: '123-1', textLength: 1002
+  })
+  const readyWrite = writes.find(value => value && value.textId === draftId && value.pendingSend === false)
+  const pendingWrite = writes.find(value => value && value.textId === draftId && value.pendingSend === true)
+  assert.ok(readyWrite)
+  assert.ok(pendingWrite)
+  assert.equal(f.client.getState().phase, 'job')
+  assert.equal(draft, null)
+  f.client.close()
+})
+
+test('a failed edited-text upload stays reviewable and only explicit Send retries it', async () => {
+  let draft = null
+  let beginFailures = 2
+  const f = fixture(payload => {
+    const { method, params } = payload
+    if (method === 'STATUS') return Promise.resolve({ ok: true, agent: 'Мусафир' })
+    if (method === 'LATEST_JOB') return Promise.resolve({ ok: true, job: {
+      id: '123-1', state: 'ready', text: 'Исходный текст'
+    } })
+    if (method === 'TEXT_BEGIN' && beginFailures-- > 0) return Promise.reject(new Error('BLE disconnected'))
+    if (method === 'TEXT_BEGIN') return Promise.resolve({ ok: true, id: params.id,
+      state: 'uploading', textLength: params.textLength, receivedLength: 0 })
+    if (method === 'TEXT_PART') return Promise.resolve({ ok: true, id: params.id,
+      state: 'uploading', textLength: 10, receivedLength: 10 })
+    if (method === 'TEXT_FINISH') return Promise.resolve({ ok: true, id: params.id,
+      state: 'ready', textLength: 10 })
+    if (method === 'SEND_TEXT') return Promise.resolve({ ok: true, id: '123-1', state: 'queued' })
+    throw new Error(`unexpected ${method}`)
+  }, {
+    readDraft: () => draft,
+    writeDraft: value => { draft = value }
+  })
+  f.client.start()
+  await flush()
+  f.client.updateReviewText('Исправлено')
+  assert.equal(f.client.sendText(), true)
+  await flush()
+  assert.equal(f.client.getState().phase, 'review')
+  assert.match(f.client.getState().error, /BLE disconnected/)
+  assert.equal(f.sent.some(item => item.payload.method === 'SEND_TEXT'), false)
+  assert.equal(draft.pendingSend, false)
+
+  assert.equal(f.client.sendText(), true)
+  await flush()
+  await flush()
+  assert.equal(f.sent.filter(item => item.payload.method === 'TEXT_BEGIN').length, 3)
+  assert.equal(f.sent.filter(item => item.payload.method === 'SEND_TEXT').length, 1)
+  assert.equal(f.client.getState().phase, 'job')
+  f.client.close()
+})
+
+test('an uncertain submitted draft is recovered by exact id without resending', async () => {
+  let draft = null
+  let first = true
+  const handler = payload => {
+    const { method, params } = payload
+    if (method === 'STATUS') return Promise.resolve({ ok: true, agent: 'Мусафир' })
+    if (method === 'LATEST_JOB') return Promise.resolve({ ok: true, job: {
+      id: '123-1', state: 'ready', text: 'Исходный текст'
+    } })
+    if (method === 'SEND_TEXT') return Promise.reject(new Error('receipt lost'))
+    if (method === 'JOB_STATUS') return Promise.resolve({ ok: true, id: params.id, state: 'queued' })
+    throw new Error(`unexpected ${method}`)
+  }
+  const persistence = {
+    readDraft: () => draft,
+    writeDraft: value => { draft = value }
+  }
+  const original = fixture(handler, persistence)
+  original.client.start()
+  await flush()
+  assert.equal(original.client.sendText(), true)
+  await flush()
+  assert.equal(original.client.getState().phase, 'unknown')
+  assert.equal(draft.pendingSend, true)
+  original.client.close()
+
+  let statusChecks = 0
+  const reopened = fixture(payload => {
+    first = false
+    if (payload.method === 'JOB_STATUS' && statusChecks++ === 0) {
+      return Promise.reject(new Error('cold handshake'))
+    }
+    return handler(payload)
+  }, persistence)
+  reopened.client.start()
+  await flush()
+  assert.equal(first, false)
+  assert.deepEqual(reopened.sent.map(item => item.payload.method), ['STATUS', 'JOB_STATUS', 'JOB_STATUS'])
+  assert.equal(reopened.sent[1].payload.params.id, '123-1')
+  assert.equal(reopened.client.getState().phase, 'job')
+  assert.equal(draft, null)
+  reopened.client.close()
+})
+
+test('failure to persist pending send keeps the review and sends no command', async () => {
+  let draft = null
+  let rejectPending = true
+  const f = fixture(payload => {
+    if (payload.method === 'STATUS') return Promise.resolve({ ok: true, agent: 'Мусафир' })
+    if (payload.method === 'LATEST_JOB') return Promise.resolve({ ok: true, job: {
+      id: '123-1', state: 'ready', text: 'Исходный текст'
+    } })
+    if (payload.method === 'SEND_TEXT') return Promise.resolve({ ok: true, id: '123-1', state: 'queued' })
+    throw new Error(`unexpected ${payload.method}`)
+  }, {
+    readDraft: () => draft,
+    writeDraft: value => {
+      if (value && value.pendingSend && rejectPending) throw new Error('storage full')
+      draft = value
+    }
+  })
+  f.client.start()
+  await flush()
+  assert.equal(f.client.sendText(), true)
+  await flush()
+  assert.equal(f.client.getState().phase, 'review')
+  assert.match(f.client.getState().error, /сохранить текст/)
+  assert.equal(f.sent.some(item => item.payload.method === 'SEND_TEXT'), false)
+
+  rejectPending = false
+  assert.equal(f.client.sendText(), true)
+  await flush()
+  assert.equal(f.sent.filter(item => item.payload.method === 'SEND_TEXT').length, 1)
+  assert.equal(f.client.getState().phase, 'job')
+  f.client.close()
+})
+
+test('non-authoritative send and status errors keep the pending draft uncertain', async () => {
+  let draft = null
+  const persistence = {
+    readDraft: () => draft,
+    writeDraft: value => { draft = value }
+  }
+  const first = fixture(payload => {
+    if (payload.method === 'STATUS') return Promise.resolve({ ok: true, agent: 'Мусафир' })
+    if (payload.method === 'LATEST_JOB') return Promise.resolve({ ok: true, job: {
+      id: '123-1', state: 'ready', text: 'Не потерять'
+    } })
+    if (payload.method === 'SEND_TEXT') return Promise.resolve({ ok: false, error: 'BRIDGE_HTTP_503' })
+    throw new Error(`unexpected ${payload.method}`)
+  }, persistence)
+  first.client.start()
+  await flush()
+  assert.equal(first.client.sendText(), true)
+  await flush()
+  assert.equal(first.client.getState().phase, 'unknown')
+  assert.equal(first.client.getState().retryMethod, 'JOB_STATUS')
+  assert.equal(draft.pendingSend, true)
+  first.client.close()
+
+  const reopened = fixture(payload => {
+    if (payload.method === 'STATUS') return Promise.resolve({ ok: true, agent: 'Мусафир' })
+    if (payload.method === 'JOB_STATUS') return Promise.resolve({ ok: false, error: 'BRIDGE_HTTP_503' })
+    throw new Error(`unexpected ${payload.method}`)
+  }, persistence)
+  reopened.client.start()
+  await flush()
+  assert.equal(reopened.client.getState().phase, 'unknown')
+  assert.equal(reopened.client.getState().retryId, '123-1')
+  assert.equal(draft.pendingSend, true)
+  assert.equal(reopened.sent.some(item => item.payload.method === 'LATEST_JOB'), false)
+  assert.equal(reopened.sent.some(item => item.payload.method === 'SEND_TEXT'), false)
+  reopened.client.close()
+})
+
+test('an exact ready status preserves and restores the pending review text', async () => {
+  let draft = { id: '123-1', text: 'Правка остаётся', textId: null,
+    edited: false, draftId: null, pendingSend: true }
+  const f = fixture(payload => {
+    if (payload.method === 'STATUS') return Promise.resolve({ ok: true, agent: 'Мусафир' })
+    if (payload.method === 'JOB_STATUS') return Promise.resolve({ ok: true,
+      id: '123-1', state: 'ready', text: 'Старый текст' })
+    throw new Error(`unexpected ${payload.method}`)
+  }, {
+    readDraft: () => draft,
+    writeDraft: value => { draft = value }
+  })
+  f.client.start()
+  await flush()
+  assert.equal(f.client.getState().phase, 'review')
+  assert.equal(f.client.getState().text, 'Правка остаётся')
+  assert.equal(draft.pendingSend, true)
+  f.client.close()
+})
+
+test('an unsent edited draft is restored without any automatic submission', async () => {
+  let draft = { id: '123-1', text: 'Сохранённая правка', textId: null,
+    edited: true, draftId: '123-2', pendingSend: false }
+  const f = fixture(payload => {
+    if (payload.method === 'STATUS') return Promise.resolve({ ok: true, agent: 'Мусафир' })
+    throw new Error(`unexpected ${payload.method}`)
+  }, {
+    readDraft: () => draft,
+    writeDraft: value => { draft = value }
+  })
+  f.client.start()
+  await flush()
+  assert.equal(f.client.getState().phase, 'review')
+  assert.equal(f.client.getState().text, 'Сохранённая правка')
+  assert.deepEqual(f.sent.map(item => item.payload.method), ['STATUS'])
+  assert.equal(f.client.cancelReview(), true)
+  assert.equal(draft, null)
   f.client.close()
 })

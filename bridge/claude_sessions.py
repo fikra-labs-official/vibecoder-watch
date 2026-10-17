@@ -13,6 +13,7 @@ for a permission prompt; the morning digest and one Telegram summary report them
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -43,7 +44,7 @@ MODES = (
     ("bypass", "Без ограничений", ("--dangerously-skip-permissions",)),
     ("default", "Без правок", ()),  # headless prompts are denied, so only read-only tools run
 )
-STATES = ("night", "queued", "running", "completed", "error", "unknown")
+STATES = ("night", "queued", "submitting", "running", "completed", "error", "unknown")
 KINDS = ("task", "research", "deep")
 RESEARCH_KINDS = ("research", "deep")
 DEEP_TIMEOUT = 3600  # the bundled workflow spawns ~100 agents; 10–15 minutes is normal
@@ -134,7 +135,7 @@ def _clean_job_id(value):
 def _text(value, label):
     if not isinstance(value, str) or not value.strip() or len(value) > MAX_TEXT or "\x00" in value:
         raise ValueError(f"Некорректный {label}")
-    return value.strip()
+    return value
 
 
 def _short(text, limit=80):
@@ -234,9 +235,16 @@ class ClaudeService:
             self.db.execute("ALTER TABLE jobs ADD COLUMN kind TEXT NOT NULL DEFAULT 'task'")
         if "preset" not in columns:
             self.db.execute("ALTER TABLE jobs ADD COLUMN preset TEXT NOT NULL DEFAULT ''")
+        if "text_id" not in columns:
+            self.db.execute("ALTER TABLE jobs ADD COLUMN text_id TEXT NOT NULL DEFAULT ''")
+        if "request_fingerprint" not in columns:
+            self.db.execute("ALTER TABLE jobs ADD COLUMN request_fingerprint TEXT NOT NULL DEFAULT ''")
+        # Legacy dictated tasks used the job id as their transcription id.
+        # Presets have no transcription and keep the empty sentinel.
+        self.db.execute("UPDATE jobs SET text_id=id WHERE text_id='' AND preset='' AND kind='task'")
         # The child died with the bridge: nothing was accepted elsewhere, so this is an honest error.
         self.db.execute("UPDATE jobs SET state='error',error='Мост перезапущен во время выполнения. Повторите запрос.',updated=? "
-                        "WHERE state IN ('queued','running')", (time.time(),))
+                        "WHERE state IN ('queued','submitting','running')", (time.time(),))
         self.db.commit()
         self.worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix=self.KEY)
         self.processes = {}
@@ -428,10 +436,34 @@ class ClaudeService:
         text_id = params.get("textId")
         if preset is None and (not isinstance(text_id, str) or not JOB_ID.fullmatch(text_id)):
             raise ValueError("Некорректный ID расшифровки")
+        preset_id = preset["id"] if preset else ""
+        identity = {
+            "kind": kind, "mode": mode, "night": night, "pr": params.get("pr"),
+            "presetId": preset_id, "project": project["id"], "sessionId": session,
+            "textId": text_id or "",
+        }
+        fingerprint = hashlib.sha256(json.dumps(
+            identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")).hexdigest()
+
+        def same_request(row, source_text=None):
+            if (row["project"] != project["id"] or row["session_id"] != session or
+                    row["mode"] != mode or bool(row["night"]) != night or
+                    row["kind"] != kind or row["preset"] != preset_id):
+                return False
+            if row["request_fingerprint"]:
+                if row["request_fingerprint"] != fingerprint:
+                    return False
+            elif row["text_id"] and row["text_id"] != (text_id or ""):
+                return False
+            if source_text is not None and row["source_text"] != source_text:
+                return False
+            return True
+
         with self.lock:
             old = self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         if old:
-            if old["project"] != project["id"] or old["session_id"] != session:
+            if not same_request(old):
                 raise ValueError("ID задачи уже использован с другими данными")
             return {"ok": True, "job": self._public(old, params)}
         if preset is not None and preset.get("arg") == "pr":
@@ -454,15 +486,18 @@ class ClaudeService:
         with self.lock:
             old = self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
             if old:
+                if not same_request(old, text):
+                    raise ValueError("ID задачи уже использован с другими данными")
                 return {"ok": True, "job": self._public(old, params)}
-            active = self.db.execute("SELECT id FROM jobs WHERE state IN ('queued','running') AND project=? LIMIT 1",
+            active = self.db.execute("SELECT id FROM jobs WHERE state IN ('queued','submitting','running') AND project=? LIMIT 1",
                                      (project["id"],)).fetchone()
             if active and not night:
                 raise ValueError("В этом проекте уже выполняется задача")
-            self.db.execute("""INSERT INTO jobs(id,project,label,session_id,mode,source_text,state,created,updated,night,kind,preset)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            self.db.execute("""INSERT INTO jobs(
+                id,project,label,session_id,mode,source_text,state,created,updated,night,kind,preset,text_id,request_fingerprint)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (job_id, project["id"], project["label"], session, mode, text, "night" if night else "queued", now, now,
-                 int(night), kind, preset["id"] if preset else ""))
+                 int(night), kind, preset_id, text_id or "", fingerprint))
             self.db.commit()
             row = self._job(job_id)
         if not night:
@@ -473,7 +508,7 @@ class ClaudeService:
         self._only(params, "id")
         with self.lock:
             job = self._job(job_id)
-            if job["state"] not in ("queued", "running"):
+            if job["state"] not in ("queued", "submitting", "running"):
                 return {"ok": True, "job": self._public(job, params)}
             self.stopped.add(job_id)
             process = self.processes.get(job_id)
@@ -499,7 +534,7 @@ class ClaudeService:
             job = self._job(job_id)
             if job["state"] != "queued" or job_id in self.stopped:
                 return
-            self._save(job_id, state="running")
+            self._save(job_id, state="submitting")
         argv = self._launch_argv(job)
         env = {key: value for key, value in os.environ.items() if not key.startswith("CLAUDE_CODE_")}
         try:
@@ -508,7 +543,15 @@ class ClaudeService:
             self._finish(job_id, error=f"{self.LABEL} не запустился: " + type(exc).__name__)
             return
         with self.lock:
+            current = self._job(job_id)
+            if current["state"] != "submitting" or job_id in self.stopped:
+                try:
+                    process.terminate()
+                except OSError:
+                    pass
+                return
             self.processes[job_id] = process
+            self._save(job_id, state="running")
         if self.PROMPTS and hasattr(process, "poll") and not job["night"]:
             threading.Thread(target=self._watch_prompts, args=(job_id, process), name="prompts", daemon=True).start()
         try:
@@ -850,7 +893,7 @@ class ClaudeService:
         """Stop the current night task; the rest stay queued for the next start."""
         self.shift_stop.set()
         with self.lock:
-            row = self.db.execute("SELECT id FROM jobs WHERE night=1 AND state IN ('queued','running') LIMIT 1").fetchone()
+            row = self.db.execute("SELECT id FROM jobs WHERE night=1 AND state IN ('queued','submitting','running') LIMIT 1").fetchone()
         if row:
             self._stop(row["id"], {"id": row["id"]})
 

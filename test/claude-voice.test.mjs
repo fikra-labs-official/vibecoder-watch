@@ -163,3 +163,59 @@ test('question options pass through the route and the answer reaches CLAUDE_APPR
   await route({ method: 'JOB_APPROVE', params: { id: 'job-1', approvalId: '0123456789abcdef', allow: true, answer: 'Синий' } })
   assert.deepEqual(calls.at(-1).params, { id: 'job-1', approvalId: '0123456789abcdef', allow: true, answer: 'Синий' })
 })
+
+test('a lost new send receipt never maps the previous Claude job to the new voice id', async () => {
+  const calls = []
+  const context = { target: 'claude', project: '/work/crm', mode: 'auto',
+    jobId: 'old-job', aliasId: 'old-voice' }
+  const route = createClaudeVoiceRoute({ context, request: async payload => {
+    calls.push(payload)
+    if (payload.method === 'CLAUDE_SEND') throw new Error('receipt lost')
+    if (payload.method === 'CLAUDE_JOB') return { ok: true, job: {
+      id: payload.params.id, state: 'running'
+    } }
+    throw new Error(payload.method)
+  } })
+  await assert.rejects(route({ method: 'SEND_TEXT', params: {
+    id: '1700000000000-2', textId: '1700000000000-2'
+  } }), /receipt lost/)
+  const status = await route({ method: 'JOB_STATUS', params: { id: '1700000000000-2' } })
+  assert.equal(status.id, '1700000000000-2')
+  assert.deepEqual(calls.at(-1), { method: 'CLAUDE_JOB', params: { id: '1700000000000-2' } })
+})
+
+test('startup with an uncertain Claude send recovers its exact alias and forwards pagination progress', async () => {
+  const options = { onRouteProgress() { options.progress += 1 }, progress: 0 }
+  const calls = []
+  const context = { target: 'claude', project: '/work/crm', mode: 'auto',
+    jobId: 'old-job', aliasId: '1700000000000-2', pendingSend: true }
+  const route = createClaudeVoiceRoute({ context, request: async (payload, receivedOptions) => {
+    calls.push({ payload, receivedOptions })
+    return { ok: true, job: { id: '1700000000000-2', state: 'completed',
+      result: payload.params.cursor ? 'два' : 'один ', nextCursor: payload.params.cursor ? null : 'page-2' } }
+  } })
+  const latest = await route({ method: 'LATEST_JOB' }, options)
+  assert.equal(latest.job.result, 'один два')
+  assert.deepEqual(calls.map(call => call.payload), [
+    { method: 'CLAUDE_JOB', params: { id: '1700000000000-2' } },
+    { method: 'CLAUDE_JOB', params: { id: '1700000000000-2', cursor: 'page-2' } }
+  ])
+  assert.ok(calls.every(call => call.receivedOptions === options))
+  assert.ok(options.progress >= 2)
+})
+
+test('Claude and Codex expose submitting before their process starts', async () => {
+  for (const [createRoute, method] of [
+    [createClaudeVoiceRoute, 'CLAUDE_SEND'],
+    [createCodexVoiceRoute, 'CODEX_SEND']
+  ]) {
+    const route = createRoute({ context: { project: '/work/crm', mode: 'auto' }, request: async payload => {
+      assert.equal(payload.method, method)
+      return { ok: true, job: { id: payload.params.id, state: 'submitting' } }
+    } })
+    const reply = await route({ method: 'SEND_TEXT', params: {
+      id: '1700000000000-3', textId: '1700000000000-3'
+    } })
+    assert.equal(reply.state, 'submitting')
+  }
+})

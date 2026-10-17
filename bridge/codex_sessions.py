@@ -125,9 +125,12 @@ class CodexService(ClaudeService):
                     "-c", 'sandbox_mode="read-only"', "-c", 'approval_policy="never"']
         flags = next(flags for mode_id, _, flags in self.MODES if mode_id == job["mode"])
         common = ["--json", "-c", "check_for_update_on_startup=false", "--skip-git-repo-check", *flags]
+        prompt = job["source_text"]
+        if not prompt.endswith(HINT):
+            prompt += "\n\n" + HINT
         if job["session_id"]:
-            return [self.executable, "exec", "resume", job["session_id"], job["source_text"], *common]
-        return [self.executable, "exec", "-C", job["project"], job["source_text"], *common]
+            return [self.executable, "exec", "resume", job["session_id"], prompt, *common]
+        return [self.executable, "exec", "-C", job["project"], prompt, *common]
 
     def _parse_output(self, out, err, returncode, denials_note=True):
         session, answer, failures = "", "", []
@@ -152,13 +155,3 @@ class CodexService(ClaudeService):
             raise ValueError(reason)
         result = answer.strip()[:MAX_RESULT]
         return result, session
-
-    def _run(self, job_id):
-        # Codex has no system-prompt flag; put the watch hint into the prompt itself.
-        with self.lock:
-            job = self._job(job_id)
-            if job["state"] == "queued" and job["kind"] != "research" and not job["source_text"].endswith(HINT):
-                self.db.execute("UPDATE jobs SET source_text=? WHERE id=?",
-                                (job["source_text"] + "\n\n" + HINT, job_id))
-                self.db.commit()
-        super()._run(job_id)

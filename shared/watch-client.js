@@ -14,6 +14,7 @@ export const AUDIO_CHUNK_SIZE = 1024
 export const MAX_AUDIO_BYTES = 8 * 1024 * 1024
 export const TRANSCRIPT_PAGE_SIZE = 1000
 export const MAX_TRANSCRIPT_CODEPOINTS = 30000
+export const TEXT_PART_SIZE = 1000
 export const REQUEST_TIMEOUT_MS = 15000
 export const HANDSHAKE_TIMEOUT_MS = 20000
 export const TRANSCRIPTION_POLL_MS = 2000
@@ -24,6 +25,7 @@ const JOB_STATES = new Set([
   'transcribing', 'ready', 'submitting', 'queued', 'running', 'approval',
   'completed', 'error', 'unknown'
 ])
+const RETRYABLE_READS = new Set(['STATUS', 'LATEST_JOB', 'AUDIO_STATUS', 'JOB_STATUS'])
 
 function messageOf(error) {
   if (!error) return 'Неизвестная ошибка'
@@ -35,6 +37,24 @@ function validReply(reply) {
   return reply && reply.ok === true
 }
 
+function normalizeReviewText(value) {
+  if (typeof value !== 'string' || value.includes('\0')) return null
+  if (!value.trim() || Array.from(value).length > MAX_TRANSCRIPT_CODEPOINTS) return null
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index)
+    if ((code <= 0x1f && code !== 0x09 && code !== 0x0a) ||
+        (code >= 0x7f && code <= 0x9f)) return null
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1)
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return null
+      index += 1
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return null
+    }
+  }
+  return value
+}
+
 export function createWatchClient({
   request,
   report,
@@ -42,7 +62,9 @@ export function createWatchClient({
   clearTimer,
   now = Date.now,
   readAcknowledgedResultId = () => null,
-  writeAcknowledgedResultId = () => {}
+  writeAcknowledgedResultId = () => {},
+  readDraft = () => null,
+  writeDraft = () => {}
 }) {
   let closed = false
   let generation = 0
@@ -52,6 +74,54 @@ export function createWatchClient({
   let lastResult = null
   let pendingUpload = null
   let current = { phase: 'connecting', hasLastResult: false }
+
+  function createId() {
+    let stamp = Math.floor(Number(now()))
+    if (!Number.isFinite(stamp) || stamp < 0) stamp = 0
+    const id = `${stamp}-${++sequence}`
+    return LOCAL_ID.test(id) ? id : `${String(stamp).slice(0, 16)}-${sequence}`
+  }
+
+  function storedReview(id = null) {
+    let draft
+    try { draft = readDraft() } catch (error) { return null }
+    if (!draft || (id !== null && draft.id !== id) || !LOCAL_ID.test(draft.id) ||
+        typeof draft.edited !== 'boolean' || typeof draft.pendingSend !== 'boolean') return null
+    if (draft.edited) {
+      if (!LOCAL_ID.test(draft.draftId) || (draft.textId !== null && draft.textId !== draft.draftId)) return null
+    } else if (draft.draftId !== null || (draft.textId !== null && draft.textId !== draft.id)) {
+      return null
+    }
+    const text = normalizeReviewText(draft.text)
+    return text === null ? null : { ...draft, text }
+  }
+
+  function persistDraft(draft) {
+    try {
+      writeDraft(draft)
+      return true
+    } catch (error) {
+      return false
+    }
+  }
+
+  function clearDraft(id = null) {
+    let draft = null
+    try { draft = readDraft() } catch (error) {}
+    if (id !== null && (!draft || draft.id !== id)) return
+    try { writeDraft(null) } catch (error) {}
+  }
+
+  function emitReview(id, text, textId = null) {
+    const draft = storedReview(id)
+    if (draft) {
+      emit({ phase: 'review', id, jobId: null, text: draft.text, textId: draft.textId,
+        edited: draft.edited, draftId: draft.draftId, busy: false })
+      return
+    }
+    emit({ phase: 'review', id, jobId: null, text, textId,
+      edited: false, draftId: null, busy: false })
+  }
 
   function emit(next) {
     if (closed) return
@@ -102,12 +172,19 @@ export function createWatchClient({
     return new Promise((resolve, reject) => {
       let settled = false
       let cancel
-      const timer = setTimer(() => {
+      let timer = null
+      const expire = () => {
         if (settled) return
         settled = true
         pending.delete(cancel)
         reject(new Error('REQUEST_TIMEOUT'))
-      }, HANDSHAKE_TIMEOUT_MS)
+      }
+      const keepAlive = () => {
+        if (settled) return
+        if (timer !== null) clearTimer(timer)
+        timer = setTimer(expire, HANDSHAKE_TIMEOUT_MS)
+      }
+      keepAlive()
 
       function finish(callback, value) {
         if (settled) return
@@ -131,7 +208,7 @@ export function createWatchClient({
       pending.add(cancel)
 
       try {
-        request(payload, { timeout: REQUEST_TIMEOUT_MS }).then(
+        request(payload, { timeout: REQUEST_TIMEOUT_MS, onRouteProgress: keepAlive }).then(
           value => finish(resolve, value),
           error => finish(reject, error)
         )
@@ -141,17 +218,24 @@ export function createWatchClient({
     })
   }
 
-  async function callOk(payload, operation, retry = false) {
-    let reply
-    try {
-      reply = await call(payload)
-    } catch (error) {
-      if (!retry || !active(operation)) throw error
-      reply = await call(payload)
+  async function callOk(payload, operation, retry = RETRYABLE_READS.has(payload.method)) {
+    const attempts = retry ? 2 : 1
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      let reply
+      try {
+        reply = await call(payload)
+      } catch (error) {
+        if (attempt + 1 >= attempts || !active(operation)) throw error
+        continue
+      }
+      assertActive(operation)
+      if (validReply(reply)) return reply
+      const retryableReply = reply && reply.ok === false && reply.retryable === true
+      if (attempt + 1 >= attempts || !retryableReply) {
+        throw new Error(reply && reply.error ? reply.error : 'INVALID_RESPONSE')
+      }
     }
-    assertActive(operation)
-    if (!validReply(reply)) throw new Error(reply && reply.error ? reply.error : 'INVALID_RESPONSE')
-    return reply
+    throw new Error('INVALID_RESPONSE')
   }
 
   function schedule(delay, operation, callback) {
@@ -192,7 +276,7 @@ export function createWatchClient({
     if (typeof first.text !== 'string') throw new Error('INVALID_RESPONSE')
     if (first.textOffset === undefined) {
       if (!first.text.trim()) throw new Error('INVALID_RESPONSE')
-      emit({ phase: 'review', id, text: first.text, textId: null, busy: false })
+      emitReview(id, first.text, null)
       return
     }
 
@@ -224,7 +308,7 @@ export function createWatchClient({
     }
     const text = parts.join('')
     if (!text.trim()) throw new Error('INVALID_RESPONSE')
-    emit({ phase: 'review', id, jobId: null, text, textId: id, busy: false })
+    emitReview(id, text, id)
   }
 
   async function pollAudioStatus(id, operation) {
@@ -263,13 +347,17 @@ export function createWatchClient({
       throw new Error('INVALID_RESPONSE')
     }
 
+    const rejected = job.state === 'error' && job.retryTextId === job.id
+    const accepted = ['submitting', 'queued', 'running', 'approval', 'completed', 'unknown'].includes(job.state) ||
+      (job.state === 'error' && !rejected)
+    if (accepted) clearDraft(job.id)
     const base = { id: job.id, jobId: job.id, state: job.state, busy: false }
     if (job.state === 'transcribing') {
       emit({ ...base, phase: 'transcribing', busy: true })
       scheduleAudioStatus(job.id, operation)
     } else if (job.state === 'ready') {
       if (typeof job.text !== 'string' || !job.text.trim()) throw new Error('INVALID_RESPONSE')
-      emit({ ...base, phase: 'review', text: job.text })
+      emitReview(job.id, job.text, null)
     } else if (job.state === 'submitting' || job.state === 'queued' || job.state === 'running') {
       emit({ ...base, phase: 'job', text: job.text || '', busy: true })
       scheduleJobStatus(job.id, operation)
@@ -309,7 +397,6 @@ export function createWatchClient({
     } else if (job.state === 'unknown') {
       emit({ ...base, phase: 'unknown', text: job.text || '', statusMessage: job.result || '' })
     } else {
-      const rejected = job.retryTextId === job.id
       emit({
         ...base, phase: 'error', error: job.error || 'Задание завершилось с ошибкой',
         jobId: rejected ? null : job.id,
@@ -330,6 +417,37 @@ export function createWatchClient({
   }
 
   async function recoverLatest(operation) {
+    const draft = storedReview()
+    if (draft && !draft.pendingSend) {
+      emitReview(draft.id, draft.text, draft.textId)
+      return
+    }
+    if (draft && draft.pendingSend) {
+      let reply
+      try {
+        try {
+          reply = await call({ method: 'JOB_STATUS', params: { id: draft.id } })
+        } catch (error) {
+          assertActive(operation)
+          reply = await call({ method: 'JOB_STATUS', params: { id: draft.id } })
+        }
+        assertActive(operation)
+      } catch (error) {
+        if (!active(operation) || error && error.message === 'CANCELED') return
+        fail(error, operation, 'JOB_STATUS', draft.id, 'job')
+        return
+      }
+      if (validReply(reply)) {
+        if (reply.id !== draft.id) throw new Error('INVALID_RESPONSE')
+        showJob(reply, operation, true)
+        return
+      }
+      emit({ phase: 'unknown', state: 'unknown', id: draft.id, jobId: draft.id,
+        text: draft.text, textId: draft.textId, edited: draft.edited, draftId: draft.draftId,
+        error: reply && reply.error || 'Не удалось подтвердить принятие задания', busy: false,
+        retryMethod: 'JOB_STATUS', retryId: draft.id })
+      return
+    }
     const latest = await callOk({ method: 'LATEST_JOB', params: {} }, operation)
     if (latest.job === null || latest.job === undefined) {
       emit({ phase: 'ready', busy: false, id: null, jobId: null, text: '', result: '' })
@@ -388,6 +506,41 @@ export function createWatchClient({
     }
   }
 
+  async function saveEditedText(review, operation) {
+    const codepoints = Array.from(review.text)
+    const total = codepoints.length
+    emit({ phase: 'saving-text', id: review.id, jobId: null, text: review.text,
+      textId: null, edited: true, draftId: review.draftId, busy: true })
+
+    const begin = await callOk({ method: 'TEXT_BEGIN', params: {
+      id: review.draftId, sourceId: review.id, textLength: total
+    } }, operation, true)
+    if (begin.id !== review.draftId || begin.textLength !== total ||
+        !Number.isInteger(begin.receivedLength) || begin.receivedLength < 0 || begin.receivedLength > total) {
+      throw new Error('INVALID_RESPONSE')
+    }
+
+    for (let offset = 0; offset < total; offset += TEXT_PART_SIZE) {
+      const text = codepoints.slice(offset, offset + TEXT_PART_SIZE).join('')
+      const accepted = offset + Array.from(text).length
+      const part = await callOk({ method: 'TEXT_PART', params: {
+        id: review.draftId, offset, text
+      } }, operation, true)
+      if (part.id !== review.draftId || part.textLength !== total ||
+          !Number.isInteger(part.receivedLength) || part.receivedLength < accepted || part.receivedLength > total) {
+        throw new Error('INVALID_RESPONSE')
+      }
+    }
+
+    const finish = await callOk({ method: 'TEXT_FINISH', params: { id: review.draftId } }, operation, true)
+    if (finish.id !== review.draftId || finish.state !== 'ready' || finish.textLength !== total) {
+      throw new Error('INVALID_RESPONSE')
+    }
+    const saved = { ...review, textId: review.draftId, pendingSend: false }
+    if (!persistDraft(saved)) throw new Error('Не удалось сохранить исправленный текст')
+    return saved
+  }
+
   return {
     start() {
       const operation = beginOperation()
@@ -403,11 +556,26 @@ export function createWatchClient({
       })()
     },
 
-    createId() {
-      let stamp = Math.floor(Number(now()))
-      if (!Number.isFinite(stamp) || stamp < 0) stamp = 0
-      const id = `${stamp}-${++sequence}`
-      return LOCAL_ID.test(id) ? id : `${String(stamp).slice(0, 16)}-${sequence}`
+    createId,
+
+    updateReviewText(value) {
+      if (current.phase !== 'review' || typeof current.id !== 'string') {
+        throw new Error('Текст сейчас нельзя изменить')
+      }
+      const text = normalizeReviewText(value)
+      if (text === null) throw new Error('Введите от 1 до 30000 допустимых символов')
+      if (text === current.text) {
+        emit({ phase: 'review', busy: false })
+        return true
+      }
+      const draft = {
+        id: current.id, text, textId: null, edited: true,
+        draftId: createId(), pendingSend: false
+      }
+      if (!persistDraft(draft)) throw new Error('Не удалось сохранить исправленный текст')
+      emit({ phase: 'review', id: draft.id, jobId: null, text: draft.text,
+        textId: null, edited: true, draftId: draft.draftId, busy: false })
+      return true
     },
 
     beginRecording(id) {
@@ -416,6 +584,7 @@ export function createWatchClient({
         current.phase === 'result' || (current.phase === 'error' && current.errorKind === 'local')
       if (!canStart) return false
       acknowledgeCurrentResult()
+      clearDraft()
       beginOperation()
       emit({
         phase: 'recording', id, jobId: null, approvalId: null,
@@ -478,22 +647,67 @@ export function createWatchClient({
       }
       const id = current.id
       const text = current.text
-      const textId = current.textId === id ? id : null
+      let review = {
+        id, text,
+        textId: typeof current.textId === 'string' ? current.textId : null,
+        edited: current.edited === true,
+        draftId: current.edited === true ? current.draftId : null,
+        pendingSend: false
+      }
+      if (review.edited && (!LOCAL_ID.test(review.draftId) ||
+          (review.textId !== null && review.textId !== review.draftId))) return false
       const operation = beginOperation()
-      emit({ phase: 'sending', id, jobId: id, text, busy: true })
       ;(async () => {
         try {
-          const params = textId ? { id, textId } : { id, text }
-          const reply = await callOk({ method: 'SEND_TEXT', params }, operation)
-          if (reply.id !== id) throw new Error('INVALID_RESPONSE')
-          showJob(reply, operation)
-        } catch (error) {
-          if (active(operation)) {
+          if (review.edited && review.textId === null) review = await saveEditedText(review, operation)
+          const pendingReview = { ...review, pendingSend: true }
+          if (!persistDraft(pendingReview)) {
+            emit({ phase: 'review', id, jobId: null, text, textId: review.textId,
+              edited: review.edited, draftId: review.draftId,
+              error: 'Не удалось сохранить текст перед отправкой', busy: false })
+            return
+          }
+          review = pendingReview
+          emit({ phase: 'sending', id, jobId: id, text, textId: review.textId,
+            edited: review.edited, draftId: review.draftId, busy: true })
+          const params = review.textId ? { id, textId: review.textId } : { id, text }
+          let reply
+          try {
+            reply = await call({ method: 'SEND_TEXT', params })
+          } catch (error) {
+            assertActive(operation)
             emit({
               phase: 'unknown', state: 'unknown', id, jobId: id, text,
               error: messageOf(error), busy: false,
               retryMethod: 'JOB_STATUS', retryId: id
             })
+            return
+          }
+          assertActive(operation)
+          if (!validReply(reply)) {
+            emit({ phase: 'unknown', state: 'unknown', id, jobId: id, text, textId: review.textId,
+              edited: review.edited, draftId: review.draftId,
+              error: reply && reply.error || 'Не удалось подтвердить принятие задания', busy: false,
+              retryMethod: 'JOB_STATUS', retryId: id })
+            return
+          }
+          if (reply.id !== id) throw new Error('INVALID_RESPONSE')
+          showJob(reply, operation)
+        } catch (error) {
+          if (active(operation)) {
+            if (current.phase === 'saving-text') {
+              const restored = { ...review, pendingSend: false }
+              persistDraft(restored)
+              emit({ phase: 'review', id, jobId: null, text,
+                textId: review.textId, edited: review.edited, draftId: review.draftId,
+                error: messageOf(error), busy: false })
+            } else {
+              emit({
+                phase: 'unknown', state: 'unknown', id, jobId: id, text,
+                error: messageOf(error), busy: false,
+                retryMethod: 'JOB_STATUS', retryId: id
+              })
+            }
           }
         }
       })()
@@ -502,6 +716,7 @@ export function createWatchClient({
 
     cancelReview() {
       if (current.phase !== 'review') return false
+      clearDraft(current.id)
       beginOperation()
       emit({
         phase: 'ready', busy: false, id: null, jobId: null,
@@ -515,6 +730,7 @@ export function createWatchClient({
         current.phase === 'result' || (current.phase === 'error' && current.errorKind === 'local')
       if (!canGoHome) return false
       acknowledgeCurrentResult()
+      if (current.phase === 'review') clearDraft(current.id)
       beginOperation()
       emit({
         phase: 'ready', busy: false, id: null, jobId: null,

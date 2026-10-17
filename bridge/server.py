@@ -14,18 +14,24 @@ import shlex
 import sqlite3
 import threading
 import time
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from lexicon import compile_rules, normalize
+from orca_service import CliFailure
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "0.7.13"
+VERSION = "0.8.0"
 ID = re.compile(r"^[0-9]{1,16}-[0-9]{1,8}$")
 MAX_AUDIO = 8 * 1024 * 1024
 MAX_TEXT_CHARS = 30_000
+MAX_TEXT_PART_CHARS = 1_000
+MAX_DRAFTS_PER_SOURCE = 8
+MAX_RECENT_DRAFTS = 32
+TEXT_DRAFT_RETENTION = 86400
 TEXT_PAGE_DEFAULT = 1_000
 TEXT_PAGE_MAX = 2_000
 JOB_TEXT_PREVIEW = 1_000
@@ -60,7 +66,7 @@ class Hermes:
     def __init__(self, env_path):
         self.env_path = Path(env_path)
 
-    def call(self, path, body=None, request_id=None):
+    def call(self, path, body=None, request_id=None, timeout=12):
         key = ""
         for line in self.env_path.read_text().splitlines():
             if line.startswith("API_SERVER_KEY="):
@@ -74,7 +80,7 @@ class Hermes:
             headers["X-Hermes-Session-Key"] = "musafer-watch"
         req = Request("http://127.0.0.1:8642" + path,
                       data=None if body is None else json.dumps(body).encode(), headers=headers)
-        with urlopen(req, timeout=12) as response:
+        with urlopen(req, timeout=timeout) as response:
             return json.load(response)
 
 
@@ -109,12 +115,20 @@ class Bridge:
             CREATE TABLE IF NOT EXISTS uploads (
                 id TEXT PRIMARY KEY, total INTEGER, data BLOB, created REAL,
                 state TEXT, text TEXT DEFAULT '', error TEXT DEFAULT '');
+            CREATE TABLE IF NOT EXISTS text_drafts (
+                id TEXT PRIMARY KEY, source_id TEXT NOT NULL, text_length INTEGER NOT NULL,
+                text TEXT NOT NULL DEFAULT '', state TEXT NOT NULL,
+                created REAL NOT NULL, updated REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS jobs (
                 id TEXT PRIMARY KEY, text TEXT, created REAL, state TEXT,
-                run_id TEXT DEFAULT '', result TEXT DEFAULT '', error TEXT DEFAULT '');
+                run_id TEXT DEFAULT '', result TEXT DEFAULT '', error TEXT DEFAULT '',
+                decision_id TEXT DEFAULT '');
         """)
-        if "deleted_at" not in {row[1] for row in self.db.execute("PRAGMA table_info(jobs)")}:
+        job_columns = {row[1] for row in self.db.execute("PRAGMA table_info(jobs)")}
+        if "deleted_at" not in job_columns:
             self.db.execute("ALTER TABLE jobs ADD COLUMN deleted_at REAL")
+        if "decision_id" not in job_columns:
+            self.db.execute("ALTER TABLE jobs ADD COLUMN decision_id TEXT DEFAULT ''")
         self.db.execute("UPDATE jobs SET state='unknown', error='Мост был перезапущен во время отправки. Не повторяйте команду.' WHERE state='submitting'")
         self.db.execute("UPDATE jobs SET state='error', error='Перезапуск до отправки. Команда не отправлена.' WHERE state='queued'")
         self.db.execute("UPDATE uploads SET state='error', error='Распознавание прервано перезапуском. Нажмите повтор, чтобы продолжить.' WHERE state='transcribing'")
@@ -155,7 +169,7 @@ class Bridge:
             try:
                 with self.lock:
                     rows = self.db.execute(
-                        "SELECT id FROM jobs WHERE state IN ('running','approval') AND run_id!=''").fetchall()
+                        "SELECT id FROM jobs WHERE state IN ('queued','submitting','running','approval','unknown') AND run_id!=''").fetchall()
                 for row in rows:
                     if self.stop.is_set():
                         break
@@ -273,7 +287,7 @@ class Bridge:
             from digest import summary
             return {"ok": True, **summary(self.state)}
         if method == "STATUS":
-            self.hermes.call("/health")
+            self.hermes.call("/health", timeout=8)
             return {"ok": True, "agent": "Мусафир", "voice": self.model.exists(), "version": VERSION, "asr": self.speech_status()}
         if method == "LATEST_JOB":
             with self.lock:
@@ -296,6 +310,12 @@ class Bridge:
             return self.history_empty_trash(params)
         if method == "DIAGNOSTIC":
             return self.save_diagnostic(params)
+        if method == "TEXT_BEGIN":
+            return self.text_begin(params)
+        if method == "TEXT_PART":
+            return self.text_part(params)
+        if method == "TEXT_FINISH":
+            return self.text_finish(params)
         request_id = identifier(params.get("id"))
         if method == "JOB_STATUS":
             return self.job_status(request_id)
@@ -303,34 +323,51 @@ class Bridge:
             approval_id, allow = params.get("approvalId"), params.get("allow")
             if not isinstance(approval_id, str) or not isinstance(allow, bool):
                 raise Invalid("Некорректное подтверждение")
-            current = self.job_status(request_id)
+            # Keep the stale-approval guard, but fit the read and decision into
+            # the watch request deadline. The result is observed by later polls.
+            current = self.job_status(request_id, timeout=4)
             if current["state"] != "approval" or current.get("approval", {}).get("id") != approval_id:
                 raise Invalid("Это подтверждение больше не действует")
             with self.lock:
-                run_id = self._get("jobs", request_id)["run_id"]
+                row = self._get("jobs", request_id)
+                if row["state"] != "approval" or row["decision_id"] == approval_id:
+                    raise Invalid("Это подтверждение больше не действует")
+                run_id = row["run_id"]
+                # Record the attempt before I/O. A lost receipt must never let
+                # the same approval be posted twice.
+                self.db.execute("UPDATE jobs SET decision_id=? WHERE id=?", (approval_id, request_id))
+                self.db.commit()
+            state, result, error = "submitting", "Решение передано Hermes.", ""
             try:
                 self.hermes.call(f"/v1/runs/{run_id}/approval", {
-                    "choice": "once" if allow else "deny", "request_id": approval_id})
+                    "choice": "once" if allow else "deny", "request_id": approval_id}, timeout=4)
             except HTTPError as exc:
-                if exc.code != 409:
-                    raise
-                with self.lock:
-                    self.expired_approvals[run_id] = approval_id
-                    if len(self.expired_approvals) > 128:
-                        self.expired_approvals.pop(next(iter(self.expired_approvals)))
-                self.event("approval_expired", id=request_id)
-            return self.job_status(request_id)
+                if exc.code == 409:
+                    with self.lock:
+                        self.expired_approvals[run_id] = approval_id
+                        if len(self.expired_approvals) > 128:
+                            self.expired_approvals.pop(next(iter(self.expired_approvals)))
+                    result = "Срок разрешения истёк. Ожидаем итог Hermes."
+                    self.event("approval_expired", id=request_id)
+                elif 400 <= exc.code < 500:
+                    state, result, error = "error", "", "Hermes отклонил решение"
+                else:
+                    state, result, error = "unknown", "", "Ответ о приёме решения потерян. Не повторяйте его."
+            except (OSError, ValueError, RuntimeError):
+                state, result, error = "unknown", "", "Ответ о приёме решения потерян. Не повторяйте его."
+            with self.lock:
+                self.db.execute("UPDATE jobs SET state=?,result=?,error=? WHERE id=?",
+                                (state, result, error, request_id))
+                self.db.commit()
+                row = self._get("jobs", request_id)
+            return self._public(row)
         if method == "SEND_TEXT":
             text, text_id = params.get("text"), params.get("textId")
             if text is not None and text_id is not None:
                 raise Invalid("Укажите текст или ID расшифровки")
             if text_id is not None:
                 text_id = identifier(text_id)
-                with self.lock:
-                    speech = self._get("uploads", text_id)
-                if speech["state"] != "ready" or not speech["text"]:
-                    raise Invalid("Расшифровка ещё не готова")
-                text = speech["text"]
+                text = self.transcript(text_id)
             return self.send(request_id, text, text_id)
         with self.lock:
             # Unsubmitted speech is ephemeral. Accepted jobs are retained independently.
@@ -499,11 +536,109 @@ class Bridge:
         return {"ok": True, "job": job if job["state"] in ACTIVE_JOB_STATES else None}
 
     def transcript(self, text_id):
+        text_id = identifier(text_id)
         with self.lock:
-            row = self._get("uploads", identifier(text_id))
+            draft = self.db.execute("SELECT * FROM text_drafts WHERE id=?", (text_id,)).fetchone()
+            if draft is not None:
+                if draft["state"] != "ready" or not draft["text"]:
+                    raise Invalid("Исправленный текст ещё не готов")
+                return draft["text"]
+            row = self._get("uploads", text_id)
         if row["state"] != "ready" or not row["text"]:
             raise Invalid("Расшифровка ещё не готова")
         return row["text"]
+
+    def text_begin(self, params):
+        if set(params) != {"id", "sourceId", "textLength"}:
+            raise Invalid("Некорректный исправленный текст")
+        draft_id = identifier(params.get("id"))
+        source_id = identifier(params.get("sourceId"))
+        text_length = params.get("textLength")
+        if draft_id == source_id or type(text_length) is not int or not 1 <= text_length <= MAX_TEXT_CHARS:
+            raise Invalid("Некорректный исправленный текст")
+        now = time.time()
+        with self.lock:
+            old = self.db.execute("SELECT * FROM text_drafts WHERE id=?", (draft_id,)).fetchone()
+            if old:
+                if old["source_id"] != source_id or old["text_length"] != text_length:
+                    raise Invalid("ID уже используется для другого исправленного текста")
+                return {"ok": True, "id": draft_id, "state": old["state"],
+                        "textLength": old["text_length"], "receivedLength": len(old["text"])}
+            source = self._get("uploads", source_id)
+            if source["state"] != "ready" or not source["text"]:
+                raise Invalid("Расшифровка ещё не готова")
+            self.db.execute("DELETE FROM text_drafts WHERE updated<?", (now - TEXT_DRAFT_RETENTION,))
+            per_source = self.db.execute(
+                "SELECT count(*) FROM text_drafts WHERE source_id=?", (source_id,)).fetchone()[0]
+            recent = self.db.execute("SELECT count(*) FROM text_drafts").fetchone()[0]
+            if per_source >= MAX_DRAFTS_PER_SOURCE or recent >= MAX_RECENT_DRAFTS:
+                self.db.commit()
+                raise Invalid("Слишком много сохранённых исправлений. Повторите позже")
+            self.db.execute(
+                "INSERT INTO text_drafts(id,source_id,text_length,text,state,created,updated) "
+                "VALUES (?,?,?,'','uploading',?,?)",
+                (draft_id, source_id, text_length, now, now))
+            self.db.commit()
+        return {"ok": True, "id": draft_id, "state": "uploading",
+                "textLength": text_length, "receivedLength": 0}
+
+    def text_part(self, params):
+        if set(params) != {"id", "offset", "text"}:
+            raise Invalid("Некорректная часть исправленного текста")
+        draft_id = identifier(params.get("id"))
+        offset, part = params.get("offset"), params.get("text")
+        if type(offset) is not int or offset < 0 or not isinstance(part, str) or not 1 <= len(part) <= MAX_TEXT_PART_CHARS:
+            raise Invalid("Некорректная часть исправленного текста")
+        try:
+            part.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise Invalid("Исправленный текст содержит некорректный Unicode") from exc
+        with self.lock:
+            row = self._get("text_drafts", draft_id)
+            current = row["text"]
+            end = offset + len(part)
+            if end > row["text_length"]:
+                raise Invalid("Исправленный текст превышает заявленную длину")
+            if offset < len(current):
+                if end > len(current) or current[offset:end] != part:
+                    raise Invalid("Повтор отличается от принятой части текста")
+            elif offset != len(current):
+                raise Invalid("Нарушен порядок частей текста")
+            else:
+                if row["state"] != "uploading":
+                    raise Invalid("Исправленный текст уже закрыт")
+                current += part
+                self.db.execute("UPDATE text_drafts SET text=?,updated=? WHERE id=?",
+                                (current, time.time(), draft_id))
+                self.db.commit()
+            return {"ok": True, "id": draft_id, "state": row["state"],
+                    "textLength": row["text_length"], "receivedLength": len(current)}
+
+    def text_finish(self, params):
+        if set(params) != {"id"}:
+            raise Invalid("Некорректный исправленный текст")
+        draft_id = identifier(params.get("id"))
+        with self.lock:
+            row = self._get("text_drafts", draft_id)
+            if row["state"] == "ready":
+                return {"ok": True, "id": draft_id, "state": "ready",
+                        "textLength": row["text_length"]}
+            text = row["text"]
+            if len(text) != row["text_length"]:
+                raise Invalid("Исправленный текст передан не полностью")
+            if not text.strip():
+                raise Invalid("Исправленный текст пуст")
+            if any(unicodedata.category(char) in ("Cc", "Cs") and char not in "\n\t" for char in text):
+                raise Invalid("Исправленный текст содержит недопустимые символы")
+            try:
+                text.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise Invalid("Исправленный текст содержит некорректный Unicode") from exc
+            self.db.execute("UPDATE text_drafts SET state='ready',updated=? WHERE id=?",
+                            (time.time(), draft_id))
+            self.db.commit()
+        return {"ok": True, "id": draft_id, "state": "ready",
+                "textLength": row["text_length"]}
 
     def save_diagnostic(self, params):
         if set(params) != {"version", "stage", "detail"}:
@@ -577,18 +712,29 @@ class Bridge:
             text.encode("utf-8")
         except UnicodeEncodeError as exc:
             raise Invalid("Команда содержит некорректный Unicode") from exc
-        text = text.strip()
+        # Text selected by ID is already immutable and validated by its owner.
+        # Keep it byte-for-byte; direct legacy input retains its old trimming.
+        if text_id is None:
+            text = text.strip()
         with self.lock:
             old = self.db.execute("SELECT * FROM jobs WHERE id=?", (request_id,)).fetchone()
             if old:
                 if old["text"] != text:
                     raise Invalid("ID уже принят с другим текстом")
                 return self._public(dict(old))
-            # A captured command must match the transcription shown for confirmation.
-            speech_id = text_id or request_id
-            speech = self.db.execute("SELECT state,text FROM uploads WHERE id=?", (speech_id,)).fetchone()
-            if speech and (speech["state"] != "ready" or speech["text"] != text):
-                raise Invalid("Текст не соответствует распознанной записи")
+            # A legacy direct command must still match its ASR row exactly. An
+            # edited command is accepted only through an immutable ready draft
+            # tied to this original audio/job id.
+            draft = self.db.execute(
+                "SELECT source_id,state,text FROM text_drafts WHERE id=?", (text_id,)).fetchone() if text_id else None
+            if draft:
+                if draft["source_id"] != request_id or draft["state"] != "ready" or draft["text"] != text:
+                    raise Invalid("Исправленный текст не соответствует этой записи")
+            else:
+                speech_id = text_id or request_id
+                speech = self.db.execute("SELECT state,text FROM uploads WHERE id=?", (speech_id,)).fetchone()
+                if speech and (speech["state"] != "ready" or speech["text"] != text):
+                    raise Invalid("Текст не соответствует распознанной записи")
             active = self.db.execute("SELECT count(*) FROM jobs WHERE state IN ('queued','submitting','running','approval','unknown')").fetchone()[0]
             if active:
                 raise Invalid("Сначала дождитесь результата предыдущей команды")
@@ -609,7 +755,8 @@ class Bridge:
             if not isinstance(run_id, str) or not re.fullmatch(r"run_[0-9a-f]{32}", run_id):
                 raise RuntimeError("Invalid run id")
             with self.lock:
-                self.db.execute("UPDATE jobs SET state='running',run_id=? WHERE id=?", (run_id, request_id))
+                # A run id confirms receipt, not that an agent has started work.
+                self.db.execute("UPDATE jobs SET state='queued',run_id=? WHERE id=?", (run_id, request_id))
                 self.db.commit()
         except Exception as exc:
             # A timeout can follow acceptance. Never turn a lost receipt into a duplicate run.
@@ -628,15 +775,21 @@ class Bridge:
                 "textLength": len(text), "textComplete": len(text) <= JOB_TEXT_PREVIEW,
                 **{k: row[k] for k in ("state", "result", "error")}}
 
-    def job_status(self, request_id):
+    def job_status(self, request_id, timeout=8):
         with self.lock:
             row = self._get("jobs", request_id)
-        if row["run_id"] and row["state"] in ("running", "approval"):
+        if row["run_id"] and row["state"] in ("queued", "submitting", "running", "approval", "unknown"):
             try:
-                remote = self.hermes.call("/v1/runs/" + row["run_id"])
-                states = {"completed": "completed", "failed": "error", "cancelled": "error", "interrupted": "error", "waiting_for_approval": "approval"}
+                remote = self.hermes.call("/v1/runs/" + row["run_id"], timeout=timeout)
+                states = {"queued": "queued", "submitting": "submitting", "running": "running",
+                          "completed": "completed", "failed": "error", "cancelled": "error",
+                          "interrupted": "error", "waiting_for_approval": "approval"}
                 previous = row["state"]
-                row["state"] = states.get(remote.get("status"), "running")
+                mapped = states.get(remote.get("status"))
+                if mapped is None:
+                    return {**self._public(row), "state": "unknown",
+                            "error": "Hermes вернул неизвестный статус. Команда не повторялась."}
+                row["state"] = mapped
                 if previous != row["state"]:
                     self.event("job_state", id=request_id, state=row["state"], previous=previous, ms=round((time.time() - row["created"]) * 1000))
                 row["result"] = str(remote.get("output") or "")[:6000]
@@ -650,8 +803,15 @@ class Bridge:
                     approval = remote.get("approval") or {}
                     proposal = str(approval.get("command") or approval.get("description") or "")
                     aid = approval.get("request_id")
-                    if self.expired_approvals.get(row["run_id"]) == aid and aid:
-                        return {**answer, "state": "running", "result": "Срок разрешения истёк. Ожидаем итог Hermes."}
+                    if row["decision_id"] == aid and aid:
+                        message = ("Срок разрешения истёк. Ожидаем итог Hermes."
+                                   if self.expired_approvals.get(row["run_id"]) == aid else
+                                   "Решение уже передавалось Hermes. Повтора не будет.")
+                        with self.lock:
+                            self.db.execute("UPDATE jobs SET state='submitting',result=?,error='' WHERE id=?",
+                                            (message, request_id))
+                            self.db.commit()
+                        return {**answer, "state": "submitting", "result": message, "error": ""}
                     # Never approve an unidentified or truncated action from the watch.
                     if isinstance(aid, str) and aid and proposal and len(proposal) <= APPROVAL_TEXT_MAX:
                         answer["approval"] = {"id": aid, "text": proposal}
@@ -714,6 +874,12 @@ def make_handler(bridge, token):
                 self.reply(200, answer)
             except Invalid as exc:
                 self.reply(400, {"ok": False, "error": str(exc)})
+            except CliFailure as exc:
+                unavailable = exc.code == "runtime_unavailable"
+                self.reply(503, {"ok": False, "code": "ORCA_" + exc.code.upper(),
+                                 "retryable": not unavailable,
+                                 "error": "Откройте Orca на Mac и повторите запрос" if unavailable else
+                                 "Orca не успела ответить. Обновите статус на часах."})
             except (ValueError, TypeError):
                 self.reply(400, {"ok": False, "error": "Некорректный запрос или операция сейчас недоступна"})
             except Exception as exc:

@@ -1,8 +1,8 @@
 const PROFILES = {
-  musafir: ['STATUS', 'SUMMARY', 'AUDIO_BEGIN', 'AUDIO_CHUNK', 'AUDIO_PART', 'AUDIO_FINISH', 'AUDIO_STATUS',
+  musafir: ['STATUS', 'SUMMARY', 'AUDIO_BEGIN', 'AUDIO_CHUNK', 'AUDIO_PART', 'AUDIO_FINISH', 'AUDIO_STATUS', 'TEXT_BEGIN', 'TEXT_PART', 'TEXT_FINISH',
     'DIAGNOSTIC', 'SEND_TEXT', 'JOB_STATUS', 'LATEST_JOB', 'JOB_APPROVE',
     'HISTORY_LIST', 'HISTORY_DETAIL', 'HISTORY_SET_DELETED', 'HISTORY_CURRENT', 'HISTORY_EMPTY_TRASH'],
-  orca: ['SUMMARY', 'AUDIO_BEGIN', 'AUDIO_CHUNK', 'AUDIO_PART', 'AUDIO_FINISH', 'AUDIO_STATUS', 'DIAGNOSTIC',
+  orca: ['SUMMARY', 'AUDIO_BEGIN', 'AUDIO_CHUNK', 'AUDIO_PART', 'AUDIO_FINISH', 'AUDIO_STATUS', 'TEXT_BEGIN', 'TEXT_PART', 'TEXT_FINISH', 'DIAGNOSTIC',
     'ORCA_LIST', 'ORCA_TERMINALS', 'ORCA_PAIRS', 'ORCA_BIND',
     'ORCA_SEND', 'ORCA_JOB', 'ORCA_LATEST', 'ORCA_REPLY', 'ORCA_PAUSE', 'ORCA_ROOTS',
     'ORCA_PRESETS', 'ORCA_AGENTS', 'ORCA_MODELS', 'ORCA_PROJECT_CREATE', 'ORCA_PROJECT_PLAN',
@@ -11,12 +11,12 @@ const PROFILES = {
     'ORCA_HISTORY_LIST', 'ORCA_HISTORY_DETAIL', 'ORCA_HISTORY_SET_DELETED', 'ORCA_HISTORY_EMPTY_TRASH',
     'ORCA_QUICK_LIST', 'ORCA_MODES', 'ORCA_STOP', 'ORCA_ASK', 'ORCA_HANDOFF'
   ],
-  claude: ['SUMMARY', 'AUDIO_BEGIN', 'AUDIO_CHUNK', 'AUDIO_PART', 'AUDIO_FINISH', 'AUDIO_STATUS', 'DIAGNOSTIC',
+  claude: ['SUMMARY', 'AUDIO_BEGIN', 'AUDIO_CHUNK', 'AUDIO_PART', 'AUDIO_FINISH', 'AUDIO_STATUS', 'TEXT_BEGIN', 'TEXT_PART', 'TEXT_FINISH', 'DIAGNOSTIC',
     'CLAUDE_PROJECTS', 'CLAUDE_SESSIONS', 'CLAUDE_MODES', 'CLAUDE_SEND', 'CLAUDE_JOB', 'CLAUDE_LATEST', 'CLAUDE_STOP', 'CLAUDE_APPROVE',
     'CLAUDE_HISTORY_LIST', 'CLAUDE_HISTORY_DETAIL', 'CLAUDE_HISTORY_SET_DELETED', 'CLAUDE_HISTORY_EMPTY_TRASH',
     'CLAUDE_NIGHT', 'CLAUDE_NIGHT_RUN', 'CLAUDE_NIGHT_STOP', 'CLAUDE_QUICK_LIST', 'CLAUDE_PRS',
     'WATCH_LIST', 'WATCH_ADD', 'WATCH_REMOVE', 'WATCH_CHECK'],
-  codex: ['SUMMARY', 'AUDIO_BEGIN', 'AUDIO_CHUNK', 'AUDIO_PART', 'AUDIO_FINISH', 'AUDIO_STATUS', 'DIAGNOSTIC',
+  codex: ['SUMMARY', 'AUDIO_BEGIN', 'AUDIO_CHUNK', 'AUDIO_PART', 'AUDIO_FINISH', 'AUDIO_STATUS', 'TEXT_BEGIN', 'TEXT_PART', 'TEXT_FINISH', 'DIAGNOSTIC',
     'CODEX_PROJECTS', 'CODEX_SESSIONS', 'CODEX_MODES', 'CODEX_SEND', 'CODEX_JOB', 'CODEX_LATEST', 'CODEX_STOP', 'CODEX_APPROVE',
     'CODEX_HISTORY_LIST', 'CODEX_HISTORY_DETAIL', 'CODEX_HISTORY_SET_DELETED', 'CODEX_HISTORY_EMPTY_TRASH',
     'CODEX_NIGHT', 'CODEX_NIGHT_RUN', 'CODEX_NIGHT_STOP', 'CODEX_QUICK_LIST', 'CODEX_PRS',
@@ -64,16 +64,17 @@ export function forwardRequest(request, fetchRequest, bridgeURL, deviceToken, pr
     }
     if (response.status !== 200) return {
       ok: false, error: body.error || 'Мост к Mac недоступен',
-      ...(profile === 'limits' ? { code: 'BRIDGE_HTTP', retryable: response.status >= 500 } : {})
+      code: typeof body.code === 'string' ? body.code : 'BRIDGE_HTTP',
+      retryable: response.status >= 500 && body.retryable !== false
     }
     return body
   })
 }
 
 // A failed HTTP request does not prove that Tailscale or the Mac is offline.
-// Only the read-only limits page consumes retryable replies; agent commands do not retry.
-export function forwardLimitsRequest(request, fetchRequest, bridgeURL, deviceToken) {
-  return Promise.resolve().then(() => forwardRequest(request, fetchRequest, bridgeURL, deviceToken, 'limits'))
+// The caller may retry safe reads or idempotent uploads; never a task submission.
+export function forwardVoiceRequest(request, fetchRequest, bridgeURL, deviceToken, profile = 'musafir') {
+  return Promise.resolve().then(() => forwardRequest(request, fetchRequest, bridgeURL, deviceToken, profile))
     .catch(error => {
       const malformed = error && error.code === 'BRIDGE_PROTOCOL'
       return {
@@ -83,4 +84,8 @@ export function forwardLimitsRequest(request, fetchRequest, bridgeURL, deviceTok
         error: malformed ? 'Mac прислал некорректный ответ' : 'Телефон не получил ответ Mac'
       }
     })
+}
+
+export function forwardLimitsRequest(request, fetchRequest, bridgeURL, deviceToken) {
+  return forwardVoiceRequest(request, fetchRequest, bridgeURL, deviceToken, 'limits')
 }

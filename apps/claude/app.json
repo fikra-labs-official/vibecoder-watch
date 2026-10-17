@@ -5,8 +5,8 @@
     "appName": "Claude",
     "appType": "app",
     "version": {
-      "code": 9,
-      "name": "0.1.8"
+      "code": 10,
+      "name": "0.2.0"
     },
     "icon": "claude-icon.png",
     "vender": "Fikra Labs",

@@ -17,6 +17,7 @@ const files = new Map()
 const fileHandles = new Map()
 const storage = new Map()
 const uploads = new Map()
+const textDrafts = new Map()
 const widgets = []
 let currentPage = null
 let currentPath = 'page/index'
@@ -50,7 +51,7 @@ const scenarios = {
   ready: null,
   review: {
     id: '1700000000000-1', state: 'ready',
-    text: 'Покажи мой план на сегодня и ничего не меняй.'
+    text: 'Проверь состояние проекта. Исправь две опечатки в названии экрана. Перед началом покажи, что задание принято. После выполнения пришли результат на часы. '.repeat(3)
   },
   approval: {
     id: 'demo-job-1', state: 'approval', text: 'Показываю план без изменений.',
@@ -61,6 +62,32 @@ const scenarios = {
     id: 'demo-job-1', state: 'completed', text: 'Покажи мой план на сегодня и ничего не меняй.',
     result: 'Сегодня в плане три пункта. В 10:00 проверить входящие сообщения. В 13:30 подготовить заметки к встрече. В 18:00 подвести итоги дня. Я ничего не менял и не отправлял. Можно открыть любой пункт для чтения, но в этой демонстрации файлы, задачи и сообщения остаются без изменений. Длинный ответ листается стрелками на экране часов.'
   }
+}
+
+// This browser-only stand-in exercises the page callbacks; the watch uses Zepp's native keyboard.
+const keyboardUI = {
+  inputType: { CHAR: 1, JSKB: 4 },
+  createKeyboard(options) {
+    this.deleteKeyboard()
+    const panel = document.createElement('div')
+    panel.className = 'keyboard-demo'
+    const label = document.createElement('label')
+    label.textContent = 'Демонстрация ввода. На часах откроется системная клавиатура.'
+    const input = document.createElement('textarea')
+    input.value = options.text
+    input.setAttribute('aria-label', 'Полный текст задания')
+    const save = document.createElement('button')
+    save.textContent = 'Сохранить правки'
+    save.onclick = () => options.onComplete(null, { data: input.value })
+    const cancel = document.createElement('button')
+    cancel.textContent = 'Отмена'
+    cancel.onclick = () => options.onCancel()
+    panel.append(label, input, save, cancel)
+    screen.append(panel)
+    input.focus()
+    return panel
+  },
+  deleteKeyboard() { screen.querySelector('.keyboard-demo')?.remove() }
 }
 
 function color(value, fallback = 'transparent') {
@@ -227,6 +254,13 @@ function localRequest(payload) {
         if (scenario === 'offline') { reject(new Error('Телефон не ответил')); return }
         resolve({ ok: true, agent: 'Мусафир · локальная демонстрация' })
         return
+      case 'TEXT_BEGIN':
+        textDrafts.set(params.id, params.textLength)
+        resolve({ ok: true, id: params.id, state: 'uploading', textLength: params.textLength, receivedLength: 0 }); return
+      case 'TEXT_PART':
+        resolve({ ok: true, id: params.id, textLength: textDrafts.get(params.id), receivedLength: params.offset + Array.from(params.text).length }); return
+      case 'TEXT_FINISH':
+        resolve({ ok: true, id: params.id, state: 'ready', textLength: textDrafts.get(params.id) }); return
       case 'LATEST_JOB':
         if (scenario === 'error') { resolve({ ok: false, error: 'Не удалось прочитать запись' }); return }
         resolve({ ok: true, job: scenarios[scenario] ?? null })
@@ -453,7 +487,7 @@ function evaluatePage(source, path) {
     'BasePage', 'MAX_AUDIO_BYTES', 'createWatchClient', 'createFolderVoiceRoute',
     'createOrcaVoiceRoute', 'replace', 'Page', 'LocalStorage', 'setWakeUpRelaunch',
     'setPageBrightTime', 'resetPageBrightTime', 'pauseDropWristScreenOff',
-    'resetDropWristScreenOff', 'Vibrator', 'VIBRATOR_SCENE_SHORT_STRONG'
+    'resetDropWristScreenOff', 'Vibrator', 'VIBRATOR_SCENE_SHORT_STRONG', 'keyboardUI'
   ]
   const values = [
     createWidget, widget, align, text_style, prop, getTextLayout,
@@ -469,7 +503,7 @@ function evaluatePage(source, path) {
       setItem(key, value) { storage.set(key, value) }
     },
     () => {}, () => {}, () => {}, () => {}, () => {},
-    class { start({ mode }) { console.log('[preview] simulated vibration:', mode) } stop() {} }, 'short-strong'
+    class { start({ mode }) { console.log('[preview] simulated vibration:', mode) } stop() {} }, 'short-strong', keyboardUI
   ]
   new Function(...names, `${executable}\n//# sourceURL=/${path}.js`)(...values)
 }

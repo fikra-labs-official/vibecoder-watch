@@ -21,6 +21,9 @@ export function createWatchAlerts({ namespace, storage, setTimer, clearTimer }) 
   function keyFor(state) {
     const id = state && (state.jobId || state.id)
     if (!SAFE_ID.test(id || '')) return null
+    if (state.phase === 'job' && state.state === 'running') {
+      return JSON.stringify([namespace, 'started', id])
+    }
     if (state.phase === 'approval') {
       if (!SAFE_ID.test(state.approvalId || '')) return null
       return JSON.stringify([namespace, 'approval', id, state.approvalId])
@@ -87,7 +90,7 @@ export function createWatchAlerts({ namespace, storage, setTimer, clearTimer }) 
       if (key === activeKey) return
       activeKey = key
       silence()
-      // Distinct patterns: a prompt asks three times, an error twice, a finished answer once.
+      // A prompt asks three times, an error twice, a confirmed start or answer once.
       if (key && remember(key)) vibrate(state.phase === 'approval' ? 3 : state.phase === 'error' ? 2 : 1)
     },
     silence,

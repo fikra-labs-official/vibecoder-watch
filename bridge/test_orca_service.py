@@ -5,6 +5,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 from orca_service import OrcaService, CliFailure
 
@@ -161,6 +162,35 @@ class FakeCli:
         return {"ok": True, "result": result, "_meta": {"runtimeId": self.runtime}}
 
 
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+class TimedCli(FakeCli):
+    def __init__(self, clock, durations):
+        super().__init__()
+        self.clock = clock
+        self.durations = {key: list(values) for key, values in durations.items()}
+        self.timed_calls = []
+
+    def run(self, argv, timeout=None):
+        key = tuple(argv[:2])
+        duration = self.durations.get(key, [0]).pop(0) if self.durations.get(key) else 0
+        self.timed_calls.append((tuple(argv), timeout))
+        if timeout is not None and duration > timeout:
+            self.clock.advance(timeout)
+            raise TimeoutError()
+        self.clock.advance(duration)
+        return super().run(argv, timeout)
+
+
 class OrcaServiceTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -197,6 +227,103 @@ class OrcaServiceTests(unittest.TestCase):
         self.assertEqual(term['handle'], WORKER)
         self.assertEqual(len(calls), 2)
         self.assertFalse(any(c[:2] == ('terminal', 'create') for c in self.fake.calls))
+
+    def test_terminal_discovery_has_one_total_budget_and_never_returns_partial_success(self):
+        clock = FakeClock()
+        cli = TimedCli(clock, {
+            ("worktree", "ps"): [1],
+            ("terminal", "list"): [1],
+            ("terminal", "show"): [10, 10],
+        })
+        self.service.close()
+        self.service = OrcaService(self.tmp.name, cli)
+        with patch("orca_service.time.monotonic", clock.monotonic):
+            with self.assertRaises(CliFailure) as raised:
+                self.service.rpc("ORCA_TERMINALS", {"workspaceId": WORKSPACE})
+        self.assertEqual(raised.exception.code, "request_deadline")
+        self.assertEqual(clock.now, 8)
+        self.assertEqual([round(timeout, 3) for _, timeout in cli.timed_calls], [8, 7, 5, 1])
+        self.assertEqual(len([call for call, _ in cli.timed_calls
+                              if call[:2] == ("terminal", "show")]), 2)
+
+    def test_bind_reuses_catalog_snapshot_and_clips_each_call_to_remaining_budget(self):
+        clock = FakeClock()
+        cli = TimedCli(clock, {
+            ("worktree", "ps"): [1],
+            ("terminal", "show"): [1, 1],
+            ("terminal", "wait"): [1, 1],
+            ("status", "--json"): [1],
+        })
+        self.service.close()
+        self.service = OrcaService(self.tmp.name, cli)
+        with patch("orca_service.time.monotonic", clock.monotonic):
+            pair = self.bind()
+        self.assertEqual(pair["workspaceId"], WORKSPACE)
+        catalogs = [call for call, _ in cli.timed_calls if call[:2] == ("worktree", "ps")]
+        self.assertEqual(len(catalogs), 1)
+        self.assertEqual([round(timeout, 3) for _, timeout in cli.timed_calls],
+                         [8, 5, 1, 5, 1, 3])
+
+    def test_bind_deadline_does_not_persist_pair(self):
+        clock = FakeClock()
+        cli = TimedCli(clock, {
+            ("worktree", "ps"): [1],
+            ("terminal", "show"): [1, 1],
+            ("terminal", "wait"): [1, 1],
+            ("status", "--json"): [10],
+        })
+        self.service.close()
+        self.service = OrcaService(self.tmp.name, cli)
+        with patch("orca_service.time.monotonic", clock.monotonic):
+            with self.assertRaises(CliFailure) as raised:
+                self.bind()
+        self.assertEqual(raised.exception.code, "request_deadline")
+        self.assertEqual(clock.now, 8)
+        self.assertEqual(self.service.db.execute("SELECT count(*) FROM pairs").fetchone()[0], 0)
+        self.assertEqual(len([call for call, _ in cli.timed_calls
+                              if call[:2] == ("status", "--json")]), 1)
+
+    def test_late_cli_success_cannot_escape_menu_deadline(self):
+        clock = FakeClock()
+        timeouts = []
+
+        def late_success(argv, timeout=None):
+            timeouts.append(timeout)
+            clock.advance(9)
+            return self.fake.run(argv, timeout)
+
+        self.service.cli = late_success
+        with patch("orca_service.time.monotonic", clock.monotonic):
+            with self.assertRaises(CliFailure) as raised:
+                self.service.rpc("ORCA_LIST", {})
+        self.assertEqual(raised.exception.code, "request_deadline")
+        self.assertEqual(timeouts, [8])
+
+    def test_menu_budget_is_thread_local_and_cleared_after_rpc(self):
+        timeouts = []
+        background = []
+        started = False
+
+        def runner(argv, timeout=None):
+            nonlocal started
+            timeouts.append((tuple(argv), timeout, threading.current_thread().name))
+            if argv[:2] == ["worktree", "ps"] and not started:
+                started = True
+                thread = threading.Thread(
+                    target=lambda: background.append(
+                        self.service._call(["status", "--json"], timeout=20)[0]))
+                thread.start()
+                thread.join(timeout=2)
+                self.assertFalse(thread.is_alive())
+            return self.fake.run(argv, timeout)
+
+        self.service.cli = runner
+        self.service.rpc("ORCA_LIST", {})
+        self.service._call(["status", "--json"], timeout=5)
+        self.assertEqual(background[0]["runtime"]["state"], "ready")
+        status_timeouts = [timeout for argv, timeout, _ in timeouts
+                           if argv[:2] == ("status", "--json")]
+        self.assertEqual(status_timeouts, [20, 5])
 
     def test_unreadable_saved_coordinator_is_not_recreated(self):
         pair = self.bind()

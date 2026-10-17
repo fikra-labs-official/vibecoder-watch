@@ -148,3 +148,19 @@ test('connection: Zepp settings win as a pair, baked values are the fallback, on
   assert.equal(resolveConnection(store({ bridgeURL: 'https://mac.ts.net:8443/evil path', deviceToken: key })), null)
   assert.equal(resolveConnection(store({ bridgeURL: 'https://mac.ts.net:8443', deviceToken: 'short' })), null)
 })
+
+test('corrected text chunks reach the bridge for all voice profiles and stay forbidden in Limits', async () => {
+  for (const profile of ['musafir', 'orca', 'claude', 'codex']) {
+    for (const method of ['TEXT_BEGIN', 'TEXT_PART', 'TEXT_FINISH']) {
+      let seen
+      const params = { id: '1700000000000-2', offset: 0, text: 'Исправлено 🕌' }
+      const result = await forwardRequest({ method, params }, async options => {
+        seen = JSON.parse(options.body)
+        return { status: 200, body: { ok: true } }
+      }, 'https://mac.test', 'device-secret', profile)
+      assert.equal(result.ok, true)
+      assert.deepEqual(seen, { method, params })
+      assert.equal((await forwardRequest({ method }, () => { throw Error('must not forward') }, '', '', 'limits')).ok, false)
+    }
+  }
+})

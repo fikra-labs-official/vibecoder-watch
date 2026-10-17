@@ -5,20 +5,22 @@ import { answerPhonePing, createPhoneProbe } from '../shared/phone-link.js'
 const flush = () => new Promise(resolve => setImmediate(resolve))
 
 function fixture() {
-  let resolve, reject, deadline
+  const pending = []
+  let deadline
   const states = [], sent = []
   let cleared = 0
   const probe = createPhoneProbe({
     request(payload) {
       sent.push(payload)
-      return new Promise((yes, no) => { resolve = yes; reject = no })
+      return new Promise((yes, no) => { pending.push({ resolve: yes, reject: no }) })
     },
     report: state => states.push(state),
     setTimer: callback => { deadline = callback; return 1 },
     clearTimer: () => { cleared += 1 }
   })
   return { probe, states, sent, expire: () => deadline(),
-    resolve: value => resolve(value), reject: () => reject(new Error('BLE disconnected')),
+    resolve: (value, index = pending.length - 1) => pending[index].resolve(value),
+    reject: (index = pending.length - 1) => pending[index].reject(new Error('BLE disconnected')),
     cleared: () => cleared }
 }
 
@@ -50,13 +52,12 @@ test('timeout covers an unresolved handshake and a late reply cannot become succ
   f.probe.start()
   await flush()
   f.expire()
-  assert.deepEqual(f.states.at(-1), { state: 'timeout', busy: true })
-  assert.equal(f.probe.start(), false)
-  f.resolve(answerPhonePing(f.sent[0]))
-  await flush()
   assert.deepEqual(f.states.at(-1), { state: 'timeout', busy: false })
-  assert.equal(f.states.some(x => x.state === 'ok'), false)
   assert.equal(f.probe.start(), true)
+  f.resolve(answerPhonePing(f.sent[0]), 0)
+  await flush()
+  assert.deepEqual(f.states.at(-1), { state: 'waiting', busy: true })
+  assert.equal(f.states.some(x => x.state === 'ok'), false)
   f.probe.close()
   await flush()
 })

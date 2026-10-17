@@ -1,7 +1,8 @@
 // Keep the proven recorder/ASR UI shared; only confirmed command routing changes.
 export function createOrcaVoiceRoute({ request, context, save = () => {} }) {
   const remember = values => { Object.assign(context, values); save(context) }
-  async function jobReply(reply, alias) {
+  async function jobReply(reply, alias, options) {
+    if (options && typeof options.onRouteProgress === 'function') options.onRouteProgress()
     if (!reply || reply.ok !== true) return reply
     const job = reply.job
     if (!job) return { ok: true, job: null }
@@ -20,12 +21,14 @@ export function createOrcaVoiceRoute({ request, context, save = () => {} }) {
     let length = Array.from(publicJob.result).length
     const seen = new Set()
     while (job.state === 'completed' && cursor != null) {
-      if (seen.has(cursor) || length > 100000) throw new Error('Ответ слишком большой. Полный отчёт сохранён на Mac.')
+      if (options && typeof options.onRouteProgress === 'function') options.onRouteProgress()
+      if (seen.has(cursor) || seen.size >= 128 || length > 100000) throw new Error('Ответ слишком большой. Полный отчёт сохранён на Mac.')
       seen.add(cursor)
-      const page = await request({ method: 'ORCA_JOB', params: { id: job.id, cursor } })
+      const page = await request({ method: 'ORCA_JOB', params: { id: job.id, cursor } }, options)
       if (!page || !page.ok || !page.job || page.job.id !== job.id) throw new Error('Не удалось получить продолжение ответа')
       publicJob.result += page.job.result || ''
       length += Array.from(page.job.result || '').length
+      if (length > 100000) throw new Error('Ответ слишком большой. Полный отчёт сохранён на Mac.')
       cursor = page.job.nextCursor
     }
     if (job.state === 'question') {
@@ -34,13 +37,15 @@ export function createOrcaVoiceRoute({ request, context, save = () => {} }) {
       let question = job.question || job.summary || 'Нужен ответ владельца'
       let next = job.questionNextCursor
       while (next != null) {
-        if (seen.has(next) || Array.from(question).length > 30000) throw new Error('Вопрос нужно открыть на Mac')
+        if (options && typeof options.onRouteProgress === 'function') options.onRouteProgress()
+        if (seen.has(next) || seen.size >= 64 || Array.from(question).length > 30000) throw new Error('Вопрос нужно открыть на Mac')
         seen.add(next)
-        const more = await request({ method: 'ORCA_JOB', params: { id: job.id, questionCursor: next } })
+        const more = await request({ method: 'ORCA_JOB', params: { id: job.id, questionCursor: next } }, options)
         if (!more || !more.ok || !more.job || more.job.id !== job.id || more.job.questionId !== job.questionId) {
           throw new Error('Не удалось прочитать весь вопрос')
         }
         question += more.job.question || ''
+        if (Array.from(question).length > 30000) throw new Error('Вопрос нужно открыть на Mac')
         next = more.job.questionNextCursor
       }
       publicJob.approval = { id: job.questionId, text: question }
@@ -52,13 +57,15 @@ export function createOrcaVoiceRoute({ request, context, save = () => {} }) {
     if (method === 'STATUS') return { ok: true, agent: 'Orca' }
     if (method === 'LATEST_JOB') {
       if (context.answering && !context.pendingSend) return { ok: true, job: null }
-      const resumeExact = context.resumeJob === true && context.jobId
-      const reply = await request(resumeExact
-        ? { method: 'ORCA_JOB', params: { id: context.jobId } }
+      const pendingId = context.pendingSend === true && (context.answering ? context.jobId : context.aliasId)
+      const resumeId = context.resumeJob === true && context.jobId
+      const exactId = pendingId || resumeId
+      const reply = await request(exactId
+        ? { method: 'ORCA_JOB', params: { id: exactId } }
         : { method: 'ORCA_LATEST', params: { pairId: context.pairId } }, options)
-      if (resumeExact && reply && reply.ok) remember({ resumeJob: false })
-      if (reply && reply.ok && reply.job && context.jobId !== reply.job.id) remember({ aliasId: reply.job.id })
-      const job = await jobReply(reply)
+      if (resumeId && reply && reply.ok) remember({ resumeJob: false })
+      if (!pendingId && reply && reply.ok && reply.job && context.jobId !== reply.job.id) remember({ aliasId: reply.job.id })
+      const job = await jobReply(reply, null, options)
       return job && job.ok ? { ok: true, job: job.job === null ? null : job } : job
     }
     if (method === 'SEND_TEXT') {
@@ -69,10 +76,11 @@ export function createOrcaVoiceRoute({ request, context, save = () => {} }) {
           ? await request({ method: 'ORCA_ASK', params: { id: params.id, textId: params.textId || params.id, pairId: context.pairId, role: context.askRole } }, options)
           : await request({ method: 'ORCA_SEND', params: { id: params.id, textId: params.textId || params.id, pairId: context.pairId } }, options)
       if (reply && reply.ok) remember({ answering: false })
-      return jobReply(reply, params.id)
+      return jobReply(reply, params.id, options)
     }
     if (method === 'JOB_STATUS') {
-      return jobReply(await request({ method: 'ORCA_JOB', params: { id: context.jobId || params.id } }, options), params.id)
+      const pendingId = context.pendingSend === true && (context.answering ? context.jobId : context.aliasId)
+      return jobReply(await request({ method: 'ORCA_JOB', params: { id: pendingId || context.jobId || params.id } }, options), params.id, options)
     }
     if (method === 'JOB_APPROVE') return { ok: false, error: 'Ответьте на вопрос голосом в Orca' }
     return request(payload, options)
@@ -94,6 +102,7 @@ export function createFolderVoiceRoute({ request, context, save = () => {} }) {
     return { ok: true, id, state: 'error', error: message, retryTextId: id }
   }
   async function operation(reply, id, options) {
+    if (options && typeof options.onRouteProgress === 'function') options.onRouteProgress()
     if (reply && reply.ok === false && ['PROJECT_REJECTED', 'OPERATION_NOT_FOUND'].includes(reply.code)) {
       return rejected(id, reply.code === 'OPERATION_NOT_FOUND'
         ? 'План проекта не найден. Текст сохранён. Вернитесь к нему или откройте меню Orca.'
@@ -114,7 +123,8 @@ export function createFolderVoiceRoute({ request, context, save = () => {} }) {
       if (Array.from(text).length > 30000) throw new Error('План нужно открыть на Mac')
       const seen = new Set()
       while (cursor != null) {
-        if (seen.has(cursor)) throw new Error('План нужно открыть на Mac')
+        if (options && typeof options.onRouteProgress === 'function') options.onRouteProgress()
+        if (seen.has(cursor) || seen.size >= 64) throw new Error('План нужно открыть на Mac')
         seen.add(cursor)
         const page = await request({ method: 'ORCA_OPERATION', params: { id, cursor } }, options)
         const next = page && page.operation

@@ -1,4 +1,5 @@
 import { createWidget, widget, align, text_style, prop, getTextLayout } from '@zos/ui'
+import * as keyboardUI from '@zos/ui'
 import { getDeviceInfo } from '@zos/device'
 import { setTimeout, clearTimeout } from '@zos/timer'
 import { codec, create, id as mediaId } from '@zos/media'
@@ -20,13 +21,14 @@ const DISPLAY_RENEW_MS = 45000
 const ACKNOWLEDGED_RESULT_KEY = 'acknowledged-result-id'
 const DESTINATION_KEY = 'voice-destination'
 const PENDING_AUDIO_KEY = 'pending-audio'
+const DRAFT_KEY = 'voice-draft'
 const CLAUDE_MODES = { auto: 'Авто', acceptEdits: 'Автоправки', plan: 'План', bypass: 'Без ограничений', default: 'Без правок' }
 const COLORS = { background: 0x0b0b0c, gold: 0xeac477, text: 0xf4eee3,
   muted: 0xb8ac99, surface: 0x28231d, pressed: 0x413629, red: 0xff776a }
 function clockText(seconds) {
   return `${Math.floor(seconds / 60).toString().padStart(2, '0')}:${(seconds % 60).toString().padStart(2, '0')}`
 }
-function pagesFor(value, width, px) {
+function pagesFor(value, width, px, height = 146) {
   const characters = Array.from(String(value || ''))
   if (!characters.length) return ['']
   const pages = []
@@ -44,11 +46,11 @@ function pagesFor(value, width, px) {
           text_size: px(20), text_width: width, wrapped: 1
         })
         if (!layout || !Number.isFinite(layout.height)) throw new Error('layout unavailable')
-        fits = layout.result !== -1 && layout.height <= px(146)
+        fits = layout.result !== -1 && layout.height <= px(height)
       } catch (error) {
         // Older firmware may omit layout metadata; keep all text in small pages.
         const lines = candidate.split('\n').reduce((sum, line) => sum + Math.max(1, Math.ceil(line.length / 14)), 0)
-        fits = candidate.length <= 70 && lines <= 5
+        fits = candidate.length <= (height < 146 ? 56 : 70) && lines <= (height < 146 ? 4 : 5)
       }
       if (fits) {
         count = middle
@@ -93,6 +95,8 @@ export function createVoicePage({ kind, icon, title, version }) {
     this.pageSource = null
     this.textPages = ['']
     this.textPage = 0
+    this.keyboardOpen = false
+    this.keyboardGeneration = 0
 
     this.animationTimer = null
     this.phaseStartedAt = Date.now()
@@ -137,6 +141,9 @@ export function createVoicePage({ kind, icon, title, version }) {
         }
       } catch (error) {}
     }
+    this.draftStorageKey = DRAFT_KEY + (this.destination
+      ? ':' + [this.destination.target, this.destination.pairId || this.destination.project || this.destination.rootId,
+        this.destination.sessionId || ''].join(':') : '')
     this.pendingAudio = legacyOrcaContext ? null : this.readPendingAudio()
     if (!isOrca && !this.pendingAudio && this.resultStorage &&
         this.resultStorage.getItem('musafir-resume') === 'history') {
@@ -211,6 +218,13 @@ export function createVoicePage({ kind, icon, title, version }) {
       click_func: () => this.secondaryAction && this.secondaryAction()
     })
 
+    this.editButton = createWidget(widget.BUTTON, {
+      x: px(24), y: px(296), w: width - px(48), h: px(44), radius: px(12),
+      normal_color: COLORS.surface, press_color: COLORS.pressed, color: COLORS.gold,
+      text_size: px(19), text: 'Править вручную', click_func: () => this.editTranscript()
+    })
+    this.editButton.setProperty(prop.VISIBLE, false)
+
     this.menuButton = createWidget(widget.BUTTON, {
       x: px(110), y: px(302), w: width - px(220), h: px(38), radius: px(12),
       normal_color: COLORS.surface, press_color: COLORS.pressed, color: COLORS.gold,
@@ -234,6 +248,14 @@ export function createVoicePage({ kind, icon, title, version }) {
         setTimer: setTimeout,
         clearTimer: clearTimeout,
         request,
+        readDraft: () => {
+          try { return JSON.parse(this.resultStorage.getItem(this.draftStorageKey) || 'null') }
+          catch (error) { return null }
+        },
+        writeDraft: value => {
+          if (!this.resultStorage) throw new Error('Не удалось сохранить текст на часах')
+          this.resultStorage.setItem(this.draftStorageKey, value ? JSON.stringify(value) : '')
+        },
         readAcknowledgedResultId: () => this.resultStorage && this.resultStorage.getItem(acknowledgementKey),
         writeAcknowledgedResultId: id => this.resultStorage && this.resultStorage.setItem(acknowledgementKey, id),
         report: state => {
@@ -248,6 +270,58 @@ export function createVoicePage({ kind, icon, title, version }) {
     } catch (error) {
       this.showStartupError(error)
     }
+  },
+
+  editTranscript() {
+    if (this.closed || this.keyboardOpen || !this.client) return
+    const state = this.client.getState()
+    if (state.phase !== 'review') return
+    if (typeof keyboardUI.createKeyboard !== 'function' || !keyboardUI.inputType) {
+      this.stageWidget.setProperty(prop.TEXT, 'Клавиатура требует Zepp OS API 4.0+')
+      return
+    }
+    this.alerts.silence()
+    const generation = ++this.keyboardGeneration
+    this.keyboardOpen = true
+    const options = {
+      text: state.text,
+      onComplete: (_, result) => {
+        if (this.closed || generation !== this.keyboardGeneration) return
+        this.closeKeyboard()
+        try {
+          if (!result || typeof result.data !== 'string') throw new Error('Клавиатура не вернула текст')
+          this.client.updateReviewText(result.data)
+        } catch (error) {
+          this.stageWidget.setProperty(prop.TEXT, error.message || 'Не удалось сохранить правку')
+        }
+      },
+      onCancel: () => {
+        if (this.closed || generation !== this.keyboardGeneration) return
+        this.closeKeyboard()
+        this.render(this.client.getState())
+      }
+    }
+    try {
+      // JSKB opens the enabled custom keyboard; CHAR also allows switching via the globe.
+      const type = keyboardUI.inputType.JSKB == null ? keyboardUI.inputType.CHAR : keyboardUI.inputType.JSKB
+      try {
+        if (keyboardUI.createKeyboard({ ...options, inputType: type }) === false) throw new Error('KEYBOARD_UNAVAILABLE')
+      } catch (error) {
+        try { keyboardUI.deleteKeyboard() } catch (ignored) {}
+        if (type === keyboardUI.inputType.CHAR ||
+            keyboardUI.createKeyboard({ ...options, inputType: keyboardUI.inputType.CHAR }) === false) throw error
+      }
+    } catch (error) {
+      this.closeKeyboard()
+      this.stageWidget.setProperty(prop.TEXT, 'Включите клавиатуру в настройках часов')
+    }
+  },
+
+  closeKeyboard() {
+    if (!this.keyboardOpen) return
+    this.keyboardOpen = false
+    this.keyboardGeneration += 1
+    try { keyboardUI.deleteKeyboard() } catch (error) {}
   },
 
   openHistory() {
@@ -431,12 +505,13 @@ export function createVoicePage({ kind, icon, title, version }) {
     if (secondary) this.secondaryButton.setProperty(prop.TEXT, secondary.text)
   },
 
-  setBody(text, pageable = true) {
+  setBody(text, pageable = true, height = 146) {
     const source = String(text || '')
-    if (source !== this.pageSource || pageable !== this.bodyPageable) {
+    if (source !== this.pageSource || pageable !== this.bodyPageable || height !== this.bodyPageHeight) {
+      this.bodyPageHeight = height
       this.bodyPageable = pageable
       this.pageSource = source
-      this.textPages = pageable ? pagesFor(source, this.width - this.px(48), this.px) : [source]
+      this.textPages = pageable ? pagesFor(source, this.width - this.px(48), this.px, height) : [source]
       this.textPage = 0
     }
     this.bodyWidget.setProperty(prop.TEXT, this.textPages[this.textPage])
@@ -506,7 +581,7 @@ export function createVoicePage({ kind, icon, title, version }) {
     let secondary = null
     const home = state.phase === 'ready'
     const active = ['connecting', 'refreshing', 'recording', 'stopping', 'canceling',
-      'uploading', 'transcribing', 'sending', 'job'].includes(state.phase)
+      'uploading', 'transcribing', 'saving-text', 'sending', 'job'].includes(state.phase)
     const reader = !home && !active
 
     if (state.phase === 'connecting' || state.phase === 'refreshing') {
@@ -546,14 +621,23 @@ export function createVoicePage({ kind, icon, title, version }) {
       body = state.text
       primary = { text: 'Отправить', action: () => this.client.sendText() }
       secondary = { text: 'Заново', action: () => this.startRecording() }
+      if (state.edited) stage = 'Правки сохранены · проверь и отправь'
+      if (state.error) stage = state.error
+    } else if (state.phase === 'saving-text') {
+      status = 'Сохраняю правки'
+      stage = 'Текст ещё не отправлен агенту'
+      body = 'Передаю исправленный текст на Mac.\nЗатем отправлю задание.'
     } else if (state.phase === 'sending') {
       status = state.approvalId ? 'Передаю решение' : 'Отправляю команду'
       stage = `3 из 3 · ${title}`
       body = state.approvalId ? `Передаю ваш выбор\n${title} на Mac.` : `Передаю подтверждённый\nтекст ${title} на Mac.`
     } else if (state.phase === 'job') {
-      status = state.state === 'queued' ? 'Команда в очереди' : `${title} думает`
-      stage = '3 из 3 · Жду ответ'
-      body = `${title} работает на Mac.\nОтвет сохранится.`
+      status = state.state === 'queued' ? 'Задание получено'
+        : state.state === 'submitting' ? 'Передаю агенту' : `${title} работает`
+      stage = state.state === 'running' ? 'Работа началась · жду результат' : 'Сохранено на Mac'
+      body = state.state === 'running' ? `${title} выполняет задание.\nРезультат появится здесь.`
+        : state.state === 'submitting' ? `Ожидаю подтверждение\nзапуска ${title}.`
+          : `Задание принято в очередь.\nОжидаю запуска ${title}.`
       if (!isOrca) secondary = { text: 'История', action: () => this.openHistory() }
     } else if (state.phase === 'approval' && isClaude && state.approvalId && state.approvalOptions) {
       // An agent question with options: the choice is made on the menu page's list.
@@ -622,8 +706,7 @@ export function createVoicePage({ kind, icon, title, version }) {
         stage = label + (this.destination.sessionId ? ' · продолжение' : '')
         body = `Нажмите «Запись» и говорите.\nРежим: ${this.destination.modeLabel || CLAUDE_MODES[this.destination.mode] || 'Авто'}`
       } else if (state.phase === 'job') {
-        status = `${title} работает`
-        stage = label
+        stage = state.state === 'running' ? label + ' · в работе' : label + ' · ожидает запуска'
         primary = { text: this.stopArmed ? 'Точно стоп?' : 'Стоп', action: () => this.stopOrca() }
         secondary = { text: 'История', action: () => this.openHistory() }
       } else if (state.phase === 'result') {
@@ -656,6 +739,13 @@ export function createVoicePage({ kind, icon, title, version }) {
         stage = label
         body = folder ? planning ? 'Orca разбирает задачу\nи готовит план.' : 'Создание идёт на Mac.'
           : 'Задача выполняется на Mac.\nРезультат сохранится.'
+        if (state.phase === 'sending') {
+          status = 'Отправляю задание'
+          body = 'Ожидаю подтверждение\nприёма на Mac.'
+        } else if (state.state === 'queued' || state.state === 'submitting') {
+          status = 'Задание получено'
+          body = 'Сохранено на Mac.\nОжидаю запуска.'
+        }
         if (!folder && state.phase === 'job') {
           primary = { text: this.stopArmed ? 'Точно стоп?' : 'Стоп', action: () => this.stopOrca() }
           secondary = { text: this.destination.paused ? 'Продолжить' : 'Пауза', action: () => this.pauseOrca() }
@@ -709,12 +799,17 @@ export function createVoicePage({ kind, icon, title, version }) {
     this.progressTrack.setProperty(prop.VISIBLE, active)
     this.progressFill.setProperty(prop.VISIBLE, active)
     this.bodyWidget.setProperty(prop.MORE, {
-      y: px(home ? 222 : active ? 259 : 139), h: px(home ? 73 : active ? 65 : 151),
+      y: px(home ? 222 : active ? 259 : 139), h: px(home ? 73 : active ? 65 : state.phase === 'review' ? 111 : 151),
       text_size: px(active ? 19 : 20),
       align_h: reader ? align.LEFT : align.CENTER_H,
       align_v: reader ? align.TOP : align.CENTER_V
     })
-    this.setBody(body, reader)
+    const review = state.phase === 'review'
+    for (const control of [this.previousButton, this.nextButton, this.pageWidget]) {
+      control.setProperty(prop.MORE, { y: px(review ? 254 : 302), h: px(38) })
+    }
+    this.editButton.setProperty(prop.VISIBLE, review)
+    this.setBody(body, reader, review ? 108 : 146)
     this.setButtons(primary, secondary)
     if (active) this.animate()
     if (changed) console.log(`[${logName}] watch state: ${state.phase}`)
@@ -902,6 +997,7 @@ export function createVoicePage({ kind, icon, title, version }) {
       const value = raw && JSON.parse(raw)
       if (!value || !/^\d{1,16}-\d{1,8}$/.test(value.id) ||
           typeof value.fileName !== 'string' || typeof value.accepted !== 'boolean') return null
+      if (value.destinationKey && value.destinationKey !== this.draftStorageKey) return null
       if (value.totalBytes !== null && (!Number.isInteger(value.totalBytes) ||
           value.totalBytes <= 0 || value.totalBytes > MAX_AUDIO_BYTES)) return null
       return value
@@ -911,9 +1007,9 @@ export function createVoicePage({ kind, icon, title, version }) {
   },
 
   savePendingAudio(value) {
-    this.pendingAudio = value
+    this.pendingAudio = { ...value, destinationKey: this.draftStorageKey }
     try {
-      if (this.resultStorage) this.resultStorage.setItem(PENDING_AUDIO_KEY, JSON.stringify(value))
+      if (this.resultStorage) this.resultStorage.setItem(PENDING_AUDIO_KEY, JSON.stringify(this.pendingAudio))
     } catch (error) {}
   },
 
@@ -1079,6 +1175,7 @@ export function createVoicePage({ kind, icon, title, version }) {
 
   onDestroy() {
     this.closed = true
+    this.closeKeyboard()
     // Zepp also destroys the page on sleep. Keep wake-up relaunch enabled:
     // the next build recovers the same accepted job without resending it.
     try { resetPageBrightTime() } catch (error) {}

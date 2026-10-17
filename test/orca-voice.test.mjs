@@ -506,3 +506,64 @@ test('a question to one role routes to ORCA_ASK and remembers the proposed hando
   assert.equal(context.mode, 'ask')
   assert.equal(calls.some(call => call.method === 'ORCA_SEND'), false)
 })
+
+test('a lost new Orca send receipt reconciles the new alias instead of the stale job id', async () => {
+  const calls = []
+  const context = { target: 'orca', pairId: 'pair-1', jobId: 'old-job', aliasId: 'old-voice' }
+  const route = createOrcaVoiceRoute({ context, request: async payload => {
+    calls.push(payload)
+    if (payload.method === 'ORCA_SEND') throw new Error('receipt lost')
+    if (payload.method === 'ORCA_JOB') return { ok: true, job: {
+      id: payload.params.id, state: 'running', stage: 'worker_running'
+    } }
+    throw new Error(payload.method)
+  } })
+  await assert.rejects(route({ method: 'SEND_TEXT', params: {
+    id: '1700000000000-2', textId: '1700000000000-2'
+  } }), /receipt lost/)
+  await route({ method: 'JOB_STATUS', params: { id: '1700000000000-2' } })
+  assert.deepEqual(calls.at(-1), { method: 'ORCA_JOB', params: { id: '1700000000000-2' } })
+})
+
+test('a lost Orca question reply continues polling the original job', async () => {
+  const calls = []
+  const context = { target: 'orca', pairId: 'pair-1', jobId: 'orca-job', aliasId: 'voice-old',
+    answering: true, pendingQuestionId: 'question-1' }
+  const route = createOrcaVoiceRoute({ context, request: async payload => {
+    calls.push(payload)
+    if (payload.method === 'ORCA_REPLY') throw new Error('receipt lost')
+    if (payload.method === 'ORCA_JOB') return { ok: true, job: {
+      id: 'orca-job', state: 'running', stage: 'reviewer_working'
+    } }
+    throw new Error(payload.method)
+  } })
+  await assert.rejects(route({ method: 'SEND_TEXT', params: {
+    id: 'answer-2', textId: 'answer-2'
+  } }), /receipt lost/)
+  await route({ method: 'JOB_STATUS', params: { id: 'answer-2' } })
+  assert.deepEqual(calls.at(-1), { method: 'ORCA_JOB', params: { id: 'orca-job' } })
+})
+
+test('a transport retry after project resume becomes a read-only operation lookup', async () => {
+  const calls = []
+  const context = { target: 'folder', rootId: 'storage', operationId: '200-1' }
+  const route = createFolderVoiceRoute({ context, request: async payload => {
+    calls.push(payload.method)
+    if (payload.method === 'ORCA_PROJECT_RESUME') throw new Error('receipt lost')
+    if (payload.method === 'ORCA_OPERATION') return { ok: true, operation: {
+      id: '200-1', state: calls.length === 1 ? 'unknown' : 'running',
+      canResume: calls.length === 1, phase: 'creating', message: 'Запуск сохранён'
+    } }
+    throw new Error(payload.method)
+  } })
+  const client = createWatchClient({ request: route, report() {}, setTimer: setTimeout, clearTimer: clearTimeout })
+  client.start()
+  await flush()
+  assert.equal(client.getState().phase, 'unknown')
+  client.refresh()
+  await flush()
+  assert.equal(client.getState().phase, 'job')
+  assert.equal(calls.filter(method => method === 'ORCA_PROJECT_RESUME').length, 1)
+  assert.equal(calls.filter(method => method === 'ORCA_OPERATION').length, 2)
+  client.close()
+})

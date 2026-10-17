@@ -186,6 +186,37 @@ class ClaudeServiceTests(unittest.TestCase):
         latest = self.service.rpc("CLAUDE_LATEST", {"project": str(self.crm)})["job"]
         self.assertEqual(latest["id"], "1-2")
 
+    def test_replay_requires_the_same_text_id_and_options_and_keeps_exact_source(self):
+        params = {"id": "9-1", "textId": "9-2", "project": str(self.crm),
+                  "mode": "auto", "night": True}
+        source = '\tТочный текст 😀\n'
+        first = self.service.rpc("CLAUDE_SEND", params, lambda _: source)["job"]
+        self.assertEqual(first["state"], "night")
+        self.assertEqual(
+            self.service.rpc("CLAUDE_HISTORY_DETAIL", {"id": "9-1", "field": "text"})["content"],
+            source)
+        self.assertEqual(self.service.rpc("CLAUDE_SEND", dict(params), lambda _: "wrong")["job"]["id"], "9-1")
+        for changed in (
+                {"textId": "9-3"}, {"mode": "bypass"}, {"night": False},
+                {"project": str(self.shop)}):
+            with self.assertRaises(ValueError):
+                self.service.rpc("CLAUDE_SEND", {**params, **changed}, lambda _: source)
+
+    def test_process_is_submitting_until_spawn_succeeds(self):
+        entered, release = threading.Event(), threading.Event()
+        process = FakeProcess(result_json("Готово"))
+        def slow_runner(argv, cwd, env):
+            entered.set()
+            release.wait(2)
+            return process
+        self.service.runner = slow_runner
+        self.service.rpc("CLAUDE_SEND", {
+            "id": "9-4", "textId": "9-4", "project": str(self.crm)}, lambda _: "Задача")
+        self.assertTrue(entered.wait(1))
+        self.assertEqual(self.service.rpc("CLAUDE_JOB", {"id": "9-4"})["job"]["state"], "submitting")
+        release.set()
+        self.assertEqual(self.wait("9-4")["state"], "completed")
+
     def test_failures_are_errors_and_stop_terminates_the_child(self):
         self.process = FakeProcess(result_json("Не могу: нет доступа", is_error=True), returncode=1)
         self.service.rpc("CLAUDE_SEND", {"id": "2-1", "textId": "2-1", "project": str(self.shop)}, lambda _: "x")
