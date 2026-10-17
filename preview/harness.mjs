@@ -10,14 +10,15 @@ const screen = document.querySelector('#watch-screen')
 const layer = document.querySelector('#widget-layer')
 const select = document.querySelector('#state-select')
 const appSelect = document.querySelector('#app-select')
+const geometrySelect = document.querySelector('#geometry-select')
 const appName = document.querySelector('#app-name')
 const timeNode = document.querySelector('#watch-time')
 const snapshot = document.querySelector('#snapshot')
 
-const widget = Object.freeze({ FILL_RECT: 'fill', TEXT: 'text', BUTTON: 'button', IMG: 'image' })
+const widget = Object.freeze({ FILL_RECT: 'fill', TEXT: 'text', BUTTON: 'button', IMG: 'image', SCROLL_LIST: 'scroll-list' })
 const align = Object.freeze({ LEFT: 'left', RIGHT: 'right', CENTER_H: 'center-h', TOP: 'top', BOTTOM: 'bottom', CENTER_V: 'center-v' })
 const text_style = Object.freeze({ WRAP: 'wrap' })
-const prop = Object.freeze({ TEXT: 'text', MORE: 'more', VISIBLE: 'visible', COLOR: 'color' })
+const prop = Object.freeze({ TEXT: 'text', MORE: 'more', VISIBLE: 'visible', COLOR: 'color', UPDATE_DATA: 'update-data' })
 const files = new Map()
 const fileHandles = new Map()
 const storage = new Map()
@@ -34,6 +35,16 @@ let scenario = 'ready'
 let lastState = { phase: 'booting' }
 let audioStatusCalls = 0
 let jobStatusCalls = 0
+let gestureCallback = null
+let keyCallback = null
+const interaction = {
+  GESTURE_RIGHT: 'right', GESTURE_LEFT: 'left', GESTURE_UP: 'up', GESTURE_DOWN: 'down',
+  KEY_BACK: 'back', KEY_HOME: 'home', KEY_EVENT_CLICK: 'click',
+  onGesture(value) { gestureCallback = typeof value === 'function' ? value : value.callback },
+  offGesture() { gestureCallback = null },
+  onKey(value) { keyCallback = typeof value === 'function' ? value : value.callback },
+  offKey() { keyCallback = null }
+}
 
 const CHAT_ID = '1700000000000-1'
 const OTHER_CHAT_ID = '1700000000001-1'
@@ -167,15 +178,14 @@ function imageSource(value) {
   const raw = String(value || '')
   if (!raw) return ''
   if (raw.startsWith('/') || raw.startsWith('data:')) return raw
-  if (/^heroes\/(?:musafir|kashif|barq|hakim|amin)(?:-[0-2]|-small)?\.png$/.test(raw)) {
+  if (/^heroes\/(?:musafir|kashif|barq|hakim|amin)(?:-[0-2]|-small|-picker)?\.png$/.test(raw)) {
     return `/assets/common.s/${raw}`
   }
   return `/assets/common.s/${raw.split('/').pop()}`
 }
 
 function setWatchGeometry() {
-  const width = appKind === 'musafir' ? 432 : 390
-  const height = appKind === 'musafir' ? 514 : 450
+  const [width, height] = appKind === 'musafir' ? geometrySelect.value.split('x').map(Number) : [390, 450]
   document.documentElement.style.setProperty('--watch-width', `${width}px`)
   document.documentElement.style.setProperty('--watch-height', `${height}px`)
   screen.dataset.app = appKind
@@ -221,6 +231,40 @@ function applyWidget(record) {
       node.style.height = `${node.naturalHeight}px`
     }
   }
+  if (type === widget.SCROLL_LIST) {
+    if (record.renderedData === options.data_array) return
+    record.renderedData = options.data_array
+    node.replaceChildren()
+    for (let index = 0; index < (options.data_count || 0); index++) {
+      const data = options.data_array[index]
+      const range = options.data_type_config?.find(value => index >= value.start && index <= value.end)
+      const template = options.item_config?.find(value => value.type_id === range?.type_id) || options.item_config?.[0]
+      if (!template) continue
+      const item = document.createElement('button')
+      item.className = 'zepp-list-item'
+      item.style.height = `${template.item_height}px`
+      item.style.marginBottom = `${options.item_space || 0}px`
+      item.style.backgroundColor = color(template.item_bg_color, '#171d25')
+      item.style.borderRadius = `${template.item_bg_radius || 0}px`
+      item.addEventListener('click', () => options.item_click_func?.(record, index, ''))
+      for (const view of template.image_view || []) {
+        const img = document.createElement('img')
+        applyGeometry(img, view)
+        img.src = imageSource(data[view.key])
+        img.alt = ''
+        item.append(img)
+      }
+      for (const view of template.text_view || []) {
+        const text = document.createElement('span')
+        applyGeometry(text, view)
+        text.style.color = color(view.color, '#f3f6fa')
+        text.style.fontSize = `${view.text_size || 20}px`
+        text.textContent = String(data[view.key] || '')
+        item.append(text)
+      }
+      node.append(item)
+    }
+  }
 }
 
 function createWidget(type, initial = {}) {
@@ -235,7 +279,11 @@ function createWidget(type, initial = {}) {
       node.addEventListener(type, callback)
     },
     setProperty(property, value) {
-      if (property === prop.MORE && value && typeof value === 'object') Object.assign(this.options, value)
+      if (type === widget.BUTTON && appKind === 'musafir' && property !== prop.VISIBLE &&
+          (property !== prop.MORE || !['x', 'y', 'w', 'h'].every(key => Number.isFinite(value?.[key])))) {
+        throw new Error('Native BUTTON update requires complete x,y,w,h: ' + String(this.options.text))
+      }
+      if ((property === prop.MORE || property === prop.UPDATE_DATA) && value && typeof value === 'object') Object.assign(this.options, value)
       else this.options[property] = value
       applyWidget(this)
       updateSnapshot()
@@ -254,6 +302,12 @@ function createWidget(type, initial = {}) {
   layer.append(node)
   applyWidget(record)
   return record
+}
+
+function deleteWidget(record) {
+  record?.node?.remove()
+  const index = widgets.indexOf(record)
+  if (index >= 0) widgets.splice(index, 1)
 }
 
 function getTextLayout(value, options = {}) {
@@ -428,17 +482,22 @@ function syntheticBridge(payload) {
         resolve({ ok: true, agent: 'Мусафир · локальная демонстрация' })
         return
       case 'TEXT_BEGIN':
-        textDrafts.set(params.id, params.textLength)
+        if (!textDrafts.has(params.id)) textDrafts.set(params.id, { length: params.textLength, text: '', sourceId: params.sourceId })
         resolve({ ok: true, id: params.id, state: 'uploading', textLength: params.textLength, receivedLength: 0 }); return
-      case 'TEXT_PART':
-        resolve({ ok: true, id: params.id, textLength: textDrafts.get(params.id), receivedLength: params.offset + Array.from(params.text).length }); return
+      case 'TEXT_PART': {
+        const draft = textDrafts.get(params.id)
+        if (!draft) { resolve({ ok: false, error: 'Черновик не найден' }); return }
+        if (params.offset === Array.from(draft.text).length) draft.text += params.text
+        resolve({ ok: true, id: params.id, textLength: draft.length, receivedLength: Array.from(draft.text).length }); return
+      }
       case 'TEXT_FINISH':
-        resolve({ ok: true, id: params.id, state: 'ready', textLength: textDrafts.get(params.id) }); return
+        resolve({ ok: true, id: params.id, state: 'ready', textLength: textDrafts.get(params.id)?.length }); return
       case 'LATEST_JOB':
         if (scenario === 'error') { resolve({ ok: false, error: 'Не удалось прочитать запись' }); return }
         resolve({ ok: true, job: scenarios[scenario] ?? null })
         return
       case 'AUDIO_BEGIN':
+        if (uploads.get(params.id)?.state === 'cancelled') { resolve({ ok: false, error: 'Запись отменена' }); return }
         if (!LOCAL_ID.test(params.id || '') || !Number.isInteger(params.totalBytes) || params.totalBytes <= 0) {
           resolve({ ok: false, error: 'Некорректная аудиозапись' })
           return
@@ -454,10 +513,16 @@ function syntheticBridge(payload) {
         return
       }
       case 'AUDIO_FINISH':
+        if (uploads.get(params.id)?.state === 'cancelled') { resolve({ ok: false, error: 'Запись отменена' }); return }
         audioStatusCalls = 0
         resolve({ ok: true, id: params.id, state: 'transcribing' })
         return
+      case 'AUDIO_CANCEL':
+        uploads.set(params.id, { state: 'cancelled', totalBytes: 0, receivedBytes: 0 })
+        resolve({ ok: true, id: params.id, state: 'cancelled' })
+        return
       case 'AUDIO_STATUS':
+        if (uploads.get(params.id)?.state === 'cancelled') { resolve({ ok: true, id: params.id, state: 'cancelled', text: '' }); return }
         audioStatusCalls += 1
         if (scenario !== 'review' && audioStatusCalls < 2) {
           resolve({ ok: true, id: params.id, state: 'transcribing', text: '',
@@ -481,7 +546,7 @@ function syntheticBridge(payload) {
         }
         jobStatusCalls = 0
         const chatId = params.chatId || params.id
-        const text = typeof params.text === 'string' ? params.text : reviewText
+        const text = typeof params.text === 'string' ? params.text : textDrafts.get(params.textId)?.text || reviewText
         const job = makeMusafirJob(params.id, 'completed', {
           chatId, mode: params.mode, text,
           summary: 'Синтетический ответ готов'
@@ -496,6 +561,7 @@ function syntheticBridge(payload) {
         return
       }
       case 'JOB_STATUS':
+        if (scenario === 'offline') { reject(new Error('Телефон не ответил')); return }
         if (scenario === 'error') {
           resolve({ ok: false, error: 'Не удалось получить статус задания' })
           return
@@ -712,7 +778,7 @@ function localReplace({ url }) {
 }
 
 function executableSource(source, exportedFactory) {
-  const clean = source.replace(/^\s*import\s+.*$/gm, '')
+  const clean = source.replace(/^\s*import\s+[\s\S]*?\s+from\s+['"][^'"]+['"]\s*;?\s*$/gm, '')
   return exportedFactory
     ? clean.replace(`export function ${exportedFactory}`, `function ${exportedFactory}`)
     : clean.replace(/^\s*export\s+/gm, '')
@@ -740,12 +806,14 @@ function evaluatePage(source, sourcePath) {
     'MUSAFIR_HEROES', 'MUSAFIR_CONTEXT_KEY', 'MUSAFIR_HERO_KEY',
     'replace', 'Page', 'LocalStorage', 'setWakeUpRelaunch',
     'setPageBrightTime', 'resetPageBrightTime', 'pauseDropWristScreenOff',
-    'resetDropWristScreenOff', 'Vibrator', 'VIBRATOR_SCENE_SHORT_STRONG', 'keyboardUI'
+    'resetDropWristScreenOff', 'Vibrator', 'VIBRATOR_SCENE_SHORT_STRONG', 'keyboardUI',
+    'deleteWidget', 'interaction', 'onGesture', 'offGesture', 'onKey', 'offKey',
+    'GESTURE_RIGHT', 'KEY_BACK', 'KEY_EVENT_CLICK'
   ]
   const values = [
     createWidget, widget, align, text_style, prop, { CLICK_UP: 'click' }, getTextLayout,
     visible => { document.querySelector('.os-header').hidden = !visible },
-    () => appKind === 'musafir' ? { width: 432, height: 514 } : { width: 390, height: 450 },
+    () => setWatchGeometry(),
     window.setTimeout.bind(window), window.clearTimeout.bind(window),
     { OPUS: 'opus' }, media.create, media.RECORDER,
     closeSyncMock, openSyncMock, 0, readSyncMock, ({ path: file }) => files.delete(file),
@@ -760,7 +828,9 @@ function evaluatePage(source, sourcePath) {
       setItem(key, value) { storage.set(key, value) }
     },
     () => {}, () => {}, () => {}, () => {}, () => {},
-    class { start({ mode }) { console.log('[preview] simulated vibration:', mode) } stop() {} }, 'short-strong', keyboardUI
+    class { start({ mode }) { console.log('[preview] simulated vibration:', mode) } stop() {} }, 'short-strong', keyboardUI,
+    deleteWidget, interaction, interaction.onGesture, interaction.offGesture, interaction.onKey, interaction.offKey,
+    interaction.GESTURE_RIGHT, interaction.KEY_BACK, interaction.KEY_EVENT_CLICK
   ]
   new Function(...names, `${executable}\n//# sourceURL=/${sourcePath}.js`)(...values)
 }
@@ -769,6 +839,8 @@ function destroyPage() {
   session += 1
   try { currentPage?.onDestroy?.() } catch (error) { console.warn('[preview] destroy', error) }
   currentPage = null
+  gestureCallback = null
+  keyCallback = null
   fileHandles.clear()
   widgets.splice(0)
   layer.replaceChildren()
@@ -854,9 +926,9 @@ function seedMusafirScenario(name) {
     }))
     return 'page/voice'
   }
-  if (name === 'recording') {
+  if (name === 'recording' || name === 'compose') {
     storage.set(MUSAFIR_CONTEXT_KEY, JSON.stringify(musafirContext({
-      chatId: null, autoRecord: true
+      chatId: null, autoRecord: false
     })))
     return 'page/voice'
   }
@@ -883,7 +955,7 @@ function seedMusafirScenario(name) {
     return 'page/voice'
   }
   if (name === 'offline') {
-    storage.set(MUSAFIR_CONTEXT_KEY, JSON.stringify(musafirContext()))
+    storage.set(MUSAFIR_CONTEXT_KEY, JSON.stringify(musafirContext({ jobId: RESULT_JOB_ID, openJob: true })))
     return 'page/voice'
   }
   if (name === 'error') {
@@ -917,7 +989,7 @@ async function rebuild(nextScenario) {
   }
   const expectedPhase = {
     ready: appKind === 'musafir' ? 'home' : 'ready',
-    recording: 'recording', uploading: 'ready', transcribing: 'ready',
+    compose: 'ready', recording: 'ready', uploading: 'ready', transcribing: 'ready',
     review: 'review', approval: 'approval', job: 'job', result: 'result',
     report: 'report', offline: 'error', error: 'error'
   }[nextScenario]
@@ -936,12 +1008,8 @@ async function previewShow(name = 'ready') {
 
   if (name === 'recording') {
     await rebuild(appKind === 'musafir' ? 'recording' : 'ready')
-    if (appKind === 'orca') {
-      await waitForPhase('ready')
-      currentPage.startRecording()
-    } else {
-      await waitForPhase('recording')
-    }
+    await waitForPhase('ready')
+    currentPage.startRecording()
     // ponytail: one honest demo offset makes the timer and pulse visible immediately.
     if (currentPage.recording) {
       currentPage.recording.startedAt = Date.now() - 7000
@@ -951,6 +1019,11 @@ async function previewShow(name = 'ready') {
       currentPage.clearAnimation?.()
       currentPage.animate?.()
     }
+    return window.previewState()
+  }
+  if (name === 'heroes' && appKind === 'musafir') {
+    await rebuild('ready')
+    currentPage.heroPicker()
     return window.previewState()
   }
   if (name === 'uploading' || name === 'transcribing') {
@@ -982,6 +1055,19 @@ window.previewState = () => ({
 })
 
 select.addEventListener('change', () => previewShow(select.value))
+geometrySelect.addEventListener('change', () => previewShow(select.value))
+document.querySelector('#hardware-back').addEventListener('click', () => {
+  keyCallback?.(interaction.KEY_BACK, interaction.KEY_EVENT_CLICK)
+})
+document.querySelector('#reopen').addEventListener('click', () => navigate(currentPath))
+let pointerStart = null
+screen.addEventListener('pointerdown', event => { pointerStart = { x: event.clientX, y: event.clientY } })
+screen.addEventListener('pointerup', event => {
+  if (pointerStart && event.clientX - pointerStart.x > 70 && Math.abs(event.clientY - pointerStart.y) < 60) {
+    gestureCallback?.(interaction.GESTURE_RIGHT)
+  }
+  pointerStart = null
+})
 appSelect.addEventListener('change', async () => {
   appKind = appSelect.value === 'orca' ? 'orca' : 'musafir'
   appName.textContent = appKind === 'orca' ? 'Orca' : 'Мусафир'

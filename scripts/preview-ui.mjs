@@ -40,7 +40,7 @@ function sourcePath(pathname) {
   if (pathname.startsWith('/assets/common.s/')) {
     const name = pathname.slice('/assets/common.s/'.length)
     if (/^[a-zA-Z0-9._-]+\.png$/.test(name)) return join(root, 'assets/common.s', name)
-    if (/^heroes\/(?:musafir|kashif|barq|hakim|amin)(?:-[0-2]|-small)?\.png$/.test(name)) {
+    if (/^heroes\/(?:musafir|kashif|barq|hakim|amin)(?:-[0-2]|-small|-picker)?\.png$/.test(name)) {
       return join(root, 'assets/common.s', ...name.split('/'))
     }
   }

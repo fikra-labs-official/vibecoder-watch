@@ -6,7 +6,7 @@ import { forwardVoiceRequest } from '../shared/bridge-client.js'
 import { MUSAFIR_HEROES, heroById } from '../shared/musafir-chat.js'
 
 const source = fs.readFileSync(new URL('../shared/musafir-page.js', import.meta.url), 'utf8')
-  .replace(/^import .*$/gm, '')
+  .replace(/^import[\s\S]*?from ['\"][^'\"]+['\"]\n/gm, '')
   .replace('export function createMusafirPage', 'function createMusafirPage')
 const flush = () => new Promise(resolve => setImmediate(resolve))
 
@@ -29,18 +29,22 @@ test('Musafir home CHAT_LIST reaches the bridge through the phone forwarding all
         addEventListener(type, callback) { this.events[type] = callback },
         options: { ...options, visible: true },
         setProperty(property, value) {
-          if (property === 'more') Object.assign(this.options, value)
+          if (kind === 3 && property === 'text') throw new Error('BUTTON prop.TEXT is forbidden')
+          if (kind === 3 && property === 'more' && !['x', 'y', 'w', 'h'].every(key => Number.isFinite(value[key]))) throw new Error('partial BUTTON MORE')
+          if (property === 'more' || property === 'update_data') Object.assign(this.options, value)
           else this.options[property] = value
         }
       }
       widgets.push(item)
       return item
     },
-    widget: { FILL_RECT: 1, TEXT: 2, BUTTON: 3, IMG: 4 },
+    widget: { FILL_RECT: 1, TEXT: 2, BUTTON: 3, IMG: 4, SCROLL_LIST: 5 },
     event: { CLICK_UP: 'click_up' },
     align: { LEFT: 1 },
     text_style: { WRAP: 1 },
-    prop: { TEXT: 'text', VISIBLE: 'visible', MORE: 'more' },
+    prop: { TEXT: 'text', VISIBLE: 'visible', MORE: 'more', UPDATE_DATA: 'update_data' },
+    onGesture() {}, offGesture() {}, GESTURE_RIGHT: 10,
+    onKey() {}, offKey() {}, KEY_BACK: 20, KEY_EVENT_CLICK: 21,
     setTimeout(callback, delay) {
       const id = ++nextTimer
       timers.set(id, { callback, delay })

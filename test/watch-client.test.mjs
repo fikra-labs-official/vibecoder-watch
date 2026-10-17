@@ -884,13 +884,18 @@ test('manual review edits are validated, persisted, and get a new id after every
   for (const invalid of ['', '   ', 'a\0b', 'a\rb', 'a\u0085b', '\ud800', 'x'.repeat(30001)]) {
     assert.throws(() => f.client.updateReviewText(invalid))
   }
-  assert.equal(writes.length, 0)
+  assert.deepEqual(writes, [{
+    id: '123-1', text: 'Исходный текст', textId: null,
+    edited: false, draftId: null, typed: false,
+    sourceId: '123-1', pendingSend: false
+  }])
 
   assert.equal(f.client.updateReviewText('Исправлено 🙂'), true)
   const firstId = draft.draftId
   assert.deepEqual(draft, {
     id: '123-1', text: 'Исправлено 🙂', textId: null,
-    edited: true, draftId: firstId, pendingSend: false
+    edited: true, draftId: firstId, typed: false,
+    sourceId: '123-1', pendingSend: false
   })
   assert.equal(f.client.getState().edited, true)
   assert.equal(f.client.getState().text, 'Исправлено 🙂')
@@ -900,6 +905,168 @@ test('manual review edits are validated, persisted, and get a new id after every
   assert.equal(draft.text, 'Исправлено ещё раз')
   assert.equal(f.client.updateReviewText('Строка\nс табом\tи семьёй 👨‍👩‍👧‍👦'), true)
   assert.match(draft.text, /👨‍👩‍👧‍👦/)
+  f.client.close()
+})
+
+test('typed compose preserves exact Unicode whitespace and uploads only after explicit Send', async () => {
+  let draft = null
+  const text = `  ${'а'.repeat(998)}🙂${'б'.repeat(1001)}\n`
+  const parts = []
+  const f = fixture(({ method, params }) => {
+    if (method === 'STATUS') return Promise.resolve({ ok: true, agent: 'Мусафир' })
+    if (method === 'LATEST_JOB') return Promise.resolve({ ok: true, job: null })
+    if (method === 'TEXT_BEGIN') {
+      assert.deepEqual(params, { id: draft.id, sourceId: null,
+        textLength: Array.from(text).length })
+      return Promise.resolve({ ok: true, id: params.id, textLength: params.textLength,
+        receivedLength: 0 })
+    }
+    if (method === 'TEXT_PART') {
+      parts.push(params)
+      return Promise.resolve({ ok: true, id: params.id,
+        textLength: Array.from(text).length,
+        receivedLength: params.offset + Array.from(params.text).length })
+    }
+    if (method === 'TEXT_FINISH') return Promise.resolve({ ok: true, id: params.id,
+      state: 'ready', textLength: Array.from(text).length })
+    if (method === 'SEND_TEXT') {
+      assert.deepEqual(params, { id: draft.id, textId: draft.id })
+      return Promise.resolve({ ok: true, id: params.id, state: 'queued' })
+    }
+    throw new Error(`unexpected ${method}`)
+  }, {
+    readDraft: () => draft,
+    writeDraft: value => { draft = value }
+  })
+  f.client.start()
+  await flush()
+  assert.equal(f.client.createTypedReview(text), true)
+  assert.equal(f.client.getState().text, text)
+  assert.deepEqual(draft, { id: draft.id, text, textId: null, edited: true,
+    draftId: draft.id, typed: true, sourceId: null, pendingSend: false })
+  assert.deepEqual(f.sent.map(item => item.payload.method), ['STATUS', 'LATEST_JOB'])
+
+  assert.equal(f.client.sendText(), true)
+  await flush()
+  assert.deepEqual(parts.map(part => Array.from(part.text).length), [1000, 1000, 3])
+  assert.equal(parts.map(part => part.text).join(''), text)
+  assert.equal(f.sent.filter(item => item.payload.method === 'SEND_TEXT').length, 1)
+  f.client.close()
+})
+
+test('editing a typed draft after a partial upload creates a new immutable job id', async () => {
+  let draft = null
+  const begins = []
+  const sends = []
+  const f = fixture(({ method, params }) => {
+    if (method === 'STATUS') return Promise.resolve({ ok: true, agent: 'Мусафир' })
+    if (method === 'LATEST_JOB') return Promise.resolve({ ok: true, job: null })
+    if (method === 'TEXT_BEGIN') {
+      begins.push(params)
+      return Promise.resolve({ ok: true, id: params.id, textLength: params.textLength,
+        receivedLength: 0 })
+    }
+    if (method === 'TEXT_PART') {
+      if (params.id === begins[0].id) {
+        return Promise.reject(new Error('partial write lost'))
+      }
+      return Promise.resolve({ ok: true, id: params.id,
+        textLength: Array.from(draft.text).length,
+        receivedLength: params.offset + Array.from(params.text).length })
+    }
+    if (method === 'TEXT_FINISH') return Promise.resolve({ ok: true, id: params.id,
+      state: 'ready', textLength: Array.from(draft.text).length })
+    if (method === 'SEND_TEXT') {
+      sends.push(params)
+      return Promise.resolve({ ok: true, id: params.id, state: 'queued' })
+    }
+    throw new Error(`unexpected ${method}`)
+  }, {
+    readDraft: () => draft,
+    writeDraft: value => { draft = value }
+  })
+  f.client.start()
+  await flush()
+  f.client.createTypedReview('Первый текст')
+  const firstId = draft.id
+  f.client.sendText()
+  await flush()
+  assert.equal(f.client.getState().phase, 'review')
+  assert.equal(draft.id, firstId)
+
+  f.client.updateReviewText('Исправленный текст')
+  const secondId = draft.id
+  assert.notEqual(secondId, firstId)
+  assert.equal(draft.draftId, secondId)
+  f.client.sendText()
+  await flush()
+  assert.deepEqual(begins.map(item => item.id), [firstId, secondId])
+  assert.deepEqual(begins.map(item => item.sourceId), [null, null])
+  assert.deepEqual(sends, [{ id: secondId, textId: secondId }])
+  f.client.close()
+})
+
+test('canceling text save fences its late reply and never sends the command', async () => {
+  let draft = null
+  let resolveBegin
+  const f = fixture(({ method, params }) => {
+    if (method === 'STATUS') return Promise.resolve({ ok: true, agent: 'Мусафир' })
+    if (method === 'LATEST_JOB') return Promise.resolve({ ok: true, job: null })
+    if (method === 'TEXT_BEGIN') return new Promise(resolve => { resolveBegin = () => resolve({
+      ok: true, id: params.id, textLength: params.textLength, receivedLength: 0
+    }) })
+    throw new Error(`unexpected ${method}`)
+  }, {
+    readDraft: () => draft,
+    writeDraft: value => { draft = value }
+  })
+  f.client.start()
+  await flush()
+  f.client.createTypedReview('Не отправлять')
+  assert.equal(f.client.sendText(), true)
+  assert.equal(f.client.getState().phase, 'saving-text')
+  assert.equal(f.client.cancelBeforeSend(), true)
+  assert.equal(f.client.getState().phase, 'review')
+  resolveBegin()
+  await flush()
+  assert.equal(f.client.getState().phase, 'review')
+  assert.equal(draft.pendingSend, false)
+  assert.equal(f.sent.some(item => ['TEXT_PART', 'TEXT_FINISH', 'SEND_TEXT']
+    .includes(item.payload.method)), false)
+  f.client.close()
+})
+
+test('audio cancellation fences late upload and ASR replies and requests remote cleanup', async () => {
+  let resolveBegin
+  let resolveStatus
+  const f = fixture(({ method, params }) => {
+    if (method === 'AUDIO_BEGIN') return new Promise(resolve => { resolveBegin = () => resolve({
+      ok: true, id: params.id, receivedBytes: 0, totalBytes: params.totalBytes
+    }) })
+    if (method === 'AUDIO_STATUS') return new Promise(resolve => { resolveStatus = () => resolve({
+      ok: true, id: params.id, state: 'ready', text: 'Слишком поздно'
+    }) })
+    if (method === 'AUDIO_CANCEL') return Promise.resolve({ ok: true, id: params.id,
+      state: 'cancelled' })
+    throw new Error(`unexpected ${method}`)
+  })
+  const uploadId = '123456789-1'
+  const uploading = f.client.uploadAudio({ id: uploadId, totalBytes: 1,
+    readChunk: () => [1] })
+  assert.equal(f.client.cancelAudio(uploadId), true)
+  resolveBegin()
+  assert.equal(await uploading, false)
+  assert.equal(f.sent.some(item => ['AUDIO_PART', 'AUDIO_CHUNK', 'AUDIO_FINISH']
+    .includes(item.payload.method)), false)
+
+  const asrId = '123456789-2'
+  assert.equal(f.client.resumeAudio(asrId), true)
+  assert.equal(f.client.cancelAudio(asrId), true)
+  resolveStatus()
+  await flush()
+  assert.equal(f.client.getState().phase, 'ready')
+  assert.deepEqual(f.sent.filter(item => item.payload.method === 'AUDIO_CANCEL')
+    .map(item => item.payload.params.id), [uploadId, asrId])
   f.client.close()
 })
 

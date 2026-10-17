@@ -36,7 +36,9 @@ export function normalizeContext(value) {
     mode: source.mode === 'research' ? 'research' : 'task',
     jobId,
     openJob: jobId !== null && source.openJob === true,
-    autoRecord: source.autoRecord === true,
+    // Opening a conversation always lands on the compose screen. Older builds
+    // persisted autoRecord=true; treat it as stale instead of opening the mic.
+    autoRecord: false,
     pendingSend: jobId !== null && source.pendingSend === true
   }
 }
@@ -90,9 +92,9 @@ export function createMusafirVoiceRoute({ request, context, save = () => {} }) {
   return async function route(payload, options) {
     const { method, params = {} } = payload || {}
     if (method === 'STATUS') {
-      // Recording is local. A deliberate New/Continue action must not wait for
-      // network health; upload and job RPCs still verify the actual connection.
-      if (context.autoRecord) return { ok: true, agent: 'Мусафир' }
+      // Compose is local. New/Continue must open even while the bridge is down;
+      // upload and job RPCs still verify the actual connection.
+      if (!context.openJob && !context.pendingSend) return { ok: true, agent: 'Мусафир' }
       return request({ method: 'STATUS', params: {} }, options)
     }
     if (method === 'LATEST_JOB') {

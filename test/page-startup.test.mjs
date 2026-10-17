@@ -33,7 +33,10 @@ export function pageFixture({ media = () => { throw Error('recorder unavailable'
   const displayCalls = []
   const vibrationCalls = []
   const keyboardCalls = []
+  const interactionCalls = []
   let keyboardOptions
+  let gestureCallback = null
+  let keyCallback = null
   const keyboardUI = keyboard || {
     inputType: { CHAR: 1, JSKB: 4 },
     createKeyboard(options) { keyboardOptions = options; keyboardCalls.push({ action: 'open', options }); return {} },
@@ -55,6 +58,15 @@ export function pageFixture({ media = () => { throw Error('recorder unavailable'
     createMusafirVoiceRoute, normalizeContext, heroById, MUSAFIR_CONTEXT_KEY, MUSAFIR_HERO_KEY,
     replace(value) { replacements.push(value) },
     ...display, keyboardUI,
+    interaction: {
+      GESTURE_RIGHT: 4,
+      KEY_BACK: 8,
+      KEY_EVENT_CLICK: 16,
+      onGesture({ callback }) { gestureCallback = callback; interactionCalls.push('onGesture') },
+      offGesture() { gestureCallback = null; interactionCalls.push('offGesture') },
+      onKey({ callback }) { keyCallback = callback; interactionCalls.push('onKey') },
+      offKey() { keyCallback = null; interactionCalls.push('offKey') }
+    },
     setStatusBarVisible: value => displayCalls.push({ name: 'setStatusBarVisible', visible: value }),
     LocalStorage: class {
       constructor() { if (storageError) throw Error('storage unavailable') }
@@ -74,6 +86,12 @@ export function pageFixture({ media = () => { throw Error('recorder unavailable'
       kind,
       options: { ...options, visible: true },
       setProperty(key, value) {
+        if (kind === 3 && key === 'text') throw new Error('BUTTON prop.TEXT is invalid on native Zepp OS')
+        if (kind === 3 && key === 'more') {
+          for (const required of ['x', 'y', 'w', 'h', 'text']) {
+            assert.ok(Object.hasOwn(value, required), `BUTTON prop.MORE requires ${required}`)
+          }
+        }
         if (key === 'more') Object.assign(this.options, value)
         else this.options[key] = value
       }
@@ -97,8 +115,10 @@ export function pageFixture({ media = () => { throw Error('recorder unavailable'
     return Promise.resolve(reply ? reply(payload) : payload.method === 'STATUS'
       ? { ok: true, agent: 'Мусафир' } : { ok: true, job: null })
   }
-  return { page, requests, timers, widgets, displayCalls, vibrationCalls, keyboardCalls,
+  return { page, requests, timers, widgets, displayCalls, vibrationCalls, keyboardCalls, interactionCalls,
     keyboard: () => keyboardOptions, storage, replacements, mediaCalls: () => mediaCalls,
+    gesture(event = 4) { return gestureCallback && gestureCallback(event) },
+    key(key = 8, event = 16) { return keyCallback && keyCallback(key, event) },
     advance(ms) { clock += ms },
     tick(delay) {
       const match = [...timers].find(([, timer]) => timer.delay === delay)
@@ -120,7 +140,7 @@ test('startup connects without opening the microphone', async () => {
   f.page.onDestroy()
 })
 
-test('Musafir New task starts local recording without waiting for Mac or loading a previous answer', async () => {
+test('Musafir New task ignores legacy autoRecord and opens local compose without the Mac', async () => {
   const storage = new Map([['musafir-context', JSON.stringify({ target: 'musafir', chatId: null,
     mode: 'task', jobId: null, openJob: false, autoRecord: true })], ['musafir-hero', 'barq']])
   let starts = 0
@@ -129,13 +149,17 @@ test('Musafir New task starts local recording without waiting for Mac or loading
   }), reply: () => { throw Error('Mac must not be needed for local recording') } })
   f.page.build()
   await flush()
-  f.tick(0)
-  assert.equal(starts, 1)
-  assert.equal(f.page.client.getState().phase, 'recording')
+  assert.equal(starts, 0)
+  assert.equal(f.page.client.getState().phase, 'ready')
   assert.equal(f.requests.length, 0)
   assert.equal(f.page.hero.id, 'barq')
-  assert.equal(JSON.parse(storage.get('musafir-pending-context')).chatId, null)
-  assert.equal(JSON.parse(storage.get('musafir-context')).autoRecord, false)
+  assert.equal(f.page.statusWidget.options.text, 'Новая задача')
+  assert.equal(f.page.primaryButton.options.text, 'Надиктовать')
+  assert.equal(f.page.secondaryButton.options.text, 'Написать')
+  assert.equal(f.page.backButton.options.x, 24)
+  assert.equal(f.page.backButton.options.h >= 48, true)
+  assert.deepEqual([f.page.brandWidget.options.w, f.page.brandWidget.options.h], [80, 80])
+  assert.equal(f.page.brandWidget.options.src, 'heroes/barq.png')
   f.page.onDestroy()
 })
 
@@ -171,7 +195,7 @@ test('Musafir explicit task resumes after sleep and animates its cosmetic hero o
   reopened.page.onDestroy()
 })
 
-test('Musafir result exposes full report and continuing scopes its draft to the accepted chat', async () => {
+test('Musafir result exposes full report and Continue returns to compose without the microphone', async () => {
   const id = '1700000000000-31'
   const storage = new Map([['musafir-context', JSON.stringify({ target: 'musafir', chatId: id,
     mode: 'research', jobId: id, openJob: true })]])
@@ -189,12 +213,14 @@ test('Musafir result exposes full report and continuing scopes its draft to the 
   assert.equal(f.replacements.at(-1).url, 'page/report')
   f.page.primaryButton.options.click_func()
   assert.equal(f.page.draftStorageKey, 'voice-draft:musafir:' + id)
-  assert.equal(JSON.parse(storage.get('musafir-pending-context')).chatId, id)
-  assert.equal(JSON.parse(storage.get('pending-audio')).destinationKey, f.page.draftStorageKey)
+  assert.equal(f.page.client.getState().phase, 'ready')
+  assert.equal(f.page.primaryButton.options.text, 'Надиктовать')
+  assert.equal(f.mediaCalls(), 0)
+  assert.equal(storage.get('pending-audio'), undefined)
   f.page.onDestroy()
 })
 
-test('Musafir never overwrites another chat audio when a stale Continue destination auto-starts', async () => {
+test('Musafir never overwrites another chat audio when a stale Continue destination opens compose', async () => {
   const audio = { id: '1700000000000-41', fileName: 'saved.opus', accepted: true,
     totalBytes: 100, destinationKey: 'voice-draft:musafir:legacy' }
   const storage = new Map([['pending-audio', JSON.stringify(audio)],
@@ -205,10 +231,10 @@ test('Musafir never overwrites another chat audio when a stale Continue destinat
   const f = pageFixture({ chats: true, storage })
   f.page.build()
   await flush()
-  f.tick(0)
   assert.equal(f.mediaCalls(), 0)
   assert.deepEqual(JSON.parse(storage.get('pending-audio')), audio)
-  assert.equal(f.replacements.at(-1).url, 'page/index')
+  assert.equal(f.page.client.getState().phase, 'ready')
+  assert.equal(f.replacements.length, 0)
   f.page.onDestroy()
 })
 
@@ -967,11 +993,12 @@ test('cancel stops once, deletes the recording and never uploads', async () => {
   f.page.startRecording()
   f.page.cancelRecording()
   f.page.cancelRecording()
-  f.tick(250)
   await flush()
   assert.equal(f.stops(), 1)
   assert.equal(f.page.client.getState().phase, 'ready')
-  assert.equal(f.requests.some(x => x.method.startsWith('AUDIO_')), false)
+  assert.equal(f.requests.some(x => ['AUDIO_BEGIN', 'AUDIO_PART', 'AUDIO_CHUNK',
+    'AUDIO_FINISH', 'AUDIO_STATUS'].includes(x.method)), false)
+  assert.equal(f.requests.filter(x => x.method === 'AUDIO_CANCEL').length, 1)
   assert.ok(f.removed.length >= 2)
   f.page.onDestroy()
 })
@@ -1194,8 +1221,6 @@ test('sleep on transcript restores draft instead of an older result, without sen
   const reopened = pageFixture({ storage, reply })
   reopened.page.build()
   await flush()
-  reopened.tick(0)
-  await flush()
   assert.equal(reopened.page.client.getState().phase, 'review')
   assert.equal(reopened.page.bodyWidget.options.text, 'Проверка')
   assert.equal(reopened.requests.some(x => ['SEND_TEXT', 'AUDIO_BEGIN'].includes(x.method)), false)
@@ -1204,9 +1229,9 @@ test('sleep on transcript restores draft instead of an older result, without sen
   const accepted = pageFixture({ storage, reply })
   accepted.page.build()
   await flush()
-  assert.equal(accepted.page.client.getState().phase, 'result')
-  assert.equal(accepted.page.bodyWidget.options.text, 'Новый ответ')
-  assert.equal(storage.get('pending-audio'), '')
+  assert.equal(accepted.page.client.getState().phase, 'review')
+  assert.equal(accepted.page.bodyWidget.options.text, 'Проверка')
+  assert.equal(JSON.parse(storage.get('pending-audio')).accepted, true)
   assert.equal([...accepted.timers.values()].some(t => t.delay === 0), false)
   accepted.page.onDestroy()
 })
@@ -1229,7 +1254,7 @@ test('microphone pulse starts only after native start and timer stops with the m
   let f
   f = recordingFixture({ start() {
     assert.equal(f.page.recordDot.options.visible, false)
-    assert.match(f.page.bodyWidget.options.text, /Включаю микрофон/)
+    assert.equal(f.page.client.getState().phase, 'ready')
   } })
   f.page.build()
   await flush()
@@ -1419,7 +1444,6 @@ test('recording renews the finite display override before it expires', async () 
   assert.equal(f.displayCalls.filter(c => c.name === 'setPageBrightTime').length, brightCount + 1)
   assert.equal(f.displayCalls.filter(c => c.name === 'pauseDropWristScreenOff').length, wristCount + 1)
   f.page.cancelRecording()
-  f.tick(250)
   f.page.onDestroy()
 })
 
@@ -1551,6 +1575,236 @@ test('missing or failing keyboard keeps the review and all original text', async
   }
 })
 
+test('Musafir typed compose handles cancel, blank input and exact text without RPC before Send', async () => {
+  const storage = new Map([[MUSAFIR_CONTEXT_KEY, JSON.stringify({
+    target: 'musafir', chatId: null, mode: 'task', jobId: null, openJob: false
+  })]])
+  const text = '  Напомни позвонить 🙂\n'
+  let uploaded = ''
+  const f = pageFixture({ chats: true, storage, reply: ({ method, params }) => {
+    if (method === 'TEXT_BEGIN') return { ok: true, id: params.id,
+      textLength: params.textLength, receivedLength: 0 }
+    if (method === 'TEXT_PART') {
+      uploaded += params.text
+      return { ok: true, id: params.id, textLength: Array.from(text).length,
+        receivedLength: params.offset + Array.from(params.text).length }
+    }
+    if (method === 'TEXT_FINISH') return { ok: true, id: params.id,
+      state: 'ready', textLength: Array.from(text).length }
+    if (method === 'SEND_TEXT') return { ok: true, id: params.id, chatId: params.id,
+      mode: params.mode, state: 'queued', text: '', result: '', reportLength: 0 }
+    throw new Error(`unexpected ${method}`)
+  } })
+  f.page.build()
+  await flush()
+  assert.equal(f.requests.length, 0)
+
+  f.page.secondaryButton.options.click_func()
+  f.keyboard().onCancel()
+  assert.equal(f.page.client.getState().phase, 'ready')
+  assert.equal(f.requests.length, 0)
+
+  f.page.secondaryButton.options.click_func()
+  f.keyboard().onComplete(null, { data: '   ' })
+  assert.equal(f.page.client.getState().phase, 'ready')
+  assert.match(f.page.stageWidget.options.text, /Введите/)
+  assert.equal(f.requests.length, 0)
+
+  f.page.writeTask()
+  f.keyboard().onComplete(null, { data: text })
+  const draft = JSON.parse(storage.get(f.page.draftStorageKey))
+  assert.equal(f.page.client.getState().phase, 'review')
+  assert.equal(f.page.client.getState().text, text)
+  assert.deepEqual({ typed: draft.typed, sourceId: draft.sourceId,
+    sameId: draft.id === draft.draftId, text: draft.text }, {
+    typed: true, sourceId: null, sameId: true, text
+  })
+  assert.equal(f.requests.length, 0)
+
+  f.page.primaryButton.options.click_func()
+  await flush()
+  assert.equal(uploaded, text)
+  assert.deepEqual(f.requests.map(item => item.method),
+    ['TEXT_BEGIN', 'TEXT_PART', 'TEXT_FINISH', 'SEND_TEXT'])
+  f.page.onDestroy()
+})
+
+test('Musafir Back preserves review, all native back paths navigate, and destroy unregisters them', async () => {
+  const makeStorage = () => new Map([[MUSAFIR_CONTEXT_KEY, JSON.stringify({
+    target: 'musafir', chatId: null, mode: 'task', jobId: null, openJob: false
+  })]])
+  const storage = makeStorage()
+  const first = pageFixture({ chats: true, storage })
+  first.page.build()
+  await flush()
+  first.page.writeTask()
+  first.keyboard().onComplete(null, { data: 'Сохранить этот черновик' })
+  first.page.backButton.options.click_func()
+  assert.equal(first.replacements.at(-1).url, 'page/index')
+  assert.equal(JSON.parse(storage.get(first.page.draftStorageKey)).text, 'Сохранить этот черновик')
+  first.page.onDestroy()
+  assert.deepEqual(first.interactionCalls.slice(-2), ['offGesture', 'offKey'])
+
+  const reopened = pageFixture({ chats: true, storage })
+  reopened.page.build()
+  await flush()
+  assert.equal(reopened.page.client.getState().phase, 'review')
+  assert.equal(reopened.page.client.getState().text, 'Сохранить этот черновик')
+  for (const phase of ['connecting', 'ready', 'recording', 'stopping', 'uploading',
+    'transcribing', 'review', 'saving-text', 'sending', 'job', 'approval',
+    'result', 'unknown', 'error']) {
+    reopened.page.render({ phase, state: phase === 'job' ? 'running' : undefined,
+      id: '100000-1', jobId: '100000-1', text: 'Текст', result: 'Ответ', error: 'Ошибка' })
+    assert.equal(reopened.page.backButton.options.visible, true, phase)
+  }
+  reopened.page.onDestroy()
+
+  for (const invoke of [fixture => fixture.gesture(), fixture => fixture.key()]) {
+    const f = pageFixture({ chats: true, storage: makeStorage() })
+    f.page.build()
+    await flush()
+    assert.equal(invoke(f), true)
+    assert.equal(f.replacements.at(-1).url, 'page/index')
+    f.page.onDestroy()
+  }
+})
+
+test('Musafir Back cancels an in-flight text save and ignores its late completion', async () => {
+  const storage = new Map([[MUSAFIR_CONTEXT_KEY, JSON.stringify({
+    target: 'musafir', chatId: null, mode: 'task', jobId: null, openJob: false
+  })]])
+  let resolveBegin
+  const f = pageFixture({ chats: true, storage, reply: ({ method, params }) => {
+    if (method === 'TEXT_BEGIN') return new Promise(resolve => { resolveBegin = () => resolve({
+      ok: true, id: params.id, textLength: params.textLength, receivedLength: 0
+    }) })
+    throw new Error(`unexpected ${method}`)
+  } })
+  f.page.build()
+  await flush()
+  f.page.writeTask()
+  f.keyboard().onComplete(null, { data: 'Не отправлять' })
+  f.page.primaryButton.options.click_func()
+  assert.equal(f.page.client.getState().phase, 'saving-text')
+  f.page.backButton.options.click_func()
+  assert.equal(f.page.client.getState().phase, 'review')
+  assert.equal(f.replacements.at(-1).url, 'page/index')
+  resolveBegin()
+  await flush()
+  assert.equal(f.requests.some(item => ['TEXT_PART', 'TEXT_FINISH', 'SEND_TEXT'].includes(item.method)), false)
+  f.page.onDestroy()
+})
+
+test('Musafir explicit review Cancel deletes its checkpoint while Back does not', async () => {
+  const storage = new Map([[MUSAFIR_CONTEXT_KEY, JSON.stringify({
+    target: 'musafir', chatId: null, mode: 'task', jobId: null, openJob: false
+  })]])
+  const f = pageFixture({ chats: true, storage })
+  f.page.build()
+  await flush()
+  f.page.writeTask()
+  f.keyboard().onComplete(null, { data: 'Удалить по явной отмене' })
+  assert.equal(f.page.secondaryButton.options.text, 'Отмена')
+  f.page.secondaryButton.options.click_func()
+  assert.equal(f.page.client.getState().phase, 'ready')
+  assert.equal(storage.get(f.page.draftStorageKey), '')
+  assert.equal(storage.get('musafir-pending-context'), '')
+  f.page.onDestroy()
+})
+
+test('Musafir failed native re-record leaves the previous review and draft intact', async () => {
+  const storage = new Map([[MUSAFIR_CONTEXT_KEY, JSON.stringify({
+    target: 'musafir', chatId: null, mode: 'task', jobId: null, openJob: false
+  })]])
+  const f = pageFixture({ chats: true, storage, media: () => ({
+    setFormat() {}, start() { return false }, stop() {}
+  }) })
+  f.page.build()
+  await flush()
+  f.page.writeTask()
+  f.keyboard().onComplete(null, { data: 'Старый черновик' })
+  const saved = storage.get(f.page.draftStorageKey)
+  f.page.startRecording()
+  assert.equal(f.page.client.getState().phase, 'review')
+  assert.equal(f.page.client.getState().text, 'Старый черновик')
+  assert.equal(storage.get(f.page.draftStorageKey), saved)
+  f.page.onDestroy()
+})
+
+test('unaccepted legacy audio is discarded and never uploaded on reopen', async () => {
+  const storage = new Map([[MUSAFIR_CONTEXT_KEY, JSON.stringify({
+    target: 'musafir', chatId: null, mode: 'task', jobId: null, openJob: false
+  })], ['pending-audio', JSON.stringify({
+    id: '100000-1', fileName: 'legacy.opus', totalBytes: 100, accepted: false,
+    destinationKey: 'voice-draft:musafir:new'
+  })]])
+  const removed = []
+  const f = pageFixture({ chats: true, storage, files: {
+    rmSync({ path }) { removed.push(path) }
+  } })
+  f.page.build()
+  await flush()
+  assert.equal(storage.get('pending-audio'), '')
+  assert.deepEqual(removed, ['legacy.opus'])
+  assert.equal(f.requests.some(item => item.method.startsWith('AUDIO_')), false)
+  f.page.onDestroy()
+})
+
+test('recording cancellation survives immediate destroy, while explicit Stop consent resumes once', async () => {
+  const context = JSON.stringify({ target: 'musafir', chatId: null, mode: 'task', jobId: null, openJob: false })
+  const makeNative = shared => ({
+    media: () => ({
+      setFormat(_codec, { target_file }) { shared.target = target_file },
+      start() {},
+      stop() { shared.stops += 1 }
+    }),
+    files: {
+      statSync({ path }) { assert.equal(`data://${path}`, shared.target); return { size: 1 } },
+      openSync() { return 7 },
+      readSync({ buffer }) { new Uint8Array(buffer)[0] = 1; return 1 },
+      closeSync() {},
+      rmSync({ path }) { shared.removed.push(path) }
+    }
+  })
+
+  for (const exit of ['cancel', 'destroy-active', 'stop-cancel']) {
+    const storage = new Map([[MUSAFIR_CONTEXT_KEY, context]])
+    const shared = { target: null, stops: 0, removed: [] }
+    const first = pageFixture({ chats: true, storage, ...makeNative(shared) })
+    first.page.build(); await flush(); first.page.startRecording()
+    if (exit === 'cancel') first.page.cancelRecording()
+    if (exit === 'stop-cancel') { first.page.stopRecording(false); first.page.cancelRecording() }
+    first.page.onDestroy()
+    const reopened = pageFixture({ chats: true, storage, ...makeNative(shared) })
+    reopened.page.build(); await flush()
+    assert.equal(reopened.requests.some(item => ['AUDIO_BEGIN', 'AUDIO_PART', 'AUDIO_CHUNK',
+      'AUDIO_FINISH', 'AUDIO_STATUS'].includes(item.method)), false, exit)
+    assert.equal(storage.get('pending-audio'), '')
+    reopened.page.onDestroy()
+  }
+
+  const storage = new Map([[MUSAFIR_CONTEXT_KEY, context]])
+  const shared = { target: null, stops: 0, removed: [] }
+  const reply = ({ method, params }) => {
+    if (method === 'AUDIO_BEGIN') return { ok: true, id: params.id,
+      receivedBytes: 0, totalBytes: 1 }
+    if (method === 'AUDIO_CHUNK') return { ok: true, id: params.id,
+      receivedBytes: 1, totalBytes: 1 }
+    if (method === 'AUDIO_FINISH') return { ok: true, id: params.id, state: 'transcribing' }
+    if (method === 'AUDIO_CANCEL') return { ok: true, id: params.id, state: 'cancelled' }
+    throw new Error(`unexpected ${method}`)
+  }
+  const stopped = pageFixture({ chats: true, storage, reply, ...makeNative(shared) })
+  stopped.page.build(); await flush(); stopped.page.startRecording(); stopped.page.stopRecording(false)
+  stopped.page.onDestroy()
+  assert.equal(JSON.parse(storage.get('pending-audio')).uploadConsent, true)
+  const resumed = pageFixture({ chats: true, storage, reply, ...makeNative(shared) })
+  resumed.page.build(); await flush(); resumed.tick(0); await flush()
+  assert.deepEqual(resumed.requests.map(item => item.method),
+    ['AUDIO_BEGIN', 'AUDIO_CHUNK', 'AUDIO_FINISH'])
+  resumed.page.onDestroy()
+})
+
 test('accepted and submitting states never claim the agent is already working', async () => {
   for (const kind of ['musafir', 'orca', 'claude', 'codex']) {
     const storage = new Map(kind === 'musafir' ? [] : [['voice-destination', JSON.stringify({
@@ -1604,14 +1858,44 @@ test('an edited draft and its pending audio cannot be restored into a different 
   await flush()
   first.page.client.updateReviewText('Исправлено только для A')
   first.page.savePendingAudio({ id, fileName: 'draft.opus', totalBytes: 1024, accepted: true })
+  const savedPending = storage.get('pending-audio')
   first.page.onDestroy()
   storage.set('voice-destination', destination('project-b'))
-  const second = pageFixture({ kind: 'claude', storage })
+  const removed = []
+  const second = pageFixture({ kind: 'claude', storage,
+    media: () => { throw new Error('foreign recording must not open the microphone') },
+    files: { rmSync({ path }) { removed.push(path) } }
+  })
   second.page.build()
   await flush()
   assert.equal(second.page.client.getState().phase, 'ready')
   assert.equal(second.page.pendingAudio, null)
   assert.notEqual(first.page.draftStorageKey, second.page.draftStorageKey)
   assert.equal(JSON.parse(storage.get(first.page.draftStorageKey)).text, 'Исправлено только для A')
+  second.page.primaryButton.options.click_func()
+  assert.equal(second.page.client.getState().phase, 'error')
+  assert.match(second.page.bodyWidget.options.text, /другой задачи.*не потерять/s)
+  assert.equal(second.page.primaryButton.options.text, 'Claude')
+  assert.equal(second.mediaCalls(), 0)
+  assert.equal(storage.get('pending-audio'), savedPending)
+  assert.deepEqual(removed, [])
+  second.page.primaryButton.options.click_func()
+  assert.equal(second.replacements.at(-1).url, 'page/index')
   second.page.onDestroy()
+
+  const unaccepted = { ...JSON.parse(savedPending), accepted: false, uploadConsent: false }
+  storage.set('pending-audio', JSON.stringify(unaccepted))
+  storage.set('voice-destination', destination('project-c'))
+  const third = pageFixture({ kind: 'claude', storage,
+    media: () => { throw new Error('unaccepted foreign recording must also stay untouched') },
+    files: { rmSync({ path }) { removed.push(path) } }
+  })
+  third.page.build()
+  await flush()
+  third.page.primaryButton.options.click_func()
+  assert.equal(third.page.client.getState().phase, 'error')
+  assert.equal(third.mediaCalls(), 0)
+  assert.equal(storage.get('pending-audio'), JSON.stringify(unaccepted))
+  assert.deepEqual(removed, [])
+  third.page.onDestroy()
 })

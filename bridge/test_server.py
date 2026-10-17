@@ -10,7 +10,8 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from http.server import ThreadingHTTPServer
 
-from server import Bridge, Invalid, MAX_AUDIO, MAX_TEXT_CHARS, MAX_TEXT_PART_CHARS, make_handler
+from server import (Bridge, Invalid, MAX_AUDIO, MAX_RECENT_DRAFTS, MAX_TEXT_CHARS,
+                    MAX_TEXT_PART_CHARS, make_handler)
 
 
 class FakeHermes:
@@ -482,6 +483,95 @@ class BridgeTests(unittest.TestCase):
             with self.assertRaises(Invalid):
                 self.bridge.rpc('AUDIO_CHUNK', {'id': '123-1', 'index': 0, 'data': data})
 
+    def test_audio_cancel_before_begin_is_idempotent_and_prevents_resurrection(self):
+        expected = {'ok': True, 'id': '123-1', 'state': 'cancelled',
+                    'receivedBytes': 0, 'totalBytes': 0, 'text': '',
+                    'textOffset': 0, 'textLength': 0, 'textComplete': True,
+                    'error': ''}
+        self.assertEqual(self.bridge.rpc('AUDIO_CANCEL', {'id': '123-1'}), expected)
+        self.assertEqual(self.bridge.rpc('AUDIO_CANCEL', {'id': '123-1'}), expected)
+        self.assertEqual(self.bridge.rpc('AUDIO_STATUS', {'id': '123-1'}), expected)
+        with self.assertRaises(Invalid):
+            self.bridge.rpc('AUDIO_BEGIN', {'id': '123-1', 'totalBytes': 1})
+        with self.assertRaises(Invalid):
+            self.bridge.rpc('AUDIO_CHUNK', {'id': '123-1', 'index': 0, 'data': [1]})
+        with self.assertRaises(Invalid):
+            self.bridge.rpc('AUDIO_FINISH', {'id': '123-1'})
+        with self.bridge.lock:
+            row = self.bridge._get('uploads', '123-1')
+        self.assertEqual((row['state'], row['total'], len(row['data']), row['text']),
+                         ('cancelled', 0, 0, ''))
+
+    def test_audio_cancel_wins_against_inflight_asr_completion(self):
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+
+        def delayed(*args):
+            started.set()
+            release.wait(3)
+            finished.set()
+            return 'Поздний текст'
+
+        self.bridge.transcriber = delayed
+        self.bridge.rpc('AUDIO_BEGIN', {'id': '123-1', 'totalBytes': 1})
+        self.bridge.rpc('AUDIO_CHUNK', {'id': '123-1', 'index': 0, 'data': [7]})
+        self.bridge.rpc('AUDIO_FINISH', {'id': '123-1'})
+        self.assertTrue(started.wait(3))
+        self.bridge.rpc('AUDIO_CANCEL', {'id': '123-1'})
+        release.set()
+        self.assertTrue(finished.wait(3))
+        self.bridge.speech.submit(lambda: None).result(timeout=3)
+        status = self.bridge.rpc('AUDIO_STATUS', {'id': '123-1'})
+        self.assertEqual((status['state'], status['textLength']), ('cancelled', 0))
+        with self.bridge.lock:
+            row = self.bridge._get('uploads', '123-1')
+        self.assertEqual((row['state'], row['total'], len(row['data']), row['text']),
+                         ('cancelled', 0, 0, ''))
+        self.assertEqual(self.hermes.calls, [])
+
+    def test_audio_cancel_wins_against_inflight_asr_error(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        def delayed_error(*args):
+            started.set()
+            release.wait(3)
+            raise ValueError('late ASR failure')
+
+        self.bridge.transcriber = delayed_error
+        self.bridge.rpc('AUDIO_BEGIN', {'id': '123-1', 'totalBytes': 1})
+        self.bridge.rpc('AUDIO_CHUNK', {'id': '123-1', 'index': 0, 'data': [7]})
+        self.bridge.rpc('AUDIO_FINISH', {'id': '123-1'})
+        self.assertTrue(started.wait(3))
+        self.bridge.rpc('AUDIO_CANCEL', {'id': '123-1'})
+        release.set()
+        self.bridge.speech.submit(lambda: None).result(timeout=3)
+        status = self.bridge.rpc('AUDIO_STATUS', {'id': '123-1'})
+        self.assertEqual((status['state'], status['error'], status['textLength']),
+                         ('cancelled', '', 0))
+        self.assertEqual(self.hermes.calls, [])
+
+    def test_audio_cancel_clears_ready_and_error_payloads(self):
+        with self.bridge.lock:
+            for request_id, state, text, error in (
+                    ('123-1', 'ready', 'Расшифровка', ''),
+                    ('123-2', 'error', '', 'Ошибка')):
+                self.bridge.db.execute(
+                    "INSERT INTO uploads(id,total,data,created,state,text,error) VALUES (?,?,?,?,?,?,?)",
+                    (request_id, 3, b'abc', time.time(), state, text, error))
+            self.bridge.db.commit()
+        for request_id in ('123-1', '123-2'):
+            with self.subTest(state=request_id):
+                self.bridge.rpc('AUDIO_CANCEL', {'id': request_id})
+                status = self.bridge.rpc('AUDIO_STATUS', {'id': request_id})
+                self.assertEqual((status['state'], status['totalBytes'], status['text'], status['error']),
+                                 ('cancelled', 0, '', ''))
+                with self.bridge.lock:
+                    row = self.bridge._get('uploads', request_id)
+                self.assertEqual((row['total'], len(row['data']), row['text'], row['error']),
+                                 (0, 0, '', ''))
+
     def test_long_transcript_is_paged_and_sent_to_hermes_without_loss(self):
         text = ('аб😀в' * 7000)[:MAX_TEXT_CHARS]
         self.bridge.transcriber = lambda *args: text
@@ -556,6 +646,79 @@ class BridgeTests(unittest.TestCase):
         self.settle()
         submitted = next(call for call in self.hermes.calls if call[0] == '/v1/runs')
         self.assertEqual(submitted[1]['input'], edited)
+
+    def test_typed_text_draft_uses_null_source_and_is_bound_to_its_job_id(self):
+        text = 'Написано на часах 😀'
+        with self.assertRaises(Invalid):
+            self.bridge.rpc('TEXT_BEGIN', {'id': '120-1', 'textLength': len(text)})
+        with self.assertRaises(Invalid):
+            self.bridge.rpc('TEXT_BEGIN', {
+                'id': '120-1', 'sourceId': 'invalid', 'textLength': len(text)})
+        begin = self.bridge.rpc('TEXT_BEGIN', {
+            'id': '123-1', 'sourceId': None, 'textLength': len(text)})
+        self.assertEqual((begin['state'], begin['receivedLength']), ('uploading', 0))
+        replay = self.bridge.rpc('TEXT_BEGIN', {
+            'id': '123-1', 'sourceId': None, 'textLength': len(text)})
+        self.assertEqual(replay, begin)
+        self.bridge.rpc('TEXT_PART', {'id': '123-1', 'offset': 0, 'text': text})
+        self.bridge.rpc('TEXT_FINISH', {'id': '123-1'})
+        with self.assertRaises(Invalid):
+            self.bridge.rpc('SEND_TEXT', {'id': '123-2', 'textId': '123-1'})
+        queued = self.bridge.rpc('SEND_TEXT', {'id': '123-1', 'textId': '123-1'})
+        self.assertEqual(queued['text'], text)
+        self.settle()
+        submitted = next(call for call in self.hermes.calls if call[0] == '/v1/runs')
+        self.assertEqual(submitted[1]['input'], text)
+        with self.bridge.lock:
+            self.assertIsNone(self.bridge.db.execute(
+                "SELECT 1 FROM uploads WHERE id='123-1'").fetchone())
+
+    def test_typed_text_draft_rejects_blank_finish_and_keeps_global_quota(self):
+        self.bridge.rpc('TEXT_BEGIN', {'id': '123-1', 'sourceId': None, 'textLength': 2})
+        self.bridge.rpc('TEXT_PART', {'id': '123-1', 'offset': 0, 'text': '  '})
+        with self.assertRaises(Invalid):
+            self.bridge.rpc('TEXT_FINISH', {'id': '123-1'})
+
+        now = time.time()
+        with self.bridge.lock:
+            self.bridge.db.execute("DELETE FROM text_drafts")
+            self.bridge.db.executemany(
+                "INSERT INTO text_drafts(id,source_id,text_length,text,state,created,updated) "
+                "VALUES (?,'',1,'x','ready',?,?)",
+                [(f'900-{index + 1}', now, now) for index in range(MAX_RECENT_DRAFTS)])
+            self.bridge.db.commit()
+        with self.assertRaises(Invalid):
+            self.bridge.rpc('TEXT_BEGIN', {'id': '999-1', 'sourceId': None, 'textLength': 1})
+
+    def test_cancel_invalidates_audio_drafts_but_not_an_accepted_job(self):
+        with self.bridge.lock:
+            self.bridge.db.execute(
+                "INSERT INTO uploads(id,total,data,created,state,text) VALUES (?,1,X'',?,'ready',?)",
+                ('123-1', time.time(), 'Сырой текст'))
+            self.bridge.db.commit()
+        edited = 'Исправлено'
+        self.bridge.rpc('TEXT_BEGIN', {
+            'id': '123-2', 'sourceId': '123-1', 'textLength': len(edited)})
+        self.bridge.rpc('TEXT_PART', {'id': '123-2', 'offset': 0, 'text': edited})
+        self.bridge.rpc('TEXT_FINISH', {'id': '123-2'})
+        self.bridge.rpc('AUDIO_CANCEL', {'id': '123-1'})
+        with self.assertRaises(Invalid):
+            self.bridge.rpc('SEND_TEXT', {'id': '123-1', 'textId': '123-2'})
+        with self.bridge.lock:
+            self.assertIsNone(self.bridge.db.execute(
+                "SELECT 1 FROM text_drafts WHERE id='123-2'").fetchone())
+
+        with self.bridge.lock:
+            self.bridge.db.execute(
+                "INSERT INTO uploads(id,total,data,created,state,text) VALUES (?,1,X'',?,'ready',?)",
+                ('123-3', time.time(), 'Принятая команда'))
+            self.bridge.db.commit()
+        self.bridge.rpc('SEND_TEXT', {'id': '123-3', 'textId': '123-3'})
+        self.settle('123-3')
+        self.bridge.rpc('AUDIO_CANCEL', {'id': '123-3'})
+        job = self.bridge.job_status('123-3')
+        self.assertEqual(job['id'], '123-3')
+        self.assertIn(job['state'], ('queued', 'running', 'completed'))
 
     def test_corrected_text_rejects_bounds_blank_unicode_and_controls(self):
         with self.bridge.lock:
@@ -640,6 +803,20 @@ class BridgeTests(unittest.TestCase):
             time.sleep(.01)
         self.assertEqual(recovered['text'], 'Восстановлено')
         self.assertEqual(attempts, 2)
+
+    def test_whitespace_asr_is_an_error_and_never_reaches_hermes(self):
+        self.bridge.transcriber = lambda *args: ' \n\t '
+        rpc = self.bridge.rpc
+        rpc('AUDIO_BEGIN', {'id': '123-1', 'totalBytes': 1})
+        rpc('AUDIO_CHUNK', {'id': '123-1', 'index': 0, 'data': [9]})
+        rpc('AUDIO_FINISH', {'id': '123-1'})
+        for _ in range(100):
+            status = rpc('AUDIO_STATUS', {'id': '123-1'})
+            if status['state'] == 'error':
+                break
+            time.sleep(.01)
+        self.assertEqual((status['state'], status['textLength']), ('error', 0))
+        self.assertEqual(self.hermes.calls, [])
 
     def test_reviewed_text_limit_is_30000_unicode_codepoints(self):
         accepted = '😀' * MAX_TEXT_CHARS

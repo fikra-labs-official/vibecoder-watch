@@ -43,11 +43,11 @@ test('Musafir context and hero helpers reject stale values and have a stable fal
   assert.deepEqual(normalizeContext({ chatId: 'legacy', mode: 'research',
     jobId: '1700000000000-1', openJob: true, autoRecord: true, pendingSend: true }), {
     target: 'musafir', chatId: 'legacy', mode: 'research', jobId: '1700000000000-1',
-    openJob: true, autoRecord: true, pendingSend: true
+    openJob: true, autoRecord: false, pendingSend: true
   })
 })
 
-test('empty launch never asks for a global latest job and STATUS uses the real bridge', async () => {
+test('empty launch opens local compose without asking for global status or latest job', async () => {
   const calls = []
   const context = { target: 'musafir', chatId: null, mode: 'task' }
   const route = createMusafirVoiceRoute({ context, request: async payload => {
@@ -59,6 +59,18 @@ test('empty launch never asks for a global latest job and STATUS uses the real b
   assert.deepEqual(await route({ method: 'STATUS', params: { ignored: true } }), {
     ok: true, agent: 'Мусафир'
   })
+  assert.deepEqual(calls, [])
+})
+
+test('an explicitly opened job still checks the real bridge', async () => {
+  const calls = []
+  const context = { target: 'musafir', chatId: 'legacy', mode: 'task',
+    jobId: '1700000000000-10', openJob: true }
+  const route = createMusafirVoiceRoute({ context, request: async payload => {
+    calls.push(payload)
+    return { ok: true, agent: 'Мусафир' }
+  } })
+  assert.deepEqual(await route({ method: 'STATUS', params: {} }), { ok: true, agent: 'Мусафир' })
   assert.deepEqual(calls, [{ method: 'STATUS', params: {} }])
 })
 

@@ -87,13 +87,16 @@ export function createWatchClient({
     try { draft = readDraft() } catch (error) { return null }
     if (!draft || (id !== null && draft.id !== id) || !LOCAL_ID.test(draft.id) ||
         typeof draft.edited !== 'boolean' || typeof draft.pendingSend !== 'boolean') return null
+    const typed = draft.typed === true
+    if (typed && (draft.edited !== true || draft.sourceId !== null || draft.draftId !== draft.id)) return null
     if (draft.edited) {
       if (!LOCAL_ID.test(draft.draftId) || (draft.textId !== null && draft.textId !== draft.draftId)) return null
     } else if (draft.draftId !== null || (draft.textId !== null && draft.textId !== draft.id)) {
       return null
     }
     const text = normalizeReviewText(draft.text)
-    return text === null ? null : { ...draft, text }
+    return text === null ? null : { ...draft, text, typed,
+      sourceId: typed ? null : typeof draft.sourceId === 'string' ? draft.sourceId : draft.id }
   }
 
   function persistDraft(draft) {
@@ -116,11 +119,16 @@ export function createWatchClient({
     const draft = storedReview(id)
     if (draft) {
       emit({ phase: 'review', id, jobId: null, text: draft.text, textId: draft.textId,
-        edited: draft.edited, draftId: draft.draftId, busy: false })
+        edited: draft.edited, draftId: draft.draftId, typed: draft.typed,
+        sourceId: draft.sourceId, busy: false })
       return
     }
+    const saved = { id, text, textId, edited: false, draftId: null,
+      typed: false, sourceId: id, pendingSend: false }
+    const persisted = persistDraft(saved)
     emit({ phase: 'review', id, jobId: null, text, textId,
-      edited: false, draftId: null, busy: false })
+      edited: false, draftId: null, typed: false, sourceId: id,
+      error: persisted ? '' : 'Не удалось сохранить текст на часах', busy: false })
   }
 
   function emit(next) {
@@ -518,7 +526,7 @@ export function createWatchClient({
       textId: null, edited: true, draftId: review.draftId, busy: true })
 
     const begin = await callOk({ method: 'TEXT_BEGIN', params: {
-      id: review.draftId, sourceId: review.id, textLength: total
+      id: review.draftId, sourceId: review.typed ? null : review.id, textLength: total
     } }, operation, true)
     if (begin.id !== review.draftId || begin.textLength !== total ||
         !Number.isInteger(begin.receivedLength) || begin.receivedLength < 0 || begin.receivedLength > total) {
@@ -544,6 +552,14 @@ export function createWatchClient({
     const saved = { ...review, textId: review.draftId, pendingSend: false }
     if (!persistDraft(saved)) throw new Error('Не удалось сохранить исправленный текст')
     return saved
+  }
+
+  function cancelRemoteAudio(id) {
+    if (!LOCAL_ID.test(id)) return
+    try {
+      const result = request({ method: 'AUDIO_CANCEL', params: { id } }, { timeout: REQUEST_TIMEOUT_MS })
+      if (result && typeof result.catch === 'function') result.catch(() => {})
+    } catch (error) {}
   }
 
   return {
@@ -573,13 +589,33 @@ export function createWatchClient({
         emit({ phase: 'review', busy: false })
         return true
       }
+      const typed = current.typed === true
+      const nextDraftId = createId()
       const draft = {
-        id: current.id, text, textId: null, edited: true,
-        draftId: createId(), pendingSend: false
+        id: typed ? nextDraftId : current.id, text, textId: null, edited: true,
+        draftId: nextDraftId, typed,
+        sourceId: typed ? null : current.id, pendingSend: false
       }
       if (!persistDraft(draft)) throw new Error('Не удалось сохранить исправленный текст')
       emit({ phase: 'review', id: draft.id, jobId: null, text: draft.text,
-        textId: null, edited: true, draftId: draft.draftId, busy: false })
+        textId: null, edited: true, draftId: draft.draftId, typed,
+        sourceId: draft.sourceId, busy: false })
+      return true
+    },
+
+    createTypedReview(value) {
+      if (current.phase !== 'ready') throw new Error('Текст сейчас нельзя создать')
+      const text = normalizeReviewText(value)
+      if (text === null) throw new Error('Введите от 1 до 30000 допустимых символов')
+      const id = createId()
+      const draft = {
+        id, text, textId: null, edited: true, draftId: id,
+        typed: true, sourceId: null, pendingSend: false
+      }
+      if (!persistDraft(draft)) throw new Error('Не удалось сохранить текст на часах')
+      beginOperation()
+      emit({ phase: 'review', id, jobId: null, text, textId: null,
+        edited: true, draftId: id, typed: true, sourceId: null, busy: false })
       return true
     },
 
@@ -636,13 +672,28 @@ export function createWatchClient({
     },
 
     cancelUpload() {
-      if (!pendingUpload && current.retryMethod !== 'AUDIO_UPLOAD') return false
+      const id = pendingUpload && pendingUpload.id || current.id || current.retryId
+      if (!LOCAL_ID.test(id) || (!pendingUpload &&
+          !['stopping', 'uploading', 'transcribing', 'canceling', 'error'].includes(current.phase))) return false
       pendingUpload = null
       beginOperation()
       emit({
         phase: 'ready', busy: false, id: null, jobId: null,
         approvalId: null, text: '', result: ''
       })
+      cancelRemoteAudio(id)
+      return true
+    },
+
+    cancelAudio(id) {
+      if (!LOCAL_ID.test(id)) return false
+      pendingUpload = null
+      beginOperation()
+      emit({
+        phase: 'ready', busy: false, id: null, jobId: null,
+        approvalId: null, text: '', result: ''
+      })
+      cancelRemoteAudio(id)
       return true
     },
 
@@ -657,6 +708,8 @@ export function createWatchClient({
         textId: typeof current.textId === 'string' ? current.textId : null,
         edited: current.edited === true,
         draftId: current.edited === true ? current.draftId : null,
+        typed: current.typed === true,
+        sourceId: current.typed === true ? null : id,
         pendingSend: false
       }
       if (review.edited && (!LOCAL_ID.test(review.draftId) ||
@@ -664,17 +717,22 @@ export function createWatchClient({
       const operation = beginOperation()
       ;(async () => {
         try {
-          if (review.edited && review.textId === null) review = await saveEditedText(review, operation)
+          if (review.edited && review.textId === null) {
+            review = await saveEditedText(review, operation)
+            assertActive(operation)
+          }
           const pendingReview = { ...review, pendingSend: true }
           if (!persistDraft(pendingReview)) {
             emit({ phase: 'review', id, jobId: null, text, textId: review.textId,
               edited: review.edited, draftId: review.draftId,
+              typed: review.typed, sourceId: review.sourceId,
               error: 'Не удалось сохранить текст перед отправкой', busy: false })
             return
           }
           review = pendingReview
           emit({ phase: 'sending', id, jobId: id, text, textId: review.textId,
-            edited: review.edited, draftId: review.draftId, busy: true })
+            edited: review.edited, draftId: review.draftId,
+            typed: review.typed, sourceId: review.sourceId, busy: true })
           const params = review.textId ? { id, textId: review.textId } : { id, text }
           let reply
           try {
@@ -705,6 +763,7 @@ export function createWatchClient({
               persistDraft(restored)
               emit({ phase: 'review', id, jobId: null, text,
                 textId: review.textId, edited: review.edited, draftId: review.draftId,
+                typed: review.typed, sourceId: review.sourceId,
                 error: messageOf(error), busy: false })
             } else {
               emit({
@@ -721,12 +780,29 @@ export function createWatchClient({
 
     cancelReview() {
       if (current.phase !== 'review') return false
+      const audioId = current.typed === true ? null : current.id
       clearDraft(current.id)
       beginOperation()
       emit({
         phase: 'ready', busy: false, id: null, jobId: null,
         approvalId: null, text: ''
       })
+      if (audioId) cancelRemoteAudio(audioId)
+      return true
+    },
+
+    cancelBeforeSend() {
+      if (current.phase !== 'saving-text') return false
+      const draft = storedReview(current.id)
+      beginOperation()
+      if (draft) {
+        emit({ phase: 'review', id: draft.id, jobId: null, text: draft.text,
+          textId: draft.textId, edited: draft.edited, draftId: draft.draftId,
+          typed: draft.typed, sourceId: draft.sourceId, busy: false })
+      } else {
+        emit({ phase: 'ready', busy: false, id: null, jobId: null,
+          approvalId: null, text: '', result: '' })
+      }
       return true
     },
 

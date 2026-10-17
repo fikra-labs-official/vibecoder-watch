@@ -25,7 +25,7 @@ from lexicon import compile_rules, normalize
 from orca_service import CliFailure
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "0.9.0"
+VERSION = "0.10.0"
 ID = re.compile(r"^[0-9]{1,16}-[0-9]{1,8}$")
 MAX_AUDIO = 8 * 1024 * 1024
 MAX_TEXT_CHARS = 30_000
@@ -313,7 +313,7 @@ class Bridge:
                             if len(self.orca_observed) > 128:
                                 self.orca_observed.pop(next(iter(self.orca_observed)))
                             self.event("orca_state", **metadata)
-            if method in ("AUDIO_BEGIN", "AUDIO_FINISH", "JOB_APPROVE", "JOB_STOP", "SEND_TEXT", "CLAUDE_SEND", "CLAUDE_STOP", "CODEX_SEND", "CODEX_STOP") or (
+            if method in ("AUDIO_BEGIN", "AUDIO_FINISH", "AUDIO_CANCEL", "JOB_APPROVE", "JOB_STOP", "SEND_TEXT", "CLAUDE_SEND", "CLAUDE_STOP", "CODEX_SEND", "CODEX_STOP") or (
                 isinstance(method, str) and method.startswith("ORCA_") and method not in ("ORCA_JOB", "ORCA_LATEST", "ORCA_OPERATION", "ORCA_HISTORY_LIST", "ORCA_HISTORY_DETAIL")):
                 self.event("rpc", method=method, id=request_id, ms=round((time.monotonic() - started) * 1000), state=result.get("state"))
             return result
@@ -489,11 +489,32 @@ class Bridge:
         with self.lock:
             # Unsubmitted speech is ephemeral. Accepted jobs are retained independently.
             self.db.execute("DELETE FROM uploads WHERE created<? AND state!='transcribing'", (time.time() - 86400,))
+            if method == "AUDIO_CANCEL":
+                if set(params) != {"id"}:
+                    raise Invalid("Некорректная отмена записи")
+                old = self.db.execute("SELECT state FROM uploads WHERE id=?", (request_id,)).fetchone()
+                if old is None:
+                    self.db.execute(
+                        "INSERT INTO uploads(id,total,data,created,state,text,error) "
+                        "VALUES (?,0,X'',?,'cancelled','','')",
+                        (request_id, time.time()))
+                elif old["state"] != "cancelled":
+                    self.db.execute(
+                        "UPDATE uploads SET total=0,data=X'',created=?,state='cancelled',text='',error='' WHERE id=?",
+                        (time.time(), request_id))
+                self.db.execute("DELETE FROM text_drafts WHERE source_id=?", (request_id,))
+                self.db.commit()
+                return {"ok": True, "id": request_id, "state": "cancelled",
+                        "receivedBytes": 0, "totalBytes": 0, "text": "",
+                        "textOffset": 0, "textLength": 0, "textComplete": True,
+                        "error": ""}
             if method == "AUDIO_BEGIN":
                 total = params.get("totalBytes")
                 if type(total) is not int or not 1 <= total <= MAX_AUDIO:
                     raise Invalid("Запись слишком большая или пуста")
                 old = self.db.execute("SELECT total,data,state FROM uploads WHERE id=?", (request_id,)).fetchone()
+                if old and old["state"] == "cancelled":
+                    raise Invalid("Запись отменена")
                 if old and old[0] != total:
                     raise Invalid("ID уже используется для другой записи")
                 if not old:
@@ -511,6 +532,9 @@ class Bridge:
                 return {"ok": True, "id": request_id, "receivedBytes": received,
                         "totalBytes": total, "chunkBytes": 6144, "encoding": "base64"}
             row = self._get("uploads", request_id)
+            if row["state"] == "cancelled":
+                if method != "AUDIO_STATUS":
+                    raise Invalid("Запись отменена")
             if method in ("AUDIO_CHUNK", "AUDIO_PART"):
                 index, data = params.get("index"), params.get("data")
                 if method == "AUDIO_PART":
@@ -564,6 +588,11 @@ class Bridge:
                 limit = params.get("textLimit", TEXT_PAGE_DEFAULT)
                 if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= TEXT_PAGE_MAX:
                     raise Invalid("Некорректная страница расшифровки")
+                if row["state"] == "cancelled":
+                    return {"ok": True, "id": request_id, "state": "cancelled",
+                            "receivedBytes": 0, "totalBytes": 0, "text": "",
+                            "textOffset": 0, "textLength": 0, "textComplete": True,
+                            "error": ""}
                 text = row["text"] if row["state"] == "ready" else ""
                 if offset > len(text):
                     raise Invalid("Страница за пределами расшифровки")
@@ -763,9 +792,10 @@ class Bridge:
         if set(params) != {"id", "sourceId", "textLength"}:
             raise Invalid("Некорректный исправленный текст")
         draft_id = identifier(params.get("id"))
-        source_id = identifier(params.get("sourceId"))
+        source_value = params.get("sourceId")
+        source_id = "" if source_value is None else identifier(source_value)
         text_length = params.get("textLength")
-        if draft_id == source_id or type(text_length) is not int or not 1 <= text_length <= MAX_TEXT_CHARS:
+        if (source_id and draft_id == source_id) or type(text_length) is not int or not 1 <= text_length <= MAX_TEXT_CHARS:
             raise Invalid("Некорректный исправленный текст")
         now = time.time()
         with self.lock:
@@ -775,12 +805,14 @@ class Bridge:
                     raise Invalid("ID уже используется для другого исправленного текста")
                 return {"ok": True, "id": draft_id, "state": old["state"],
                         "textLength": old["text_length"], "receivedLength": len(old["text"])}
-            source = self._get("uploads", source_id)
-            if source["state"] != "ready" or not source["text"]:
-                raise Invalid("Расшифровка ещё не готова")
+            if source_id:
+                source = self._get("uploads", source_id)
+                if source["state"] != "ready" or not source["text"]:
+                    raise Invalid("Расшифровка ещё не готова")
             self.db.execute("DELETE FROM text_drafts WHERE updated<?", (now - TEXT_DRAFT_RETENTION,))
-            per_source = self.db.execute(
+            per_source = (self.db.execute(
                 "SELECT count(*) FROM text_drafts WHERE source_id=?", (source_id,)).fetchone()[0]
+                if source_id else 0)
             recent = self.db.execute("SELECT count(*) FROM text_drafts").fetchone()[0]
             if per_source >= MAX_DRAFTS_PER_SOURCE or recent >= MAX_RECENT_DRAFTS:
                 self.db.commit()
@@ -890,9 +922,15 @@ class Bridge:
         try:
             folder.mkdir(parents=True, exist_ok=True, mode=0o700)
             with self.lock:
-                raw = self._get("uploads", request_id)["data"]
+                row = self._get("uploads", request_id)
+                if row["state"] == "cancelled":
+                    return
+                raw = row["data"]
             source = folder / "record.opus"
             source.write_bytes(raw)
+            with self.lock:
+                if self._get("uploads", request_id)["state"] == "cancelled":
+                    return
             result = self.transcriber(source, folder, self.model).strip()
             if not result:
                 raise ValueError("Распознавание не вернуло текст")
@@ -903,6 +941,9 @@ class Bridge:
                 raise ValueError("Расшифровка превышает допустимые 30000 символов")
             result.encode("utf-8")
             with self.lock:
+                current = self._get("uploads", request_id)
+                if current["state"] == "cancelled":
+                    return
                 self.db.execute("UPDATE uploads SET state='ready',text=?,data=X'' WHERE id=?", (result, request_id))
                 self.db.commit()
             self.event("asr_complete", id=request_id, ms=round((time.monotonic() - started) * 1000), chars=len(result))
@@ -910,6 +951,9 @@ class Bridge:
             self.event("asr_error", id=request_id, ms=round((time.monotonic() - started) * 1000), error=type(exc).__name__)
             print(f"speech failed: {type(exc).__name__}", flush=True)
             with self.lock:
+                current = self.db.execute("SELECT state FROM uploads WHERE id=?", (request_id,)).fetchone()
+                if current is None or current["state"] == "cancelled":
+                    return
                 self.db.execute("UPDATE uploads SET state='error',error=? WHERE id=?",
                                 ("Не удалось распознать запись. Запись сохранена, можно повторить распознавание.", request_id))
                 self.db.commit()
@@ -954,11 +998,14 @@ class Bridge:
             draft = self.db.execute(
                 "SELECT source_id,state,text FROM text_drafts WHERE id=?", (text_id,)).fetchone() if text_id else None
             if draft:
-                if draft["source_id"] != request_id or draft["state"] != "ready" or draft["text"] != text:
+                bound = (draft["source_id"] == request_id if draft["source_id"] else text_id == request_id)
+                if not bound or draft["state"] != "ready" or draft["text"] != text:
                     raise Invalid("Исправленный текст не соответствует этой записи")
             else:
                 speech_id = text_id or request_id
                 speech = self.db.execute("SELECT state,text FROM uploads WHERE id=?", (speech_id,)).fetchone()
+                if text_id and speech is None:
+                    raise Invalid("Текст команды не найден")
                 if speech and (speech["state"] != "ready" or speech["text"] != text):
                     raise Invalid("Текст не соответствует распознанной записи")
             active = self.db.execute(

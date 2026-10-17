@@ -7,6 +7,7 @@ import { closeSync, openSync, O_RDONLY, readSync, rmSync, statSync } from '@zos/
 import { setWakeUpRelaunch, setPageBrightTime, resetPageBrightTime, pauseDropWristScreenOff, resetDropWristScreenOff } from '@zos/display'
 import { LocalStorage } from '@zos/storage'
 import { replace } from '@zos/router'
+import * as interaction from '@zos/interaction'
 import { createOrcaVoiceRoute, createFolderVoiceRoute } from './orca-voice'
 import { createClaudeVoiceRoute, createCodexVoiceRoute } from './claude-voice'
 import { createWatchAlerts } from './watch-alerts'
@@ -89,6 +90,7 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
     const scale = Math.min(width / 390, height / 450)
     const px = this.px = value => Math.round(value * scale)
     this.width = width
+    this.height = height
     this.closed = false
     this.recorder = null
     this.recording = null
@@ -102,8 +104,9 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
     this.textPage = 0
     this.keyboardOpen = false
     this.keyboardGeneration = 0
-    this.autoRecordTimer = null
     this.heroFrame = null
+    this.interactionRegistered = false
+    this.foreignPendingAudio = false
 
     this.animationTimer = null
     this.phaseStartedAt = Date.now()
@@ -177,6 +180,11 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
     createWidget(widget.FILL_RECT, {
       x: 0, y: 0, w: width, h: height, color: COLORS.background
     })
+    this.backButton = isMusafir ? createWidget(widget.BUTTON, {
+      x: px(24), y: px(12), w: Math.max(112, px(112)), h: Math.max(48, px(48)), radius: px(12),
+      normal_color: COLORS.surface, press_color: COLORS.pressed, color: COLORS.text,
+      text_size: px(18), text: '‹ Назад', click_func: () => this.handleMusafirBack()
+    }) : null
     this.statusWidget = createWidget(widget.TEXT, {
       ...centered, y: px(60), h: px(36), color: COLORS.gold,
       text_size: px(24), text: 'Подключение'
@@ -186,9 +194,9 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
       text_size: px(17), text: ''
     })
     this.brandWidget = createWidget(widget.IMG, {
-      x: (width - (isMusafir ? 44 : px(64))) / 2, y: px(139),
-      w: isMusafir ? 44 : px(64), h: isMusafir ? 44 : px(64),
-      src: isMusafir ? `heroes/${this.hero.id}-small.png` : icon, auto_scale: !isMusafir
+      x: (width - (isMusafir ? 80 : px(64))) / 2, y: px(isMusafir ? 133 : 139),
+      w: isMusafir ? 80 : px(64), h: isMusafir ? 80 : px(64),
+      src: isMusafir ? `heroes/${this.hero.id}.png` : icon, auto_scale: !isMusafir
     })
     this.metricWidget = createWidget(widget.TEXT, {
       ...centered, y: px(151), h: px(66), color: COLORS.text,
@@ -256,6 +264,7 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
     if (this.menuButton) this.menuButton.setProperty(prop.VISIBLE, false)
     this.hideNavigation()
     this.setButtons(null, null)
+    this.registerInteraction()
 
     try {
       const rawRequest = (payload, options) => this.request(payload, options)
@@ -293,7 +302,6 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
             this.alerts.observe(state)
             this.render(state)
             this.handlePendingAudio(state)
-            if (isMusafir) this.maybeAutoRecord(state)
           } catch (error) { this.showStartupError(error) }
         }
       })
@@ -319,26 +327,84 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
     } catch (error) {}
   },
 
-  maybeAutoRecord(state) {
-    if (!this.destination.autoRecord || state.phase !== 'ready' || this.pendingAudio || this.autoRecordTimer !== null) return
-    this.destination.autoRecord = false
-    if (this.resultStorage) this.resultStorage.setItem(MUSAFIR_CONTEXT_KEY, JSON.stringify(this.destination))
-    this.autoRecordTimer = setTimeout(() => {
-      this.autoRecordTimer = null
-      if (!this.closed && this.client.getState().phase === 'ready') this.startRecording()
-    }, 0)
+  registerInteraction() {
+    if (!isMusafir || this.interactionRegistered) return
+    try {
+      if (typeof interaction.onGesture === 'function') {
+        interaction.onGesture({ callback: event => {
+          if (this.keyboardOpen) return false
+          if (event !== interaction.GESTURE_RIGHT) return false
+          return this.handleMusafirBack()
+        } })
+      }
+      if (typeof interaction.onKey === 'function') {
+        interaction.onKey({ callback: (key, event) => {
+          if (this.keyboardOpen) return false
+          if (key !== interaction.KEY_BACK || event !== interaction.KEY_EVENT_CLICK) return false
+          return this.handleMusafirBack()
+        } })
+      }
+      this.interactionRegistered = true
+    } catch (error) {}
+  },
+
+  unregisterInteraction() {
+    if (!isMusafir || !this.interactionRegistered) return
+    try { if (typeof interaction.offGesture === 'function') interaction.offGesture() } catch (error) {}
+    try { if (typeof interaction.offKey === 'function') interaction.offKey() } catch (error) {}
+    this.interactionRegistered = false
+  },
+
+  persistMusafirExit(state) {
+    if (this.destination && this.client) {
+      if (state.jobId) this.destination.jobId = state.jobId
+      this.destination.autoRecord = false
+      this.destination.openJob = Boolean(state.jobId &&
+        ['sending', 'job', 'approval', 'result', 'unknown'].includes(state.phase))
+      this.resultStorage && this.resultStorage.setItem(MUSAFIR_CONTEXT_KEY, JSON.stringify(this.destination))
+    }
+  },
+
+  handleMusafirBack() {
+    if (!isMusafir || this.closed || this.keyboardOpen || !this.client) return false
+    const state = this.client.getState()
+    if (['recording', 'stopping', 'canceling'].includes(state.phase) || this.recording) {
+      this.cancelRecording()
+    } else if (['uploading', 'transcribing'].includes(state.phase) ||
+        (state.phase === 'error' && this.pendingAudio)) {
+      this.cancelPendingAudio()
+    } else if (state.phase === 'saving-text') {
+      this.client.cancelBeforeSend()
+      this.saveMusafirPending()
+    } else if (state.phase === 'review') {
+      // Both dictated and typed reviews are persisted before they are shown.
+      this.saveMusafirPending()
+    }
+    this.persistMusafirExit(this.client.getState())
+    replace({ url: 'page/index' })
+    return true
   },
 
   openMusafirHome() {
-    if (!isMusafir || this.recording || this.keyboardOpen) return
-    if (this.destination && this.client) {
-      const state = this.client.getState()
-      if (state.jobId) this.destination.jobId = state.jobId
-      this.destination.autoRecord = false
-      this.destination.openJob = false
-      this.resultStorage && this.resultStorage.setItem(MUSAFIR_CONTEXT_KEY, JSON.stringify(this.destination))
-    }
-    replace({ url: 'page/index' })
+    return this.handleMusafirBack()
+  },
+
+  continueMusafir() {
+    if (!isMusafir || !this.client || this.client.getState().phase !== 'result') return
+    this.destination.openJob = false
+    this.destination.autoRecord = false
+    if (this.resultStorage) this.resultStorage.setItem(MUSAFIR_CONTEXT_KEY, JSON.stringify(this.destination))
+    this.client.home()
+  },
+
+  discardReview() {
+    if (!this.client || this.client.getState().phase !== 'review') return
+    const fileName = this.pendingAudio && this.pendingAudio.fileName
+    this.closeAudio(false)
+    this.removeAudio(fileName)
+    this.clearPendingAudio()
+    this.localRecordingError = false
+    this.client.cancelReview()
   },
 
   openMusafirReport() {
@@ -365,6 +431,16 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
     if (this.closed || this.keyboardOpen || !this.client) return
     const state = this.client.getState()
     if (state.phase !== 'review') return
+    this.openKeyboard(state.text, value => this.client.updateReviewText(value))
+  },
+
+  writeTask() {
+    if (!isMusafir || this.closed || this.keyboardOpen || !this.client ||
+        this.client.getState().phase !== 'ready') return
+    this.openKeyboard('', value => this.client.createTypedReview(value))
+  },
+
+  openKeyboard(text, onComplete) {
     if (typeof keyboardUI.createKeyboard !== 'function' || !keyboardUI.inputType) {
       this.stageWidget.setProperty(prop.TEXT, 'Клавиатура требует Zepp OS API 4.0+')
       return
@@ -373,15 +449,15 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
     const generation = ++this.keyboardGeneration
     this.keyboardOpen = true
     const options = {
-      text: state.text,
+      text,
       onComplete: (_, result) => {
         if (this.closed || generation !== this.keyboardGeneration) return
         this.closeKeyboard()
         try {
           if (!result || typeof result.data !== 'string') throw new Error('Клавиатура не вернула текст')
-          this.client.updateReviewText(result.data)
+          onComplete(result.data)
         } catch (error) {
-          this.stageWidget.setProperty(prop.TEXT, error.message || 'Не удалось сохранить правку')
+          this.stageWidget.setProperty(prop.TEXT, error.message || 'Не удалось сохранить текст')
         }
       },
       onCancel: () => {
@@ -543,10 +619,8 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
     console.log(`[${logName}] startup error: ${String(error && error.message || error)}`)
     this.statusWidget.setProperty(prop.TEXT, 'Ошибка запуска')
     this.bodyWidget.setProperty(prop.TEXT, 'Не удалось открыть экран.\nНажмите «Повторить».')
-    this.primaryAction = () => this.client ? this.client.start() : this.showStartupError('client unavailable')
-    this.primaryButton.setProperty(prop.TEXT, 'Повторить')
-    this.primaryButton.setProperty(prop.VISIBLE, true)
-    this.secondaryButton.setProperty(prop.VISIBLE, false)
+    this.setButtons({ text: 'Повторить',
+      action: () => this.client ? this.client.start() : this.showStartupError('client unavailable') }, null)
   },
 
   prepareRecorder() {
@@ -582,17 +656,21 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
     })
     this.primaryButton.setProperty(prop.VISIBLE, Boolean(primary))
     this.secondaryButton.setProperty(prop.VISIBLE, Boolean(secondary))
-
+    const height = isMusafir ? Math.max(44, px(54)) : px(62)
+    const y = isMusafir ? this.height - 16 - height : px(350)
+    const margin = px(24)
+    const gap = px(10)
+    const half = Math.floor((this.width - margin * 2 - gap) / 2)
     if (primary) {
-      this.primaryButton.setProperty(prop.TEXT, primary.text)
       this.primaryButton.setProperty(prop.MORE, {
-        x: px(24),
-        y: px(350),
-        w: secondary ? this.width / 2 - px(29) : this.width - px(48),
-        h: px(62)
+        x: margin, y,
+        w: secondary ? half : this.width - margin * 2,
+        h: height, text: primary.text
       })
     }
-    if (secondary) this.secondaryButton.setProperty(prop.TEXT, secondary.text)
+    if (secondary) this.secondaryButton.setProperty(prop.MORE, {
+      x: margin + half + gap, y, w: half, h: height, text: secondary.text
+    })
   },
 
   setBody(text, pageable = true, height = 146) {
@@ -787,6 +865,17 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
           primary.text = 'К тексту'
         }
       }
+      if (local && this.foreignPendingAudio) {
+        status = 'Запись сохранена'
+        stage = 'Она относится к другой задаче'
+        body = state.error
+        primary = isMusafir
+          ? { text: 'К задачам', action: () => this.openMusafirHome() }
+          : isMenuApp
+            ? { text: isOrca ? 'Orca' : title, action: () => this.openOrca() }
+            : { text: 'Домой', action: () => this.client.home() }
+        secondary = null
+      }
     }
 
     if (this.destination && isClaude) {
@@ -880,9 +969,20 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
     }
     if (isMusafir) {
       if (home) {
-        status = this.destination.mode === 'research' ? 'Исследование' : 'Готов слушать'
-        stage = this.destination.chatId ? 'Продолжение выбранной темы' : 'Новая тема'
-        secondary = { text: 'Чаты', action: () => this.openMusafirHome() }
+        status = this.destination.chatId ? 'Продолжение' : 'Новая задача'
+        stage = this.destination.mode === 'research' ? 'Режим исследования' : 'Выберите способ ввода'
+        body = 'Продиктуйте задачу или напишите её на клавиатуре.'
+        primary = { text: 'Надиктовать', action: () => this.startRecording() }
+        secondary = { text: 'Написать', action: () => this.writeTask() }
+      } else if (state.phase === 'recording') {
+        primary = { text: 'Распознать', action: () => this.stopRecording(false) }
+        secondary = { text: 'Отмена', action: () => this.cancelRecording() }
+      } else if (['stopping', 'uploading', 'transcribing'].includes(state.phase)) {
+        primary = { text: 'Отмена', action: () => state.phase === 'stopping'
+          ? this.cancelRecording() : this.cancelPendingAudio() }
+        secondary = null
+      } else if (state.phase === 'review') {
+        secondary = { text: 'Отмена', action: () => this.discardReview() }
       } else if (state.phase === 'job') {
         if (state.state === 'stopping') {
           status = 'Останавливаю'
@@ -891,21 +991,21 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
         } else {
           primary = { text: this.stopArmed ? 'Точно стоп?' : 'Остановить', action: () => this.stopMusafir() }
         }
-        secondary = { text: 'Чаты', action: () => this.openMusafirHome() }
+        secondary = null
       } else if (state.phase === 'result') {
         status = state.state === 'cancelled' ? 'Остановлено' : 'Готово'
         stage = state.state === 'cancelled' ? 'Hermes подтвердил остановку' : 'Начало ответа · полный текст ниже'
         body = state.summary || state.result
-        primary = { text: 'Продолжить', action: () => this.startRecording() }
-        secondary = { text: 'Чаты', action: () => this.openMusafirHome() }
+        primary = { text: 'Продолжить', action: () => this.continueMusafir() }
+        secondary = null
       } else if (state.phase === 'unknown') {
-        secondary = { text: 'Чаты', action: () => this.openMusafirHome() }
+        secondary = null
       }
     }
     const reportButton = isMusafir && ['result', 'error'].includes(state.phase) && state.jobId && state.reportLength > 0
     const stopApproval = isMusafir && state.phase === 'approval'
     if (this.menuButton) {
-      this.menuButton.setProperty(prop.VISIBLE, reportButton || stopApproval || (home && !this.pendingAudio))
+      this.menuButton.setProperty(prop.VISIBLE, reportButton || stopApproval || (!isMusafir && home && !this.pendingAudio))
       if (isMusafir) this.menuButton.setProperty(prop.MORE, {
         x: px(24), w: this.width - px(48), y: px(296), h: px(44),
         text: reportButton ? state.phase === 'error' ? 'Сохранённый ответ' : 'Полный ответ'
@@ -919,9 +1019,8 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
     const heroActive = isMusafir && state.phase === 'job'
     this.brandWidget.setProperty(prop.VISIBLE, home || heroActive)
     if (isMusafir) this.brandWidget.setProperty(prop.MORE, {
-      x: (this.width - (heroActive ? 80 : 44)) / 2, y: px(heroActive ? 128 : 139),
-      w: heroActive ? 80 : 44, h: heroActive ? 80 : 44,
-      src: `heroes/${this.hero.id}${heroActive ? '' : '-small'}.png`
+      x: (this.width - 80) / 2, y: px(heroActive ? 128 : 133),
+      w: 80, h: 80, src: `heroes/${this.hero.id}.png`
     })
     this.heroFrame = null
     this.metricWidget.setProperty(prop.VISIBLE, active)
@@ -937,9 +1036,14 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
       align_v: reader ? align.TOP : align.CENTER_V
     })
     const review = state.phase === 'review'
-    for (const control of [this.previousButton, this.nextButton, this.pageWidget]) {
-      control.setProperty(prop.MORE, { y: px(review || reportButton || stopApproval ? 254 : 302), h: px(38) })
-    }
+    const navigationY = px(review || reportButton || stopApproval ? 254 : 302)
+    this.previousButton.setProperty(prop.MORE, {
+      x: px(72), y: navigationY, w: px(62), h: px(38), text: '‹'
+    })
+    this.nextButton.setProperty(prop.MORE, {
+      x: this.width - px(134), y: navigationY, w: px(62), h: px(38), text: '›'
+    })
+    this.pageWidget.setProperty(prop.MORE, { y: navigationY, h: px(38) })
     this.editButton.setProperty(prop.VISIBLE, review)
     this.setBody(body, reader, review || reportButton || stopApproval ? 108 : 146)
     this.setButtons(primary, secondary)
@@ -1009,26 +1113,27 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
   },
 
   startRecording() {
-    if (isMusafir && !this.pendingAudio) {
+    if (this.closed || this.recording) return
+    if (isMusafir) {
       this.draftStorageKey = DRAFT_KEY + ':musafir:' + (this.destination.chatId || 'new')
+    }
+    if (!this.pendingAudio && this.resultStorage) {
       try {
         const pending = JSON.parse(this.resultStorage.getItem(PENDING_AUDIO_KEY) || 'null')
         if (pending && /^\d{1,16}-\d{1,8}$/.test(pending.id || '') && pending.destinationKey !== this.draftStorageKey) {
-          this.openMusafirHome()
+          this.foreignPendingAudio = true
+          this.localRecordingError = true
+          this.client.failLocal('На часах уже сохранена запись для другой задачи. Вернитесь к ней, чтобы не потерять запись.')
           return
         }
       } catch (error) { this.client.failLocal('Не удалось проверить сохранённый черновик'); return }
     }
-    if (this.closed || this.recording) return
     const id = this.client.createId()
     const fileName = `${logName}-${id}.opus`
+    const previousState = this.client.getState()
+    const previousPending = this.pendingAudio
     this.removeAudio(fileName)
-    this.recording = { id, fileName, canceled: false, handled: false }
-    if (!this.client.beginRecording(id)) {
-      this.recording = null
-      return
-    }
-
+    this.recording = { id, fileName, canceled: false, handled: false, uploadConsent: false }
     this.localRecordingError = false
     let stage = 'recorder_create'
     try {
@@ -1039,8 +1144,14 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
       }
       stage = 'recorder_start'
       if (this.recorder.start() === false) throw new Error('START_FAILED')
+      if (!this.client.beginRecording(id)) {
+        try { this.recorder.stop() } catch (ignored) {}
+        this.recording = null
+        this.removeAudio(fileName)
+        return
+      }
       this.recording.startedAt = Date.now()
-      this.savePendingAudio({ id, fileName, totalBytes: null, accepted: false })
+      this.savePendingAudio({ id, fileName, totalBytes: null, accepted: false, uploadConsent: false })
       this.clearAnimation()
       this.animate()
       this.recordTimer = setTimeout(() => this.stopRecording(true), RECORDING_LIMIT_MS)
@@ -1051,10 +1162,19 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
       this.clearRecordTimer()
       this.recording = null
       this.removeAudio(fileName)
-      this.clearPendingAudio()
-      this.localRecordingError = true
-      this.client.failLocal('Не удалось начать запись.\nЭтап: ' +
-        ({ recorder_create: 'диктофон', recorder_format: 'формат', recorder_start: 'микрофон' })[stage])
+      if (this.pendingAudio && this.pendingAudio.id === id) {
+        if (previousPending) this.savePendingAudio(previousPending)
+        else this.clearPendingAudio()
+      }
+      const message = 'Не удалось начать запись. Этап: ' +
+        ({ recorder_create: 'диктофон', recorder_format: 'формат', recorder_start: 'микрофон' })[stage]
+      if (previousState.phase === 'review') {
+        this.render(this.client.getState())
+        this.stageWidget.setProperty(prop.TEXT, message)
+      } else {
+        this.localRecordingError = true
+        this.client.failLocal(message.replace('. Этап:', '.\nЭтап:'))
+      }
     }
   },
 
@@ -1062,6 +1182,10 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
     if (this.closed || !this.recording || this.recording.handled || this.recording.stopping) return
     this.clearRecordTimer()
     this.recording.stopping = true
+    this.recording.uploadConsent = automatic !== true
+    if (this.recording.uploadConsent && this.pendingAudio && this.pendingAudio.id === this.recording.id) {
+      this.savePendingAudio({ ...this.pendingAudio, uploadConsent: true })
+    }
     this.client.recordingStopped()
     try {
       if (this.recorder.stop() === false) throw new Error('STOP_FAILED')
@@ -1078,21 +1202,23 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
   },
 
   cancelRecording() {
-    if (!this.recording || this.recording.stopping) return
-    this.recording.canceled = true
-    this.recording.stopping = true
+    if (!this.recording || this.recording.canceled) return
+    const recording = this.recording
+    const wasStopping = recording.stopping === true
+    recording.canceled = true
+    recording.stopping = true
     this.clearRecordTimer()
-    this.client.recordingStopped(true)
+    this.clearStopWatchdog()
+    this.closeAudio(false)
+    this.clearPendingAudio()
+    this.client.cancelAudio(recording.id)
     try {
-      this.recorder.stop()
-      this.startStopWatchdog()
+      if (!wasStopping && this.recorder) this.recorder.stop()
     } catch (error) {
       this.reportRecorderError('recorder_stop', error)
-      this.removeAudio(this.recording.fileName)
-      this.clearPendingAudio()
-      this.recording = null
-      this.client.cancelRecording()
     }
+    this.removeAudio(recording.fileName)
+    this.recording = null
   },
 
   onRecorderStopped() {
@@ -1102,11 +1228,11 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
     this.clearRecordTimer()
     this.clearStopWatchdog()
 
-    if (recording.canceled) {
+    if (recording.canceled || !recording.uploadConsent) {
       this.removeAudio(recording.fileName)
       this.clearPendingAudio()
       this.recording = null
-      this.client.cancelRecording()
+      this.client.cancelAudio(recording.id)
       return
     }
 
@@ -1138,7 +1264,7 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
     this.recording = null
     this.savePendingAudio({
       id: recording.id, fileName: recording.fileName,
-      totalBytes: fileStat.size, accepted: false
+      totalBytes: fileStat.size, accepted: false, uploadConsent: true
     })
     this.uploadPendingAudio()
   },
@@ -1153,7 +1279,13 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
       if (value.destinationKey && value.destinationKey !== this.draftStorageKey) return null
       if (value.totalBytes !== null && (!Number.isInteger(value.totalBytes) ||
           value.totalBytes <= 0 || value.totalBytes > MAX_AUDIO_BYTES)) return null
-      return value
+      if (!value.accepted && value.uploadConsent !== true) {
+        this.removeAudio(value.fileName)
+        this.resultStorage.setItem(PENDING_AUDIO_KEY, '')
+        if (isMusafir) this.clearMusafirPending()
+        return null
+      }
+      return { ...value, uploadConsent: value.accepted || value.uploadConsent === true }
     } catch (error) {
       return null
     }
@@ -1188,13 +1320,14 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
       this.pendingResumeTimer = null
       if (this.closed || !this.pendingAudio || !['ready', 'result'].includes(this.client.getState().phase)) return
       if (this.pendingAudio.accepted) this.client.resumeAudio(this.pendingAudio.id)
-      else this.uploadPendingAudio()
+      else if (this.pendingAudio.uploadConsent === true) this.uploadPendingAudio()
+      else this.cancelPendingAudio()
     }, 0)
   },
 
   uploadPendingAudio() {
     const pending = this.pendingAudio
-    if (!pending || pending.accepted || this.closed) return
+    if (!pending || pending.accepted || pending.uploadConsent !== true || this.closed) return
     try {
       let totalBytes = pending.totalBytes
       if (totalBytes === null) {
@@ -1215,7 +1348,7 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
           const fileName = this.pendingAudio.fileName
           this.closeAudio(false)
           this.removeAudio(fileName)
-          this.savePendingAudio({ id, fileName, totalBytes, accepted: true })
+          this.savePendingAudio({ id, fileName, totalBytes, accepted: true, uploadConsent: true })
         }
       })
     } catch (error) {
@@ -1262,12 +1395,13 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
   },
 
   cancelPendingAudio() {
-    const fileName = this.pendingAudio && this.pendingAudio.fileName
-    const canceled = this.client && this.client.cancelUpload()
+    const pending = this.pendingAudio
+    const fileName = pending && pending.fileName
     this.closeAudio(false)
     this.removeAudio(fileName)
     this.clearPendingAudio()
     this.localRecordingError = false
+    const canceled = this.client && pending && this.client.cancelAudio(pending.id)
     if (!canceled && this.client) this.client.home()
   },
 
@@ -1339,6 +1473,17 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
         this.resultStorage.setItem(MUSAFIR_CONTEXT_KEY, JSON.stringify(this.destination))
       }
     } } catch (error) {}
+    this.unregisterInteraction()
+    if (this.recording && (!this.recording.stopping || this.recording.canceled ||
+        this.recording.uploadConsent !== true)) {
+      const recording = this.recording
+      recording.canceled = true
+      this.clearPendingAudio()
+      try { if (this.recorder) this.recorder.stop() } catch (error) {}
+      this.removeAudio(recording.fileName)
+      if (this.client) this.client.cancelAudio(recording.id)
+      this.recording = null
+    }
     this.closed = true
     this.closeKeyboard()
     // Zepp also destroys the page on sleep. Keep wake-up relaunch enabled:
@@ -1346,7 +1491,6 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
     try { resetPageBrightTime() } catch (error) {}
     try { resetDropWristScreenOff() } catch (error) {}
     this.clearAnimation()
-    if (this.autoRecordTimer !== null) clearTimeout(this.autoRecordTimer)
     this.clearRecordTimer()
     this.clearStopWatchdog()
     if (this.pendingResumeTimer !== null) clearTimeout(this.pendingResumeTimer)
@@ -1356,6 +1500,7 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
     if (this.alerts) this.alerts.destroy()
     if (this.client) this.client.close()
     if (this.recording) {
+      // A prior explicit "Распознать" is resumable after sleep/page teardown.
       try { this.recorder.stop() } catch (error) {}
       this.recording = null
     }

@@ -5,8 +5,8 @@
     "appName": "Мусафир",
     "appType": "app",
     "version": {
-      "code": 26,
-      "name": "0.9.1"
+      "code": 27,
+      "name": "0.10.0"
     },
     "icon": "musafer-icon.png",
     "vender": "Fikra Labs",

@@ -39,6 +39,8 @@
         <select id="state-select">
           <option value="ready">Главная: недавние чаты</option>
           <option value="home-error">Главная: ошибка связи</option>
+          <option value="compose">Новая задача: голос или текст</option>
+          <option value="heroes">Все пять героев</option>
           <option value="recording">Запись: микрофон и таймер</option>
           <option value="uploading">Передача: 62%</option>
           <option value="transcribing">Распознавание</option>
@@ -52,9 +54,22 @@
         </select>
       </div>
 
+      <label for="geometry-select">Размер экрана</label>
+      <div class="select-wrap">
+        <select id="geometry-select">
+          <option value="432x514">Bip Max · 432 × 514</option>
+          <option value="390x450">Совместимость · 390 × 450</option>
+          <option value="390x400">Компактный · 390 × 400</option>
+        </select>
+      </div>
+      <div class="preview-actions">
+        <button id="hardware-back" type="button">Кнопка «Назад» на часах</button>
+        <button id="reopen" type="button">Закрыть и открыть страницу</button>
+      </div>
+
       <div class="hint">
         <span class="hint-dot"></span>
-        <p><strong>Попробуйте сценарий:</strong> на главной нажмите «Новая задача», остановите запись, проверьте текст и откройте «Полный ответ». Все данные синтетические.</p>
+        <p><strong>Попробуйте сценарий:</strong> «Новая задача» → «Надиктовать» или «Написать» → проверка текста → «Отправить». Проверьте отмену и возврат на каждом шаге. Все данные синтетические.</p>
       </div>
 
       <dl class="snapshot" id="snapshot">

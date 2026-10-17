@@ -3,9 +3,14 @@ import { getDeviceInfo } from '@zos/device'
 import { replace } from '@zos/router'
 import { LocalStorage } from '@zos/storage'
 import { setTimeout, clearTimeout } from '@zos/timer'
+import {
+  onGesture, offGesture, GESTURE_RIGHT,
+  onKey, offKey, KEY_BACK, KEY_EVENT_CLICK
+} from '@zos/interaction'
 import { MUSAFIR_HEROES, heroById } from './musafir-chat'
 
 const CONTEXT_KEY = 'musafir-context'
+const RETURN_KEY = 'musafir-return-view'
 const PENDING_KEY = 'musafir-pending-context'
 const PENDING_AUDIO_KEY = 'pending-audio'
 const DRAFT_PREFIX = 'voice-draft:musafir:'
@@ -94,6 +99,47 @@ function validPendingContext(value) {
     typeof value.openJob === 'boolean' && typeof value.autoRecord === 'boolean')
 }
 
+function normalizeOrigin(value) {
+  if (value && value.kind === 'list' && typeof value.archived === 'boolean' &&
+      Number.isSafeInteger(value.offset) && value.offset >= 0) {
+    return { kind: 'list', archived: value.archived, offset: value.offset }
+  }
+  return { kind: 'home' }
+}
+
+function normalizeReturnView(value) {
+  if (!value || typeof value !== 'object') return null
+  if (value.kind === 'home') return { kind: 'home' }
+  if (value.kind === 'list') return normalizeOrigin(value)
+  if (value.kind !== 'detail' || !value.chat || !validChatId(value.chat.id) ||
+      typeof value.chat.title !== 'string' || typeof value.chat.archived !== 'boolean' ||
+      !Number.isSafeInteger(value.offset) || value.offset < 0) return null
+  return {
+    kind: 'detail',
+    chat: {
+      id: value.chat.id,
+      title: clip(value.chat.title, 80),
+      archived: value.chat.archived,
+      mode: modeOf(value.chat.mode)
+    },
+    offset: value.offset,
+    origin: normalizeOrigin(value.origin)
+  }
+}
+
+function voiceContext(value) {
+  const context = {
+    target: 'musafir',
+    chatId: value && validChatId(value.chatId) ? value.chatId : null,
+    mode: modeOf(value && value.mode),
+    jobId: value && validJobId(value.jobId) ? value.jobId : null,
+    openJob: Boolean(value && validJobId(value.jobId) && value.openJob === true),
+    autoRecord: false
+  }
+  if (value && value.pendingSend === true && context.jobId) context.pendingSend = true
+  return context
+}
+
 export function createMusafirPage() {
   return {
     build() {
@@ -101,72 +147,137 @@ export function createMusafirPage() {
       const { width, height } = getDeviceInfo()
       this.width = width
       this.height = height
-      this.px = value => Math.round(value * Math.min(width / 432, height / 514))
-      const px = this.px
-      const createHidden = (type, options) => {
-        const item = createWidget(type, options)
-        item.setProperty(prop.VISIBLE, false)
-        return item
-      }
+      this.scale = Math.min(width / 432, height / 514)
+      this.px = value => Math.round(value * this.scale)
+      this.margin = Math.max(18, Math.round(width * 0.055))
+      this.controlHeight = height >= 490 ? 52 : 48
+      this.gap = 6
+      this.bottom = height >= 490 ? 16 : 14
       this.closed = false
       this.generation = 0
       this.pendingRequests = []
+      this.currentBack = null
+      this.currentLocation = { kind: 'home' }
       this.storage = null
       try { this.storage = new LocalStorage() } catch (error) {}
       this.migrateLegacyDraft()
 
       createWidget(widget.FILL_RECT, { x: 0, y: 0, w: width, h: height, color: COLOR.bg })
       this.heroButton = createWidget(widget.BUTTON, {
-        x: px(24) + 60, y: px(24), w: width - px(48) - 60, h: px(62), radius: px(16),
+        x: this.margin + 60, y: 18, w: width - this.margin * 2 - 60, h: 56, radius: 16,
         normal_color: COLOR.surface, press_color: COLOR.pressed, color: COLOR.white,
-        text_size: px(19), text: '', click_func: () => this.heroPicker()
+        text_size: Math.max(17, this.px(19)), text: '', click_func: () => this.heroPicker()
       })
       this.heroImage = createWidget(widget.IMG, {
-        x: px(32), y: px(33), w: 44, h: 44, src: 'heroes/musafir-small.png'
+        x: this.margin + 8, y: 24, w: 44, h: 44, src: 'heroes/musafir-small.png'
       })
       this.heroImage.addEventListener(event.CLICK_UP, () => this.heroPicker())
+      this.topBack = createWidget(widget.BUTTON, {
+        x: this.margin, y: 14, w: 116, h: 48, radius: 13,
+        normal_color: COLOR.surface, press_color: COLOR.pressed, color: COLOR.white,
+        text_size: 18, text: '‹ Назад', click_func: () => this.goBack()
+      })
       this.heading = createWidget(widget.TEXT, {
-        x: px(24), y: px(90), w: width - px(48), h: px(30), text_size: px(24),
+        x: this.margin, y: 78, w: width - this.margin * 2, h: 28, text_size: Math.max(21, this.px(24)),
         color: COLOR.gold, align_h: align.LEFT, text: ''
       })
       this.note = createWidget(widget.TEXT, {
-        x: px(24), y: px(120), w: width - px(48), h: px(38), text_size: px(17),
+        x: this.margin, y: 106, w: width - this.margin * 2, h: 28, text_size: Math.max(15, this.px(17)),
         color: COLOR.muted, align_h: align.LEFT, text_style: text_style.WRAP, text: ''
       })
-      this.banners = [0, 1].map(index => createHidden(widget.BUTTON, {
-        x: px(24), y: px(162 + index * 56), w: width - px(48), h: px(51), radius: px(11),
-        normal_color: COLOR.surface, press_color: COLOR.pressed, color: COLOR.cyan,
-        text_size: px(17), text: '',
-        click_func: () => this.bannerItems[index] && this.bannerItems[index].action()
-      }))
-      this.rows = [0, 1, 2].map(index => createHidden(widget.BUTTON, {
-        x: px(24), y: px(162 + index * 56), w: width - px(48), h: px(51), radius: px(13),
-        normal_color: COLOR.surface, press_color: COLOR.pressed, color: COLOR.white,
-        text_size: px(18), text: '',
-        click_func: () => this.items[index] && this.items[index].action()
-      }))
-      this.rowImages = [0, 1, 2].map(index => createHidden(widget.IMG, {
-        x: px(32), y: px(165 + index * 56), w: 44, h: 44, src: 'heroes/musafir-small.png'
-      }))
-      this.footer = [0, 1, 2].map(index => createHidden(widget.BUTTON, {
-        x: px(24 + index * 132), y: px(386), w: px(index === 2 ? 120 : 112), h: px(51), radius: px(11),
-        normal_color: COLOR.surface, press_color: COLOR.pressed, color: COLOR.gold,
-        text_size: px(17), text: '',
-        click_func: () => this.footerItems[index] && this.footerItems[index].action()
-      }))
-      this.primary = createHidden(widget.BUTTON, {
-        x: px(24), y: height - px(68), w: width - px(48), h: px(54), radius: px(16),
-        normal_color: COLOR.gold, press_color: 0xd3a25f, color: COLOR.bg,
-        text_size: px(21), text: '',
-        click_func: () => this.primaryItem && this.primaryItem.action()
+      this.heroHint = createWidget(widget.TEXT, {
+        x: this.margin, y: 124, w: width - this.margin * 2, h: 22, text_size: 14,
+        color: COLOR.muted, align_h: align.LEFT, text: '5 героев · листайте вверх'
       })
+      const createHiddenButton = () => {
+        const item = createWidget(widget.BUTTON, {
+          x: this.margin, y: 136, w: width - this.margin * 2, h: this.controlHeight, radius: 13,
+          normal_color: COLOR.surface, press_color: COLOR.pressed, color: COLOR.white,
+          text_size: Math.max(16, this.px(18)), text: '', click_func: () => item.clickAction && item.clickAction()
+        })
+        item.setProperty(prop.VISIBLE, false)
+        return item
+      }
+      this.banners = [0, 1].map(createHiddenButton)
+      this.rows = [0, 1, 2].map(createHiddenButton)
+      this.footer = [0, 1, 2].map(createHiddenButton)
+      this.primary = createHiddenButton()
+
+      const listY = 148
+      const listWidth = width - this.margin * 2
+      const listData = this.heroData()
+      this.heroScroll = createWidget(widget.SCROLL_LIST, {
+        x: this.margin,
+        y: listY,
+        w: listWidth,
+        h: Math.max(112, height - listY - this.bottom),
+        item_space: 6,
+        item_config: [{
+          type_id: 1,
+          item_height: 112,
+          item_bg_color: COLOR.surface,
+          item_bg_radius: 14,
+          text_view: [
+            { x: 0, y: 0, w: listWidth, h: 112, key: 'tap', color: COLOR.surface, text_size: 1, action: true },
+            { x: 100, y: 12, w: listWidth - 100, h: 48, key: 'name', color: COLOR.white, text_size: 20, action: true },
+            { x: 100, y: 58, w: listWidth - 100, h: 42, key: 'meaning', color: COLOR.muted, text_size: 16, action: true }
+          ],
+          text_view_count: 3,
+          image_view: [{ x: 0, y: 8, w: 96, h: 96, key: 'image', action: true }],
+          image_view_count: 1
+        }],
+        item_config_count: 1,
+        data_array: listData,
+        data_count: listData.length,
+        snap_to_center: false,
+        item_click_func: (_list, index) => this.chooseHero(index)
+      })
+      this.heroScroll.setProperty(prop.VISIBLE, false)
+
+      this.gestureCallback = gesture => gesture === GESTURE_RIGHT ? this.goBack() : false
+      this.keyCallback = (key, keyEvent) => key === KEY_BACK && keyEvent === KEY_EVENT_CLICK
+        ? this.goBack() : false
+      onGesture({ callback: this.gestureCallback })
+      onKey({ callback: this.keyCallback })
+
       this.refreshHero()
-      this.home()
+      const returnView = this.consumeReturnView()
+      if (returnView) this.restoreLocation(returnView)
+      else this.home()
     },
 
     read(key) {
       if (!this.storage) return null
       try { return this.storage.getItem(key) } catch (error) { return null }
+    },
+
+    write(key, value) {
+      if (!this.storage) return false
+      try { this.storage.setItem(key, value); return true } catch (error) { return false }
+    },
+
+    consumeReturnView() {
+      const raw = this.read(RETURN_KEY)
+      if (raw) this.write(RETURN_KEY, '')
+      try { return normalizeReturnView(JSON.parse(raw || 'null')) } catch (error) { return null }
+    },
+
+    rememberReturnView() {
+      const value = normalizeReturnView(this.currentLocation) || { kind: 'home' }
+      return this.write(RETURN_KEY, JSON.stringify(value))
+    },
+
+    restoreLocation(location) {
+      const value = normalizeReturnView(location)
+      if (!value || value.kind === 'home') return this.home()
+      if (value.kind === 'list') return this.chats(value.archived, value.offset)
+      this.chatDetail({
+        id: value.chat.id,
+        title: value.chat.title,
+        archived: value.chat.archived,
+        mode: value.chat.mode,
+        latestJob: null
+      }, value.offset, value.origin)
     },
 
     migrateLegacyDraft() {
@@ -184,18 +295,50 @@ export function createMusafirPage() {
       } catch (error) {}
     },
 
-    write(key, value) {
-      if (!this.storage) return false
-      try { this.storage.setItem(key, value); return true } catch (error) { return false }
+    updateButton(button, visible, rectangle, text) {
+      button.setProperty(prop.MORE, {
+        x: rectangle.x, y: rectangle.y, w: rectangle.w, h: rectangle.h, text: text || ''
+      })
+      button.setProperty(prop.VISIBLE, Boolean(visible))
+    },
+
+    headerRectangle() {
+      return { x: this.margin + 60, y: 18, w: this.width - this.margin * 2 - 60, h: 56 }
     },
 
     refreshHero() {
       const hero = heroById(this.read(HERO_KEY))
       this.hero = hero
-      this.heroButton.setProperty(prop.TEXT, `${hero.name} · ${hero.meaning}`)
+      if (!this.heroButton) return
+      this.updateButton(this.heroButton, this.heroButtonVisible !== false, this.headerRectangle(),
+        `${hero.name} · ${hero.meaning}`)
       this.heroImage.setProperty(prop.MORE, {
-        x: this.px(32), y: this.px(33), w: 44, h: 44, src: `heroes/${hero.id}-small.png`
+        x: this.margin + 8, y: 24, w: 44, h: 44, src: `heroes/${hero.id}-small.png`
       })
+    },
+
+    heroData() {
+      const selected = heroById(this.read(HERO_KEY)).id
+      return MUSAFIR_HEROES.map(hero => ({
+        tap: ' ',
+        name: `${hero.id === selected ? '✓ ' : ''}${hero.name}`,
+        meaning: hero.meaning,
+        image: `heroes/${hero.id}-picker.png`
+      }))
+    },
+
+    layout(view) {
+      const hasPrimary = Boolean(view.primary)
+      const footerCount = (view.footer || []).filter(Boolean).length
+      const primaryY = this.height - this.bottom - this.controlHeight
+      const footerY = (hasPrimary ? primaryY - this.gap : this.height - this.bottom) -
+        (footerCount ? this.controlHeight : 0)
+      return {
+        contentY: view.home ? 146 : 136,
+        primaryY,
+        footerY,
+        contentBottom: (footerCount ? footerY : hasPrimary ? primaryY : this.height - this.bottom) - this.gap
+      }
     },
 
     display(view, generation, remember = true) {
@@ -203,61 +346,96 @@ export function createMusafirPage() {
       if (generation == null) ++this.generation
       else if (generation !== this.generation) return
       if (remember) this.currentView = () => this.display(view)
+      this.currentBack = typeof view.back === 'function' ? view.back : null
+      this.heroPickerActive = view.heroPicker === true
 
-      this.heading.setProperty(prop.TEXT, view.title || '')
-      this.note.setProperty(prop.TEXT, view.note || '')
-      this.bannerItems = view.banners || []
-      this.items = view.items || []
-      this.footerItems = view.footer || []
+      const homeHeader = view.home === true
+      this.heroButtonVisible = homeHeader
+      this.updateButton(this.heroButton, homeHeader, this.headerRectangle(), `${this.hero.name} · ${this.hero.meaning}`)
+      this.heroImage.setProperty(prop.VISIBLE, homeHeader)
+      this.updateButton(this.topBack, Boolean(this.currentBack),
+        { x: this.margin, y: 14, w: 116, h: 48 }, '‹ Назад')
+
+      const headingY = homeHeader ? 78 : 68
+      this.heading.setProperty(prop.MORE, {
+        x: this.margin, y: headingY, w: this.width - this.margin * 2, h: 28, text: view.title || ''
+      })
+      this.note.setProperty(prop.MORE, {
+        x: this.margin, y: headingY + 28, w: this.width - this.margin * 2,
+        h: view.heroPicker ? 24 : 36, text: view.note || ''
+      })
+      this.heroHint.setProperty(prop.VISIBLE, this.heroPickerActive)
+      this.heroScroll.setProperty(prop.VISIBLE, this.heroPickerActive)
+      if (this.heroPickerActive) {
+        this.heroScroll.setProperty(prop.UPDATE_DATA, {
+          data_array: this.heroData(), data_count: MUSAFIR_HEROES.length, on_page: 0
+        })
+      }
+
+      this.bannerItems = []
+      this.items = []
+      this.footerItems = []
+      this.primaryItem = null
+      const hiddenRect = { x: this.margin, y: 136, w: this.width - this.margin * 2, h: this.controlHeight }
+      if (this.heroPickerActive) {
+        this.banners.forEach(button => this.updateButton(button, false, hiddenRect, ''))
+        this.rows.forEach(button => this.updateButton(button, false, hiddenRect, ''))
+        this.footer.forEach(button => this.updateButton(button, false, hiddenRect, ''))
+        this.updateButton(this.primary, false, hiddenRect, '')
+        return
+      }
+
+      const layout = this.layout(view)
+      const capacity = Math.max(0, Math.floor((layout.contentBottom - layout.contentY + this.gap) /
+        (this.controlHeight + this.gap)))
+      this.bannerItems = (view.banners || []).slice(0, Math.min(2, capacity))
+      this.items = (view.items || []).slice(0, Math.min(3, capacity - this.bannerItems.length))
+      this.footerItems = (view.footer || []).filter(Boolean).slice(0, 3)
       this.primaryItem = view.primary || null
 
-      const px = this.px
-      let y = 162
-      this.banners.forEach((banner, index) => {
+      let y = layout.contentY
+      this.banners.forEach((button, index) => {
         const item = this.bannerItems[index]
-        banner.setProperty(prop.VISIBLE, Boolean(item))
-        if (!item) return
-        banner.setProperty(prop.TEXT, item.label)
-        banner.setProperty(prop.MORE, { x: px(24), y: px(y), w: this.width - px(48), h: px(51) })
-        y += 56
+        this.updateButton(button, Boolean(item),
+          { x: this.margin, y, w: this.width - this.margin * 2, h: this.controlHeight },
+          item && item.label)
+        if (item) y += this.controlHeight + this.gap
+        button.clickAction = () => this.bannerItems[index] && this.bannerItems[index].action()
       })
-      this.rows.forEach((row, index) => {
+      this.rows.forEach((button, index) => {
         const item = this.items[index]
-        const image = this.rowImages[index]
-        row.setProperty(prop.VISIBLE, Boolean(item))
-        image.setProperty(prop.VISIBLE, Boolean(item && item.image))
-        if (!item) return
-        const imageSpace = item.image ? 60 : 0
-        row.setProperty(prop.TEXT, item.label)
-        row.setProperty(prop.MORE, {
-          x: px(24) + imageSpace, y: px(y + index * 56),
-          w: this.width - px(48) - imageSpace, h: px(51)
-        })
-        if (item.image) image.setProperty(prop.MORE, {
-          x: px(28), y: px(y + 3 + index * 56), w: 44, h: 44, src: item.image
-        })
+        this.updateButton(button, Boolean(item), {
+          x: this.margin,
+          y: y + index * (this.controlHeight + this.gap),
+          w: this.width - this.margin * 2,
+          h: this.controlHeight
+        }, item && item.label)
+        button.clickAction = () => this.items[index] && this.items[index].action()
       })
+
+      const footerCount = this.footerItems.length
+      const usable = this.width - this.margin * 2 - this.gap * Math.max(0, footerCount - 1)
+      const footerWidth = footerCount ? Math.floor(usable / footerCount) : usable
       this.footer.forEach((button, index) => {
         const item = this.footerItems[index]
-        button.setProperty(prop.VISIBLE, Boolean(item))
-        if (!item) return
-        button.setProperty(prop.TEXT, item.label)
-        if (this.footerItems[0] && this.footerItems[1] && !this.footerItems[2]) {
-          const gap = px(8)
-          const buttonWidth = Math.floor((this.width - px(48) - gap) / 2)
-          button.setProperty(prop.MORE, {
-            x: index === 0 ? px(24) : px(24) + buttonWidth + gap,
-            y: px(386), w: buttonWidth, h: px(51)
-          })
-        } else {
-          button.setProperty(prop.MORE, {
-            x: px(24 + index * 132), y: px(386),
-            w: px(index === 2 ? 120 : 112), h: px(51)
-          })
-        }
+        const x = this.margin + index * (footerWidth + this.gap)
+        const w = index === footerCount - 1 ? this.width - this.margin - x : footerWidth
+        this.updateButton(button, Boolean(item),
+          { x, y: layout.footerY, w: Math.max(1, w), h: this.controlHeight }, item && item.label)
+        button.clickAction = () => this.footerItems[index] && this.footerItems[index].action()
       })
-      this.primary.setProperty(prop.VISIBLE, Boolean(this.primaryItem))
-      if (this.primaryItem) this.primary.setProperty(prop.TEXT, this.primaryItem.label)
+      this.updateButton(this.primary, Boolean(this.primaryItem),
+        { x: this.margin, y: layout.primaryY, w: this.width - this.margin * 2, h: this.controlHeight },
+        this.primaryItem && this.primaryItem.label)
+      this.primary.clickAction = () => this.primaryItem && this.primaryItem.action()
+    },
+
+    goBack() {
+      const action = this.currentBack
+      if (!action) return false
+      this.currentBack = null
+      action()
+      return true
     },
 
     cancelRequests() {
@@ -284,15 +462,17 @@ export function createMusafirPage() {
       })
     },
 
-    async load(method, params, done, back, title = 'Мусафир') {
+    async load(method, params, done, back, title = 'Мусафир', home = false) {
       this.cancelRequests()
       const generation = ++this.generation
       this.display({
+        home,
+        back,
         title,
         note: 'Получаю данные с Mac…',
-        footer: back ? [{ label: 'Назад', action: back }] : []
+        primary: home ? { label: 'Новая задача', action: () => this.newChat('task') } : null
       }, generation)
-      this.currentView = () => this.load(method, params, done, back, title)
+      this.currentView = () => this.load(method, params, done, back, title, home)
       try {
         const reply = await this.boundedRequest({ method, params })
         if (this.closed || generation !== this.generation) return
@@ -301,18 +481,20 @@ export function createMusafirPage() {
       } catch (error) {
         if (this.closed || generation !== this.generation) return
         this.display({
+          home,
+          back,
           title: 'Не удалось',
-          note: clip(error && error.message || error, 120),
-          items: [{ label: 'Повторить', action: () => this.load(method, params, done, back, title) }],
-          footer: back ? [{ label: 'Назад', action: back }] : [],
+          note: clip(error && error.message || error, 80),
+          items: [{ label: 'Повторить', action: () => this.load(method, params, done, back, title, home) }],
           primary: { label: 'Новая задача', action: () => this.newChat('task') }
         }, generation)
       }
     },
 
     home() {
+      this.currentLocation = { kind: 'home' }
       this.load('CHAT_LIST', { offset: 0, limit: 10, archived: false },
-        (reply, generation) => this.homeReply(reply, generation), null, 'Мусафир')
+        (reply, generation) => this.homeReply(reply, generation), null, 'Мусафир', true)
     },
 
     homeReply(reply, generation) {
@@ -322,7 +504,10 @@ export function createMusafirPage() {
       let pending = null
       try { pending = JSON.parse(this.read(PENDING_KEY) || 'null') } catch (error) {}
       if (validPendingContext(pending)) {
-        banners.push({ label: 'Черновик · продолжить', action: () => this.openContext(pending) })
+        banners.push({
+          label: pending.pendingSend ? 'Проверить отправку' : 'Черновик · продолжить',
+          action: () => this.openContext(pending)
+        })
       }
       const active = reply.activeJob
       if (active) {
@@ -339,12 +524,13 @@ export function createMusafirPage() {
         })
       }
       this.display({
+        home: true,
         title: 'Последние чаты',
         note: chats.length ? 'Продолжи тему или начни новую' : 'Здесь появятся твои задачи',
         banners,
         items: chats.slice(0, 2).map(chat => ({
           label: this.chatLabel(chat),
-          action: () => this.chatDetail(chat)
+          action: () => this.chatDetail(chat, 0, { kind: 'home' })
         })),
         footer: [
           { label: 'Все чаты', action: () => this.chats(false, 0) },
@@ -361,37 +547,66 @@ export function createMusafirPage() {
     },
 
     chats(archived = false, offset = 0) {
-      this.load('CHAT_LIST', { offset, limit: 3, archived }, (reply, generation) => {
-        checkedChatList(reply, 3)
-        const chats = reply.chats.slice(0, 3)
-        const firstAction = offset > 0
-          ? { label: 'Раньше', action: () => this.chats(archived, Math.max(0, offset - 3)) }
-          : { label: 'Домой', action: () => this.home() }
-        this.display({
-          title: archived ? 'Архив' : 'Все чаты',
-          note: chats.length ? 'По три чата на странице' : archived ? 'Архив пуст' : 'Чатов пока нет',
-          items: chats.map(chat => ({ label: this.chatLabel(chat), action: () => this.chatDetail(chat) })),
-          footer: [
-            firstAction,
-            { label: archived ? 'Активные' : 'Архив', action: () => this.chats(!archived, 0) },
-            reply.nextOffset == null ? null : { label: 'Дальше', action: () => this.chats(archived, reply.nextOffset) }
-          ]
-        }, generation)
-      }, () => this.home(), archived ? 'Архив' : 'Все чаты')
+      const location = { kind: 'list', archived: Boolean(archived), offset: Math.max(0, offset) }
+      this.currentLocation = location
+      this.load('CHAT_LIST', { offset: location.offset, limit: 3, archived: location.archived },
+        (reply, generation) => {
+          checkedChatList(reply, 3)
+          const chats = reply.chats.slice(0, 3)
+          this.display({
+            back: () => this.home(),
+            title: location.archived ? 'Архив' : 'Все чаты',
+            note: chats.length ? 'По три чата на странице' : location.archived ? 'Архив пуст' : 'Чатов пока нет',
+            items: chats.map(chat => ({
+              label: this.chatLabel(chat),
+              action: () => this.chatDetail(chat, 0, location)
+            })),
+            footer: [
+              { label: location.archived ? 'Активные' : 'Архив', action: () => this.chats(!location.archived, 0) },
+              location.offset > 0
+                ? { label: 'Раньше', action: () => this.chats(location.archived, Math.max(0, location.offset - 3)) }
+                : null,
+              reply.nextOffset == null
+                ? null
+                : { label: 'Дальше', action: () => this.chats(location.archived, reply.nextOffset) }
+            ]
+          }, generation)
+        }, () => this.home(), location.archived ? 'Архив' : 'Все чаты')
     },
 
-    chatDetail(chat, offset = 0) {
+    chatDetail(chat, offset = 0, origin = { kind: 'home' }) {
       if (!chat || !validChatId(chat.id)) return this.home()
-      this.load('CHAT_DETAIL', { chatId: chat.id, offset, limit: 2 },
-        (reply, generation) => this.detailReply(checkedChatDetail(reply, chat.id, offset), chat, offset, generation),
-        () => this.chats(Boolean(chat.archived), 0), clip(chat.title, 30) || 'Чат')
+      const safeOrigin = normalizeOrigin(origin)
+      const safeOffset = Number.isSafeInteger(offset) && offset >= 0 ? offset : 0
+      this.currentLocation = {
+        kind: 'detail',
+        chat: {
+          id: chat.id,
+          title: clip(chat.title, 80),
+          archived: Boolean(chat.archived),
+          mode: modeOf(chat.mode || chat.latestJob && chat.latestJob.mode)
+        },
+        offset: safeOffset,
+        origin: safeOrigin
+      }
+      this.load('CHAT_DETAIL', { chatId: chat.id, offset: safeOffset, limit: 2 },
+        (reply, generation) => this.detailReply(
+          checkedChatDetail(reply, chat.id, safeOffset), chat, safeOffset, safeOrigin, generation),
+        () => this.restoreLocation(safeOrigin), clip(chat.title, 30) || 'Чат')
     },
 
-    detailReply(reply, fallback, offset, generation) {
+    detailReply(reply, fallback, offset, origin, generation) {
       const chat = reply.chat
       const jobs = reply.jobs
-      const latestMode = modeOf(offset === 0 && jobs[0] && jobs[0].mode || fallback.latestJob && fallback.latestJob.mode)
-      const chatForPaging = { ...fallback, ...chat, latestJob: fallback.latestJob || null }
+      const latestMode = modeOf(offset === 0 && jobs[0] && jobs[0].mode ||
+        fallback.mode || fallback.latestJob && fallback.latestJob.mode)
+      const chatForPaging = { ...fallback, ...chat, mode: latestMode, latestJob: fallback.latestJob || null }
+      this.currentLocation = {
+        kind: 'detail',
+        chat: { id: chat.id, title: clip(chat.title, 80), archived: chat.archived, mode: latestMode },
+        offset,
+        origin: normalizeOrigin(origin)
+      }
       const jobItems = jobs.map(job => ({
         label: clip(job.summary || job.text || job.state, 42) || 'Открыть ответ',
         action: () => this.openContext({
@@ -401,73 +616,96 @@ export function createMusafirPage() {
       }))
       if (reply.nextOffset !== null) jobItems.push({
         label: 'Более ранние ответы',
-        action: () => this.chatDetail(chatForPaging, reply.nextOffset)
+        action: () => this.chatDetail(chatForPaging, reply.nextOffset, origin)
       })
       this.display({
+        back: () => this.restoreLocation(origin),
         title: clip(chat.title, 34) || 'Чат',
         note: jobs.length ? offset ? `Ответы ${offset + 1}–${offset + jobs.length}` : 'Последние ответы'
           : 'В этом чате пока нет ответов',
         items: jobItems,
         footer: [
-          { label: 'Назад', action: () => this.chats(Boolean(chat.archived), 0) },
-          { label: chat.archived ? 'Восстановить' : 'Архивировать', action: () => this.archiveConfirm(chatForPaging, offset) },
-          offset > 0 ? { label: 'Новее', action: () => this.chatDetail(chatForPaging, Math.max(0, offset - 2)) } : null
+          {
+            label: chat.archived ? 'Восстановить' : 'Архивировать',
+            action: () => this.archiveConfirm(chatForPaging, offset, origin)
+          },
+          offset > 0
+            ? { label: 'Новее', action: () => this.chatDetail(chatForPaging, Math.max(0, offset - 2), origin) }
+            : null
         ],
-        primary: chat.archived ? null : { label: 'Продолжить', action: () => this.openContext({
-          target: 'musafir', chatId: chat.id, mode: latestMode, jobId: null,
-          openJob: false, autoRecord: true
-        }) }
+        primary: chat.archived ? null : {
+          label: 'Продолжить',
+          action: () => this.openCompose({
+            target: 'musafir', chatId: chat.id, mode: latestMode, jobId: null,
+            openJob: false, autoRecord: false
+          })
+        }
       }, generation)
     },
 
-    archiveConfirm(chat, offset = 0) {
+    archiveConfirm(chat, offset = 0, origin = { kind: 'home' }) {
       if (chat.archived) {
-        this.setArchived(chat, false, offset)
+        this.setArchived(chat, false, offset, origin)
         return
       }
       this.display({
+        back: () => this.chatDetail(chat, offset, origin),
         title: clip(chat.title, 34) || 'Чат',
         note: 'Чат можно будет восстановить из архива',
-        items: [{ label: 'Архивировать', action: () => this.setArchived(chat, true, offset) }],
-        footer: [{ label: 'Отмена', action: () => this.chatDetail(chat, offset) }]
+        items: [{ label: 'Архивировать', action: () => this.setArchived(chat, true, offset, origin) }]
       })
     },
 
-    setArchived(chat, archived, offset = 0) {
+    setArchived(chat, archived, offset = 0, origin = { kind: 'home' }) {
       this.load('CHAT_ARCHIVE', { chatId: chat.id, archived }, reply => {
         if (reply.chatId !== chat.id || reply.archived !== archived) throw new Error('Некорректный ответ архива')
-        this.chatDetail({ ...chat, archived }, offset)
-      }, () => this.chatDetail(chat, offset), archived ? 'Архивирую' : 'Восстанавливаю')
+        this.chatDetail({ ...chat, archived }, offset, origin)
+      }, () => this.chatDetail(chat, offset, origin), archived ? 'Архивирую' : 'Восстанавливаю')
     },
 
     newChat(mode) {
-      this.openContext({ target: 'musafir', chatId: null, mode: modeOf(mode), jobId: null,
-        openJob: false, autoRecord: true })
+      this.openCompose({
+        target: 'musafir', chatId: null, mode: modeOf(mode), jobId: null,
+        openJob: false, autoRecord: false
+      })
     },
 
-    openContext(context) {
+    openCompose(context) {
       const raw = this.read(PENDING_KEY)
       let pending = null
       try { pending = JSON.parse(raw || 'null') } catch (error) {}
-      if (context.autoRecord && validPendingContext(pending)) {
-        const back = this.currentView || (() => this.home())
+      if (!validPendingContext(pending)) return this.openContext(context)
+      const back = this.currentView || (() => this.home())
+      const uncertain = pending.pendingSend === true
+      this.display({
+        back,
+        title: uncertain ? 'Проверим отправку' : 'Есть черновик',
+        note: uncertain ? 'Задание могло быть принято. Открой его статус.' : 'Продолжи его или явно начни новую задачу',
+        items: [
+          {
+            label: uncertain ? 'Открыть задание' : 'Продолжить черновик',
+            action: () => this.openContext({ ...pending, autoRecord: false })
+          },
+          ...(uncertain ? [] : [{
+            label: 'Начать заново',
+            action: () => this.discardPendingAndStart(context, raw, pending)
+          }])
+        ]
+      })
+    },
+
+    openContext(context) {
+      const value = voiceContext(context)
+      const back = this.currentView || (() => this.home())
+      if (!this.write(CONTEXT_KEY, JSON.stringify(value))) {
         this.display({
-          title: pending.pendingSend ? 'Проверим отправку' : 'Есть черновик',
-          note: pending.pendingSend ? 'Задание могло быть принято. Открой его статус.' : 'Продолжи его или явно начни новую запись',
-          items: [
-            { label: pending.pendingSend ? 'Открыть задание' : 'Продолжить черновик',
-              action: () => this.openContext({ ...pending, autoRecord: false }) },
-            ...(pending.pendingSend ? [] : [{ label: 'Новая запись', action: () => this.discardPendingAndStart(context, raw, pending) }])
-          ],
-          footer: [{ label: 'Назад', action: back }]
+          back,
+          title: 'Не удалось сохранить',
+          note: 'Чат не открыт. Проверьте свободное место на часах.'
         })
         return
       }
-      if (!this.write(CONTEXT_KEY, JSON.stringify(context))) {
-        this.display({ title: 'Не удалось сохранить', note: 'Чат не открыт. Проверьте свободное место на часах.',
-          footer: [{ label: 'Назад', action: () => this.home() }] })
-        return
-      }
+      this.rememberReturnView()
       replace({ url: 'page/voice' })
     },
 
@@ -486,32 +724,29 @@ export function createMusafirPage() {
       this.openContext(context)
     },
 
-    heroPicker(page = 0, returnView) {
+    heroPicker(returnView) {
       this.cancelRequests()
       const back = returnView || this.currentView || (() => this.home())
-      const start = page * 3
-      const choices = MUSAFIR_HEROES.slice(start, start + 3)
+      this.heroReturnView = back
       this.display({
+        back,
+        heroPicker: true,
         title: 'Выбери героя',
-        note: 'Только внешний вид',
-        items: choices.map(hero => ({
-          label: `${hero.name} · ${hero.meaning}`,
-          image: `heroes/${hero.id}-small.png`,
-          action: () => {
-            if (!this.write(HERO_KEY, hero.id)) {
-              this.note.setProperty(prop.TEXT, 'Не удалось сохранить выбор')
-              return
-            }
-            this.refreshHero()
-            back()
-          }
-        })),
-        footer: [
-          { label: 'Назад', action: back },
-          page > 0 ? { label: 'Раньше', action: () => this.heroPicker(page - 1, back) } : null,
-          start + 3 < MUSAFIR_HEROES.length ? { label: 'Дальше', action: () => this.heroPicker(page + 1, back) } : null
-        ]
+        note: 'Только внешний вид'
       }, null, false)
+    },
+
+    chooseHero(index) {
+      if (!this.heroPickerActive || !Number.isInteger(index) || !MUSAFIR_HEROES[index]) return
+      const hero = MUSAFIR_HEROES[index]
+      if (!this.write(HERO_KEY, hero.id)) {
+        this.note.setProperty(prop.TEXT, 'Не удалось сохранить выбор')
+        return
+      }
+      this.refreshHero()
+      const back = this.heroReturnView || (() => this.home())
+      this.heroPickerActive = false
+      back()
     },
 
     onDestroy() {
@@ -519,6 +754,8 @@ export function createMusafirPage() {
       this.closed = true
       ++this.generation
       this.cancelRequests()
+      offGesture()
+      offKey()
     }
   }
 }
