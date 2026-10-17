@@ -24,6 +24,7 @@ function sourcePath(pathname) {
   if (pathname === '/page/report.js') return join(root, 'page/report.js')
   if (pathname === '/page/orca.js') return join(root, 'page/orca.js')
   if (pathname === '/page/history.js') return join(root, 'page/history.js')
+  if (pathname === '/shared/bridge-client.js') return join(root, 'shared/bridge-client.js')
   if (pathname === '/shared/watch-client.js') return join(root, 'shared/watch-client.js')
   if (pathname === '/shared/orca-voice.js') return join(root, 'shared/orca-voice.js')
   if (pathname === '/shared/watch-alerts.js') return join(root, 'shared/watch-alerts.js')
@@ -39,7 +40,7 @@ function sourcePath(pathname) {
   if (pathname.startsWith('/assets/common.s/')) {
     const name = pathname.slice('/assets/common.s/'.length)
     if (/^[a-zA-Z0-9._-]+\.png$/.test(name)) return join(root, 'assets/common.s', name)
-    if (/^heroes\/(?:musafir|kashif|barq|hakim|amin)(?:-[0-2])?\.png$/.test(name)) {
+    if (/^heroes\/(?:musafir|kashif|barq|hakim|amin)(?:-[0-2]|-small)?\.png$/.test(name)) {
       return join(root, 'assets/common.s', ...name.split('/'))
     }
   }

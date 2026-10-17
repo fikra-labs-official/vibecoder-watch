@@ -45,3 +45,16 @@ Unit tests cover migration, session isolation, continuation, replay protection,
 stop races, reports, UI navigation and cosmetic hero selection. The browser preview
 is a widget simulation. Real watch keyboard, BLE, brightness and motion still need
 physical-device acceptance.
+
+## Phone and native-screen release checks
+
+Every new Musafir RPC must be listed in the `musafir` profile of
+`shared/bridge-client.js`. The installed Side Service must forward the same
+payload; a mock bridge response alone does not verify this boundary. The browser
+preview now passes synthetic requests through the production forwarding function.
+
+Musafir pages hide the native square-screen title bar through
+`setStatusBarVisible(false)` and restore it when destroyed. Menu icons are 44×44
+PNG resources; working poses are 80×80. Widget bounds match the resource pixels,
+including SRC changes, without requiring runtime image scaling. Initial hidden
+widgets use `setProperty(prop.VISIBLE, false)`, not a constructor flag.

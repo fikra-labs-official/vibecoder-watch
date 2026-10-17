@@ -43,6 +43,7 @@ function fixture({ width = 432, height = 514, storage = new Map(), request } = {
   const widgets = []
   const replacements = []
   const calls = []
+  const statusBars = []
   const timers = new Map()
   let nextTimer = 0
   vm.runInNewContext(source, {
@@ -51,6 +52,7 @@ function fixture({ width = 432, height = 514, storage = new Map(), request } = {
     MUSAFIR_HEROES,
     heroById,
     getDeviceInfo: () => ({ width, height }),
+    setStatusBarVisible: value => statusBars.push(value),
     replace: value => replacements.push(value),
     LocalStorage: class {
       getItem(key) { return storage.get(key) }
@@ -59,7 +61,9 @@ function fixture({ width = 432, height = 514, storage = new Map(), request } = {
     createWidget(kind, options) {
       const item = {
         kind,
-        options: { visible: true, ...options },
+        events: {},
+        addEventListener(type, callback) { this.events[type] = callback },
+        options: { ...options, visible: true },
         setProperty(property, value) {
           if (property === 'more') Object.assign(this.options, value)
           else this.options[property] = value
@@ -69,6 +73,7 @@ function fixture({ width = 432, height = 514, storage = new Map(), request } = {
       return item
     },
     widget: { FILL_RECT: 1, TEXT: 2, BUTTON: 3, IMG: 4 },
+    event: { CLICK_UP: 'click_up' },
     align: { CENTER_H: 1, CENTER_V: 2, LEFT: 3 },
     text_style: { WRAP: 1 },
     prop: { TEXT: 'text', VISIBLE: 'visible', MORE: 'more' },
@@ -83,7 +88,7 @@ function fixture({ width = 432, height = 514, storage = new Map(), request } = {
     })
   }
   page.build()
-  return { page, widgets, replacements, calls, storage, timers,
+  return { page, widgets, replacements, calls, storage, timers, statusBars,
     tick(delay) {
       const match = [...timers].find(([, timer]) => timer.delay === delay)
       assert.ok(match, `Expected a ${delay}ms timer`)
@@ -107,7 +112,7 @@ test('home loads chats without reopening an old answer and New task starts recor
   assert.equal(f.page.rows[0].options.text.includes('Авто в Каире'), true)
   assert.equal(f.page.rows[1].options.text.includes('Идеи проекта'), true)
   assert.equal(f.page.primary.options.text, 'Новая задача')
-  assert.equal(f.page.heroImage.options.src, 'heroes/musafir.png')
+  assert.equal(f.page.heroImage.options.src, 'heroes/musafir-small.png')
   f.page.primary.options.click_func()
   assert.deepEqual(JSON.parse(f.storage.get('musafir-context')), {
     target: 'musafir', chatId: null, mode: 'task', jobId: null, openJob: false, autoRecord: true
@@ -212,12 +217,12 @@ test('hero picker is cosmetic and returns to the same chat screen', async () => 
   assert.equal(f.page.rows[0].options.text, 'Hakim · Мудрый')
   f.page.rows[1].options.click_func()
   assert.equal(f.storage.get('musafir-hero'), 'amin')
-  assert.equal(f.page.heroImage.options.src, 'heroes/amin.png')
+  assert.equal(f.page.heroImage.options.src, 'heroes/amin-small.png')
   assert.equal(f.page.heading.options.text, CHAT.title)
   assert.equal(f.page.footer[1].options.text, 'Архивировать')
   assert.equal(f.calls.length, callCount)
   assert.equal(f.storage.get('musafir-context'), savedContext)
-  assert.equal(f.page.heroImage.options.auto_scale, true)
+  assert.equal(f.page.heroImage.options.auto_scale, undefined)
 })
 
 test('late chat-list replies cannot replace a newer screen', async () => {
@@ -387,4 +392,33 @@ test('destroy cancels the outer deadline of a pending request', async () => {
   assert.equal(f.timers.size, 0)
   await flush()
   assert.equal(f.page.heading.options.text, 'Мусафир')
+})
+
+
+test('native cold error screen hides the OS bar and uses PNG bounds that cannot overlap text', async () => {
+  for (const [width, height] of [[432, 514], [390, 450], [390, 400]]) {
+    const f = fixture({ width, height, request: async () => ({ ok: false, error: 'Нет ответа Mac' }) })
+    assert.deepEqual(f.statusBars, [false])
+    assert.ok(f.page.rowImages.every(image => image.options.visible === false))
+    await flush()
+    assert.equal(f.page.heading.options.text, 'Не удалось')
+    const hero = f.page.heroImage.options
+    const png = fs.readFileSync(new URL('../assets/common.s/' + hero.src, import.meta.url))
+    assert.equal(hero.w, png.readUInt32BE(16))
+    assert.equal(hero.h, png.readUInt32BE(20))
+    assert.ok(hero.y + hero.h <= f.page.heading.options.y)
+    assert.ok(hero.x + hero.w <= f.page.heroButton.options.x)
+    assert.ok(f.page.heading.options.y + f.page.heading.options.h <= f.page.note.options.y)
+    assert.ok(f.page.note.options.y + f.page.note.options.h <= f.page.rows[0].options.y)
+    f.page.heroImage.events.click_up()
+    assert.equal(f.page.heading.options.text, 'Выбери героя')
+    for (const image of f.page.rowImages) {
+      if (!image.options.visible) continue
+      const data = fs.readFileSync(new URL('../assets/common.s/' + image.options.src, import.meta.url))
+      assert.equal(image.options.w, data.readUInt32BE(16))
+      assert.equal(image.options.h, data.readUInt32BE(20))
+    }
+    f.page.onDestroy()
+    assert.deepEqual(f.statusBars, [false, true])
+  }
 })

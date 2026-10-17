@@ -1,3 +1,4 @@
+import { forwardVoiceRequest } from '/shared/bridge-client.js'
 import { MAX_AUDIO_BYTES, createWatchClient } from '/shared/watch-client.js'
 import { createFolderVoiceRoute, createOrcaVoiceRoute } from '/shared/orca-voice.js'
 import {
@@ -166,7 +167,7 @@ function imageSource(value) {
   const raw = String(value || '')
   if (!raw) return ''
   if (raw.startsWith('/') || raw.startsWith('data:')) return raw
-  if (/^heroes\/(?:musafir|kashif|barq|hakim|amin)(?:-[0-2])?\.png$/.test(raw)) {
+  if (/^heroes\/(?:musafir|kashif|barq|hakim|amin)(?:-[0-2]|-small)?\.png$/.test(raw)) {
     return `/assets/common.s/${raw}`
   }
   return `/assets/common.s/${raw.split('/').pop()}`
@@ -214,6 +215,11 @@ function applyWidget(record) {
   if (type === widget.IMG) {
     node.src = imageSource(options.src)
     node.alt = ''
+    node.style.objectFit = options.auto_scale ? 'contain' : 'none'
+    if (!options.auto_scale && node.naturalWidth) {
+      node.style.width = `${node.naturalWidth}px`
+      node.style.height = `${node.naturalHeight}px`
+    }
   }
 }
 
@@ -223,7 +229,11 @@ function createWidget(type, initial = {}) {
   const record = {
     type,
     node,
-    options: { ...initial },
+    options: { ...initial, visible: true },
+    addEventListener(type, callback) {
+      node.style.pointerEvents = 'auto'
+      node.addEventListener(type, callback)
+    },
     setProperty(property, value) {
       if (property === prop.MORE && value && typeof value === 'object') Object.assign(this.options, value)
       else this.options[property] = value
@@ -233,7 +243,13 @@ function createWidget(type, initial = {}) {
   }
   if (type === widget.BUTTON) node.addEventListener('click', () => record.options.click_func?.())
   node.addEventListener('error', () => { if (type === widget.IMG) node.style.visibility = 'hidden' })
-  node.addEventListener('load', () => { if (type === widget.IMG) node.style.visibility = '' })
+  node.addEventListener('load', () => { if (type === widget.IMG) {
+    node.style.visibility = ''
+    if (!record.options.auto_scale) {
+      node.style.width = `${node.naturalWidth}px`
+      node.style.height = `${node.naturalHeight}px`
+    }
+  } })
   widgets.push(record)
   layer.append(node)
   applyWidget(record)
@@ -308,6 +324,13 @@ function knownJob(id) {
 }
 
 function localRequest(payload) {
+  // Exercise the same phone allowlist as the installed Side Service.
+  return forwardVoiceRequest(payload, async options => ({
+    status: 200, body: await syntheticBridge(JSON.parse(options.body))
+  }), 'https://preview.invalid', 'preview-placeholder', appKind)
+}
+
+function syntheticBridge(payload) {
   const ownSession = session
   const delay = payload.method === 'AUDIO_CHUNK' ? 105 : 220
   return new Promise((resolve, reject) => setTimeout(() => {
@@ -315,6 +338,10 @@ function localRequest(payload) {
     const params = payload.params || {}
     switch (payload.method) {
       case 'CHAT_LIST': {
+        if (scenario === 'home-error') {
+          resolve({ ok: false, error: 'Телефон не получил ответ Mac' })
+          return
+        }
         const offset = Number.isSafeInteger(params.offset) && params.offset >= 0 ? params.offset : 0
         const limit = Number.isSafeInteger(params.limit) && params.limit > 0 ? Math.min(params.limit, 10) : 3
         const chats = allDemoChats().filter(chat => chat.archived === (params.archived === true))
@@ -705,7 +732,7 @@ function evaluatePage(source, sourcePath) {
   }
   const executable = `${prefix}\n${executableSource(source)}`
   const names = [
-    'createWidget', 'widget', 'align', 'text_style', 'prop', 'getTextLayout',
+    'createWidget', 'widget', 'align', 'text_style', 'prop', 'event', 'getTextLayout', 'setStatusBarVisible',
     'getDeviceInfo', 'setTimeout', 'clearTimeout', 'codec', 'create', 'mediaId',
     'closeSync', 'openSync', 'O_RDONLY', 'readSync', 'rmSync', 'statSync',
     'BasePage', 'MAX_AUDIO_BYTES', 'createWatchClient', 'createFolderVoiceRoute',
@@ -716,7 +743,8 @@ function evaluatePage(source, sourcePath) {
     'resetDropWristScreenOff', 'Vibrator', 'VIBRATOR_SCENE_SHORT_STRONG', 'keyboardUI'
   ]
   const values = [
-    createWidget, widget, align, text_style, prop, getTextLayout,
+    createWidget, widget, align, text_style, prop, { CLICK_UP: 'click' }, getTextLayout,
+    visible => { document.querySelector('.os-header').hidden = !visible },
     () => appKind === 'musafir' ? { width: 432, height: 514 } : { width: 390, height: 450 },
     window.setTimeout.bind(window), window.clearTimeout.bind(window),
     { OPUS: 'opus' }, media.create, media.RECORDER,
@@ -744,6 +772,7 @@ function destroyPage() {
   fileHandles.clear()
   widgets.splice(0)
   layer.replaceChildren()
+  document.querySelector('.os-header').hidden = false
 }
 
 async function navigate(path) {

@@ -1,4 +1,4 @@
-import { createWidget, widget, align, text_style, prop, getTextLayout } from '@zos/ui'
+import { createWidget, widget, align, text_style, prop, getTextLayout, setStatusBarVisible } from '@zos/ui'
 import { getDeviceInfo } from '@zos/device'
 import { replace } from '@zos/router'
 import { LocalStorage } from '@zos/storage'
@@ -30,6 +30,7 @@ function splitText(text, fits) {
 export function createMusafirReportPage() {
   return {
     build() {
+      setStatusBarVisible(false)
       const { width, height } = getDeviceInfo()
       this.px = value => Math.round(value * Math.min(width / 432, height / 514))
       const px = this.px
@@ -152,6 +153,7 @@ export function createMusafirReportPage() {
     },
 
     onDestroy() {
+      setStatusBarVisible(true)
       this.closed = true
       ++this.generation
       if (this.cancelRequest) this.cancelRequest()

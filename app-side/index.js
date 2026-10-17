@@ -4,7 +4,7 @@ import { forwardVoiceRequest, resolveConnection } from '../shared/bridge-client'
 
 AppSideService(BaseSideService({
   onInit() {
-    console.log('[musafer] voice service 0.8.0 ready')
+    console.log('[musafer] voice service 0.9.1 ready')
   },
   onRequest(request, respond) {
     const connection = resolveConnection(key => settings.settingsStorage.getItem(key), bridgeURL, deviceToken)

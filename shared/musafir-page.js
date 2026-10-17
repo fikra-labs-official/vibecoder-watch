@@ -1,4 +1,4 @@
-import { createWidget, widget, align, text_style, prop } from '@zos/ui'
+import { createWidget, widget, align, text_style, prop, event, setStatusBarVisible } from '@zos/ui'
 import { getDeviceInfo } from '@zos/device'
 import { replace } from '@zos/router'
 import { LocalStorage } from '@zos/storage'
@@ -97,11 +97,17 @@ function validPendingContext(value) {
 export function createMusafirPage() {
   return {
     build() {
+      setStatusBarVisible(false)
       const { width, height } = getDeviceInfo()
       this.width = width
       this.height = height
       this.px = value => Math.round(value * Math.min(width / 432, height / 514))
       const px = this.px
+      const createHidden = (type, options) => {
+        const item = createWidget(type, options)
+        item.setProperty(prop.VISIBLE, false)
+        return item
+      }
       this.closed = false
       this.generation = 0
       this.pendingRequests = []
@@ -111,13 +117,14 @@ export function createMusafirPage() {
 
       createWidget(widget.FILL_RECT, { x: 0, y: 0, w: width, h: height, color: COLOR.bg })
       this.heroButton = createWidget(widget.BUTTON, {
-        x: px(24), y: px(24), w: width - px(48), h: px(62), radius: px(16),
+        x: px(24) + 60, y: px(24), w: width - px(48) - 60, h: px(62), radius: px(16),
         normal_color: COLOR.surface, press_color: COLOR.pressed, color: COLOR.white,
         text_size: px(19), text: '', click_func: () => this.heroPicker()
       })
       this.heroImage = createWidget(widget.IMG, {
-        x: px(36), y: px(31), w: px(48), h: px(48), src: 'heroes/musafir.png', auto_scale: true
+        x: px(32), y: px(33), w: 44, h: 44, src: 'heroes/musafir-small.png'
       })
+      this.heroImage.addEventListener(event.CLICK_UP, () => this.heroPicker())
       this.heading = createWidget(widget.TEXT, {
         x: px(24), y: px(90), w: width - px(48), h: px(30), text_size: px(24),
         color: COLOR.gold, align_h: align.LEFT, text: ''
@@ -126,31 +133,31 @@ export function createMusafirPage() {
         x: px(24), y: px(120), w: width - px(48), h: px(38), text_size: px(17),
         color: COLOR.muted, align_h: align.LEFT, text_style: text_style.WRAP, text: ''
       })
-      this.banners = [0, 1].map(index => createWidget(widget.BUTTON, {
+      this.banners = [0, 1].map(index => createHidden(widget.BUTTON, {
         x: px(24), y: px(162 + index * 56), w: width - px(48), h: px(51), radius: px(11),
         normal_color: COLOR.surface, press_color: COLOR.pressed, color: COLOR.cyan,
-        text_size: px(17), text: '', visible: false,
+        text_size: px(17), text: '',
         click_func: () => this.bannerItems[index] && this.bannerItems[index].action()
       }))
-      this.rows = [0, 1, 2].map(index => createWidget(widget.BUTTON, {
+      this.rows = [0, 1, 2].map(index => createHidden(widget.BUTTON, {
         x: px(24), y: px(162 + index * 56), w: width - px(48), h: px(51), radius: px(13),
         normal_color: COLOR.surface, press_color: COLOR.pressed, color: COLOR.white,
-        text_size: px(18), text: '', visible: false,
+        text_size: px(18), text: '',
         click_func: () => this.items[index] && this.items[index].action()
       }))
-      this.rowImages = [0, 1, 2].map(index => createWidget(widget.IMG, {
-        x: px(32), y: px(165 + index * 56), w: px(44), h: px(44), src: '', visible: false, auto_scale: true
+      this.rowImages = [0, 1, 2].map(index => createHidden(widget.IMG, {
+        x: px(32), y: px(165 + index * 56), w: 44, h: 44, src: 'heroes/musafir-small.png'
       }))
-      this.footer = [0, 1, 2].map(index => createWidget(widget.BUTTON, {
+      this.footer = [0, 1, 2].map(index => createHidden(widget.BUTTON, {
         x: px(24 + index * 132), y: px(386), w: px(index === 2 ? 120 : 112), h: px(51), radius: px(11),
         normal_color: COLOR.surface, press_color: COLOR.pressed, color: COLOR.gold,
-        text_size: px(17), text: '', visible: false,
+        text_size: px(17), text: '',
         click_func: () => this.footerItems[index] && this.footerItems[index].action()
       }))
-      this.primary = createWidget(widget.BUTTON, {
+      this.primary = createHidden(widget.BUTTON, {
         x: px(24), y: height - px(68), w: width - px(48), h: px(54), radius: px(16),
         normal_color: COLOR.gold, press_color: 0xd3a25f, color: COLOR.bg,
-        text_size: px(21), text: '', visible: false,
+        text_size: px(21), text: '',
         click_func: () => this.primaryItem && this.primaryItem.action()
       })
       this.refreshHero()
@@ -186,7 +193,9 @@ export function createMusafirPage() {
       const hero = heroById(this.read(HERO_KEY))
       this.hero = hero
       this.heroButton.setProperty(prop.TEXT, `${hero.name} · ${hero.meaning}`)
-      this.heroImage.setProperty(prop.MORE, { src: `heroes/${hero.id}.png` })
+      this.heroImage.setProperty(prop.MORE, {
+        x: this.px(32), y: this.px(33), w: 44, h: 44, src: `heroes/${hero.id}-small.png`
+      })
     },
 
     display(view, generation, remember = true) {
@@ -218,15 +227,14 @@ export function createMusafirPage() {
         row.setProperty(prop.VISIBLE, Boolean(item))
         image.setProperty(prop.VISIBLE, Boolean(item && item.image))
         if (!item) return
-        const imageSpace = item.image ? 58 : 0
+        const imageSpace = item.image ? 60 : 0
         row.setProperty(prop.TEXT, item.label)
         row.setProperty(prop.MORE, {
-          x: px(24 + imageSpace), y: px(y + index * 56),
-          w: this.width - px(48 + imageSpace), h: px(51)
+          x: px(24) + imageSpace, y: px(y + index * 56),
+          w: this.width - px(48) - imageSpace, h: px(51)
         })
         if (item.image) image.setProperty(prop.MORE, {
-          x: px(28), y: px(y + 3 + index * 56), w: px(44), h: px(44), src: item.image,
-          auto_scale: true
+          x: px(28), y: px(y + 3 + index * 56), w: 44, h: 44, src: item.image
         })
       })
       this.footer.forEach((button, index) => {
@@ -488,7 +496,7 @@ export function createMusafirPage() {
         note: 'Только внешний вид',
         items: choices.map(hero => ({
           label: `${hero.name} · ${hero.meaning}`,
-          image: `heroes/${hero.id}.png`,
+          image: `heroes/${hero.id}-small.png`,
           action: () => {
             if (!this.write(HERO_KEY, hero.id)) {
               this.note.setProperty(prop.TEXT, 'Не удалось сохранить выбор')
@@ -507,6 +515,7 @@ export function createMusafirPage() {
     },
 
     onDestroy() {
+      setStatusBarVisible(true)
       this.closed = true
       ++this.generation
       this.cancelRequests()

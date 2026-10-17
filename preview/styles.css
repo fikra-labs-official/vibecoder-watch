@@ -101,7 +101,7 @@ main {
   letter-spacing: .03em;
 }
 
-.watch-screen[data-app="musafir"] .os-header { display: none; }
+.os-header[hidden] { display: none; }
 
 .zepp-text,
 .zepp-button {

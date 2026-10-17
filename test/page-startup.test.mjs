@@ -55,6 +55,7 @@ export function pageFixture({ media = () => { throw Error('recorder unavailable'
     createMusafirVoiceRoute, normalizeContext, heroById, MUSAFIR_CONTEXT_KEY, MUSAFIR_HERO_KEY,
     replace(value) { replacements.push(value) },
     ...display, keyboardUI,
+    setStatusBarVisible: value => displayCalls.push({ name: 'setStatusBarVisible', visible: value }),
     LocalStorage: class {
       constructor() { if (storageError) throw Error('storage unavailable') }
       getItem(key) { return storage.get(key) }
@@ -71,7 +72,7 @@ export function pageFixture({ media = () => { throw Error('recorder unavailable'
     createWidget: (kind, options) => {
       const element = {
       kind,
-      options: { visible: true, ...options },
+      options: { ...options, visible: true },
       setProperty(key, value) {
         if (key === 'more') Object.assign(this.options, value)
         else this.options[key] = value
@@ -255,6 +256,10 @@ test('Musafir hero, clock and text have separate bounds at native, compatibility
     f.page.build()
     await flush()
     const hero = f.page.brandWidget.options, clock = f.page.metricWidget.options, body = f.page.bodyWidget.options
+    const png = fs.readFileSync(new URL('../assets/common.s/' + hero.src, import.meta.url))
+    assert.equal(png.readUInt32BE(16), hero.w, 'native image width must match its widget without scaling')
+    assert.equal(png.readUInt32BE(20), hero.h, 'native image height must match its widget without scaling')
+    assert.ok(f.displayCalls.some(call => call.name === 'setStatusBarVisible' && call.visible === false))
     assert.ok(hero.y + hero.h <= clock.y)
     assert.ok(clock.y + clock.h <= body.y)
     assert.ok(body.y + body.h <= f.page.primaryButton.options.y)

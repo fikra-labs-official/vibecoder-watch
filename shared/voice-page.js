@@ -1,4 +1,4 @@
-import { createWidget, widget, align, text_style, prop, getTextLayout } from '@zos/ui'
+import { createWidget, widget, align, text_style, prop, getTextLayout, setStatusBarVisible } from '@zos/ui'
 import * as keyboardUI from '@zos/ui'
 import { getDeviceInfo } from '@zos/device'
 import { setTimeout, clearTimeout } from '@zos/timer'
@@ -83,6 +83,7 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
   const logName = isOrca ? 'orca' : isClaude ? kind : 'musafer'
   return {
   build() {
+    if (isMusafir) setStatusBarVisible(false)
     const { width, height } = getDeviceInfo()
     // Keep layout in the actual app window, including compatibility mode.
     const scale = Math.min(width / 390, height / 450)
@@ -185,8 +186,9 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
       text_size: px(17), text: ''
     })
     this.brandWidget = createWidget(widget.IMG, {
-      x: (width - px(64)) / 2, y: px(139), w: px(64), h: px(64),
-      src: isMusafir ? `heroes/${this.hero.id}.png` : icon, auto_scale: true
+      x: (width - (isMusafir ? 44 : px(64))) / 2, y: px(139),
+      w: isMusafir ? 44 : px(64), h: isMusafir ? 44 : px(64),
+      src: isMusafir ? `heroes/${this.hero.id}-small.png` : icon, auto_scale: !isMusafir
     })
     this.metricWidget = createWidget(widget.TEXT, {
       ...centered, y: px(151), h: px(66), color: COLORS.text,
@@ -917,9 +919,9 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
     const heroActive = isMusafir && state.phase === 'job'
     this.brandWidget.setProperty(prop.VISIBLE, home || heroActive)
     if (isMusafir) this.brandWidget.setProperty(prop.MORE, {
-      x: (this.width - px(heroActive ? 100 : 64)) / 2, y: px(heroActive ? 128 : 139),
-      w: px(heroActive ? 100 : 64), h: px(heroActive ? 100 : 64),
-      src: `heroes/${this.hero.id}.png`
+      x: (this.width - (heroActive ? 80 : 44)) / 2, y: px(heroActive ? 128 : 139),
+      w: heroActive ? 80 : 44, h: heroActive ? 80 : 44,
+      src: `heroes/${this.hero.id}${heroActive ? '' : '-small'}.png`
     })
     this.heroFrame = null
     this.metricWidget.setProperty(prop.VISIBLE, active)
@@ -989,7 +991,10 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
       const frame = frames[Math.floor(elapsed / 420) % frames.length]
       if (this.heroFrame !== frame) {
         this.heroFrame = frame
-        this.brandWidget.setProperty(prop.MORE, { src: `heroes/${this.hero.id}-${frame}.png` })
+        this.brandWidget.setProperty(prop.MORE, {
+          x: (this.width - 80) / 2, y: px(128), w: 80, h: 80,
+          src: `heroes/${this.hero.id}-${frame}.png`
+        })
       }
     }
     if (repeat) this.animationTimer = setTimeout(() => {
@@ -1324,6 +1329,7 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
   },
 
   onDestroy() {
+    if (isMusafir) setStatusBarVisible(true)
     try { if (isMusafir && this.client && this.resultStorage) {
       const state = this.client.getState()
       if (state.jobId && ['job', 'approval', 'result', 'unknown', 'sending'].includes(state.phase)) {

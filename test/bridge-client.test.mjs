@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { forwardRequest, resolveConnection } from '../shared/bridge-client.js'
+import { forwardRequest, forwardVoiceRequest, resolveConnection } from '../shared/bridge-client.js'
 
 test('phone forwards only allowed methods to a fixed authenticated destination', async () => {
   let seen
@@ -106,6 +106,39 @@ test('history methods are available only to the Musafir profile', async () => {
     assert.equal((await forwardRequest({ method }, fetchRequest, '', '', 'orca')).ok, false)
   }
   assert.deepEqual(seen, methods)
+})
+
+test('Musafir chat RPCs cross the real phone forwarding path with exact params and stay isolated', async () => {
+  const requests = [
+    { method: 'CHAT_LIST', params: { offset: 3, limit: 3, archived: false } },
+    { method: 'CHAT_DETAIL', params: { chatId: '1700000000000-4', offset: 2, limit: 2 } },
+    { method: 'CHAT_ARCHIVE', params: { chatId: '1700000000000-4', archived: true } },
+    { method: 'JOB_REPORT', params: { id: '1700000000001-4', offset: 1000, limit: 1000 } },
+    { method: 'JOB_STOP', params: { id: '1700000000001-4' } }
+  ]
+  const forwarded = []
+  const fetchRequest = async options => {
+    forwarded.push(JSON.parse(options.body))
+    return { status: 200, body: { ok: true } }
+  }
+
+  for (const request of requests) {
+    assert.deepEqual(await forwardVoiceRequest(
+      request, fetchRequest, 'https://mac.test', 'device-secret', 'musafir'
+    ), { ok: true })
+  }
+  assert.deepEqual(forwarded, requests)
+
+  for (const profile of ['orca', 'claude', 'codex', 'limits', 'unknown']) {
+    for (const request of requests) {
+      const before = forwarded.length
+      const rejected = await forwardVoiceRequest(
+        request, fetchRequest, 'https://mac.test', 'device-secret', profile
+      )
+      assert.equal(rejected.ok, false)
+      assert.equal(forwarded.length, before, `${profile} must not forward ${request.method}`)
+    }
+  }
 })
 
 test('phone forwards a 30000-codepoint reviewed prompt without truncation', async () => {

@@ -3,7 +3,7 @@ import { BaseApp } from '@zeppos/zml/base-app'
 App(BaseApp({
   globalData: {},
   onCreate() {
-    console.log('[musafir] Hermes voice remote 0.7.3 started')
+    console.log('[musafir] Hermes voice remote 0.9.1 started')
   },
   onDestroy() {
     console.log('[musafer] voice remote closed')

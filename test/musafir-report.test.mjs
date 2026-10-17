@@ -9,10 +9,11 @@ const flush = () => new Promise(resolve => setImmediate(resolve))
 const id = '1700000000000-1'
 
 function fixture(text, reply) {
-  const timers = new Map(), calls = []
+  const timers = new Map(), calls = [], statusBars = []
   let nextTimer = 0
   const page = vm.runInNewContext(source + '\ncreateMusafirReportPage()', {
     getDeviceInfo: () => ({ width: 432, height: 514 }),
+    setStatusBarVisible: value => statusBars.push(value),
     LocalStorage: class { getItem() { return id } }, replace() {},
     widget: { FILL_RECT: 1, TEXT: 2, BUTTON: 3 }, align: {}, text_style: {},
     prop: { TEXT: 'text', MORE: 'more', VISIBLE: 'visible' },
@@ -29,7 +30,7 @@ function fixture(text, reply) {
       textLength: chars.length, nextOffset: offset + limit < chars.length ? offset + limit : null, truncated: false })
   }
   page.build()
-  return { page, calls, timers }
+  return { page, calls, timers, statusBars }
 }
 
 test('full report preserves every Unicode character while paging bounded chunks in both directions', async () => {
@@ -44,6 +45,7 @@ test('full report preserves every Unicode character while paging bounded chunks 
     f.page.turn(1)
     await flush()
   }
+  assert.deepEqual(f.statusBars, [false])
   assert.equal(collected, text)
   assert.ok(f.calls.length > 2)
   assert.equal(f.page.total, Array.from(text).length)
@@ -55,6 +57,7 @@ test('full report preserves every Unicode character while paging bounded chunks 
   assert.equal(f.page.page, f.page.pages.length - 1)
   f.page.onDestroy()
   assert.equal(f.timers.size, 0)
+  assert.deepEqual(f.statusBars, [false, true])
 })
 
 test('wrong report, truncated flag omission and inconsistent lengths are rejected', async () => {
