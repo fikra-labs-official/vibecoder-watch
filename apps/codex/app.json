@@ -5,8 +5,8 @@
     "appName": "Codex",
     "appType": "app",
     "version": {
-      "code": 10,
-      "name": "0.3.0"
+      "code": 11,
+      "name": "0.3.1"
     },
     "icon": "codex-icon.png",
     "vender": "Fikra Labs",

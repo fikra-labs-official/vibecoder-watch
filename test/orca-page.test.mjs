@@ -101,9 +101,136 @@ test('sleep restores the chosen project and pair without creating agents again',
 test('invalid saved navigation returns to the home menu', () => {
   for (const saved of ['broken', '{}', '{"screen":"voice"}']) {
     const f = fixture({ storage: new Map([['orca-resume', saved]]) })
-    assert.equal(f.page.items[0].label, 'Текущие проекты')
+    assert.equal(f.page.items[0].label, 'Новая задача')
     assert.equal(f.replacements.length, 0)
   }
+})
+
+test('home New task selects an existing pair and opens a clean compose context', async () => {
+  const pair = {
+    id: 'pair-ready', projectLabel: 'Большой рабочий проект',
+    workerAgent: 'codex', reviewerAgent: 'claude'
+  }
+  const f = fixture({ request: async ({ method }) => {
+    if (method === 'SUMMARY') return { ok: true, text: 'На связи' }
+    if (method === 'ORCA_PAIRS') return { ok: true, pairs: [pair], nextCursor: null }
+    throw new Error(method)
+  } })
+
+  assert.deepEqual([...f.page.items].map(item => item.label),
+    ['Новая задача', 'Текущие проекты', 'Мои связки'])
+  f.page.items[0].action()
+  await flush()
+  assert.equal(f.page.heading.options.text, 'Новая задача')
+  assert.equal(f.page.items[0].label, 'Большой рабочий проект · codex/claude')
+  assert.deepEqual(f.calls.map(call => call.payload.method), ['ORCA_PAIRS'])
+
+  f.page.items[0].action()
+  assert.equal(f.replacements.at(-1).url, 'page/voice')
+  assert.deepEqual(JSON.parse(f.storage.get('voice-destination')), {
+    target: 'orca', pairId: 'pair-ready', label: 'Большой рабочий проект',
+    workerAgent: 'codex', reviewerAgent: 'claude', startFresh: true, autoRecord: false
+  })
+  assert.equal(f.calls.some(call => ['ORCA_SEND', 'ORCA_PAIR_CREATE', 'ORCA_AGENT_CREATE'].includes(call.payload.method)), false)
+  f.page.onDestroy()
+})
+
+test('New task with no pairs offers a reversible choose-or-create route without mutation', async () => {
+  const f = fixture({ request: async ({ method }) => {
+    if (method === 'SUMMARY') return { ok: true, text: 'На связи' }
+    if (method === 'ORCA_PAIRS') return { ok: true, pairs: [], nextCursor: null }
+    if (method === 'ORCA_LIST') return { ok: true, workspaces: [], nextCursor: null }
+    throw new Error(method)
+  } })
+
+  f.page.items[0].action()
+  await flush()
+  assert.equal(f.page.heading.options.text, 'Новая задача')
+  assert.equal(f.page.items[0].label, 'Выбрать или создать связку')
+  assert.equal(f.page.back.options.visible, true)
+  f.page.backAction()
+  assert.equal(f.page.items[0].label, 'Новая задача')
+
+  f.page.items[0].action()
+  await flush()
+  f.page.items[0].action()
+  await flush()
+  assert.equal(f.page.heading.options.text, 'Проекты')
+  assert.deepEqual(f.calls.map(call => call.payload.method), ['ORCA_PAIRS', 'ORCA_PAIRS', 'ORCA_LIST'])
+  assert.equal(f.calls.some(call => ['ORCA_SEND', 'ORCA_PAIR_CREATE', 'ORCA_AGENT_CREATE'].includes(call.payload.method)), false)
+  f.page.onDestroy()
+})
+
+test('show paginates every action instead of silently dropping the fourth item', () => {
+  const f = fixture()
+  const labels = ['Один', 'Два', 'Три', 'Четыре', 'Пять']
+  f.page.show('Меню', 'Все действия доступны', labels.map(label => ({ label, action() {} })), () => f.page.home())
+  assert.deepEqual([...f.page.items].map(item => item.label), labels.slice(0, 3))
+  assert.equal(f.page.next.options.visible, true)
+  f.page.nextAction()
+  assert.deepEqual([...f.page.items].map(item => item.label), labels.slice(3))
+  assert.equal(f.page.back.options.visible, true)
+  f.page.backAction()
+  assert.deepEqual([...f.page.items].map(item => item.label), labels.slice(0, 3))
+  f.page.onDestroy()
+})
+
+test('failed home summary keeps New task first and leaves Pairs reachable by paging', async () => {
+  const f = fixture({ request: async ({ method }) => {
+    if (method === 'SUMMARY') throw new Error('offline')
+    return { ok: true }
+  } })
+  await flush()
+  assert.deepEqual([...f.page.items].map(item => item.label),
+    ['Новая задача', 'Повторить связь', 'Текущие проекты'])
+  f.page.nextAction()
+  assert.deepEqual([...f.page.items].map(item => item.label), ['Мои связки'])
+  assert.equal(f.page.back.options.visible, true)
+  f.page.backAction()
+  assert.equal(f.page.items[0].label, 'Новая задача')
+  f.page.onDestroy()
+})
+
+test('long project and pair labels stay width-bound while actions retain full source data', async () => {
+  const workspace = {
+    id: 'workspace-long',
+    projectLabel: 'Очень   длинный\nпроект с названием, которое не помещается в кнопку часов',
+    name: 'ветка с ещё более длинным названием для проверки нативной кнопки'
+  }
+  const pair = {
+    id: 'pair-long', projectLabel: 'Связка с исключительно длинным названием рабочего проекта',
+    workerAgent: 'codex-agent-with-long-name', reviewerAgent: 'claude-reviewer-with-long-name'
+  }
+  const f = fixture({ request: async ({ method }) => {
+    if (method === 'SUMMARY') return { ok: true, text: 'На связи' }
+    if (method === 'ORCA_LIST') return { ok: true, workspaces: [workspace], nextCursor: null }
+    if (method === 'ORCA_PAIRS') return { ok: true, pairs: [pair], nextCursor: null }
+    throw new Error(method)
+  } })
+
+  f.page.projects()
+  await flush()
+  const projectLabel = `${workspace.projectLabel} · ${workspace.name}`
+  assert.equal(f.page.items[0].label, projectLabel)
+  assert.equal(/\s{2,}|\n/u.test(f.page.rows[0].options.text), false)
+  assert.match(f.page.rows[0].options.text, /…$/u)
+  assert.equal(textRows(f.page.rows[0].options.text,
+    f.page.rowLayouts[0].w - 36, f.page.rowTextSize, (value, options) => ({
+      result: 0, width: Math.max(1, Array.from(value).length * options.text_size * 0.6),
+      height: options.text_size
+    })).length, 1)
+  f.page.rows[0].options.click_func()
+  assert.deepEqual(f.page.workspace, workspace)
+  assert.deepEqual(JSON.parse(f.storage.get('orca-resume')).workspace, workspace)
+
+  f.page.newTask()
+  await flush()
+  assert.equal(f.page.items[0].label,
+    `${pair.projectLabel} · ${pair.workerAgent}/${pair.reviewerAgent}`)
+  assert.match(f.page.rows[0].options.text, /…$/u)
+  f.page.rows[0].options.click_func()
+  assert.equal(JSON.parse(f.storage.get('voice-destination')).pairId, pair.id)
+  f.page.onDestroy()
 })
 
 test('a late catalog reply cannot replace any newer menu page', async () => {
@@ -298,31 +425,42 @@ test('new pair and single agent use the selected models only after Open on Mac',
 test('menu layouts stay inside the watch and visible controls do not overlap', () => {
   for (const [width, height] of [[390, 450], [432, 514], [390, 400]]) {
     const f = fixture({ width, height })
+    const assertLayout = screen => {
+      const visible = f.widgets.filter(item => item.kind !== 1 && item.options.visible)
+        .map(item => item.options)
+      for (let index = 0; index < visible.length; index += 1) {
+        const item = visible[index]
+        assert.ok(item.x >= 0 && item.y >= 0 && item.x + item.w <= width && item.y + item.h <= height,
+          `${screen}: ${item.text} must fit ${width}x${height}`)
+        for (const other of visible.slice(index + 1)) {
+          const overlap = item.x < other.x + other.w && item.x + item.w > other.x &&
+            item.y < other.y + other.h && item.y + item.h > other.y
+          assert.equal(overlap, false, `${screen}: ${item.text} overlaps ${other.text} at ${width}x${height}`)
+        }
+      }
+    }
     for (let i = 1; i < f.page.rows.length; i++) {
       const above = f.page.rows[i - 1].options
       const below = f.page.rows[i].options
       assert.ok(below.y - above.y - above.h >= f.page.px(18), 'rows need visible physical spacing')
     }
-    const workspace = { id: 'workspace', projectLabel: 'Проект', name: 'main' }
-    const worker = { id: 'worker', title: 'Боевой' }
-    const reviewer = { id: 'reviewer', title: 'Проверяющий' }
-    f.page.confirmPair(workspace, worker, reviewer)
+    assertLayout('home')
+    f.page.nextAction()
+    assertLayout('secondary home')
+    f.page.show('Новая задача', 'Очень длинное описание состояния проекта. '.repeat(8), [
+      { label: 'Очень длинное название первой готовой связки Codex и Claude', action() {} },
+      { label: 'Ещё одна связка с длинным названием рабочего проекта', action() {} },
+      { label: 'Третья готовая связка для проверки трёх строк меню', action() {} },
+      { label: 'Четвёртая связка остаётся доступной на следующей странице', action() {} }
+    ], () => f.page.home())
+    assertLayout('long three-row menu')
     for (const control of [...f.page.rows, f.page.back, f.page.next]) {
       assert.ok(control.options.h >= 44, `control height must be at least 44 at ${width}x${height}`)
       assert.ok(control.moreUpdates > 0, `control must receive a full prop.MORE update at ${width}x${height}`)
     }
-    const visible = f.widgets.filter(item => item.kind !== 1 && item.options.visible)
-      .map(item => item.options)
-    for (let index = 0; index < visible.length; index += 1) {
-      const item = visible[index]
-      assert.ok(item.x >= 0 && item.y >= 0 && item.x + item.w <= width && item.y + item.h <= height,
-        `${item.text} must fit ${width}x${height}`)
-      for (const other of visible.slice(index + 1)) {
-        const overlap = item.x < other.x + other.w && item.x + item.w > other.x &&
-          item.y < other.y + other.h && item.y + item.h > other.y
-        assert.equal(overlap, false, `${item.text} overlaps ${other.text} at ${width}x${height}`)
-      }
-    }
+    f.page.nextAction()
+    assert.equal(f.page.items[0].label, 'Четвёртая связка остаётся доступной на следующей странице')
+    assertLayout('long overflow page')
     f.page.onDestroy()
   }
 })
@@ -344,7 +482,7 @@ test('pair menu opens per-pair history and sleep restores it only with a stored 
   assert.equal(restored.replacements.at(-1).url, 'page/history')
   const orphan = fixture({ storage: new Map([['orca-resume', JSON.stringify({ screen: 'history' })]]) })
   assert.equal(orphan.replacements.length, 0)
-  assert.equal(orphan.page.items[0].label, 'Текущие проекты')
+  assert.equal(orphan.page.items[0].label, 'Новая задача')
 })
 
 test('quick command sends one preset task per tap and opens the task screen', async () => {
@@ -632,8 +770,10 @@ test('home resumes an existing folder operation or unsent draft without starting
     const storage = new Map([['voice-destination', JSON.stringify(context)]])
     if (draft) storage.set(`voice-draft:folder:${context.rootId}:`, JSON.stringify(draft))
     const f = fixture({ storage })
-    assert.equal(f.page.items[0].label, 'Продолжить проект')
+    assert.equal(f.page.items[0].label, 'Новая задача')
     assert.equal(f.page.next.options.visible, true)
+    f.page.nextAction()
+    assert.equal(f.page.items[0].label, 'Продолжить создание')
     f.page.items[0].action()
     assert.equal(f.replacements.at(-1).url, 'page/voice')
     assert.deepEqual(JSON.parse(storage.get('voice-destination')), context)
@@ -644,7 +784,8 @@ test('home resumes an existing folder operation or unsent draft without starting
   const stale = fixture({ storage: new Map([['voice-destination', JSON.stringify({
     target: 'folder', rootId: 'storage', label: 'Storage'
   })]]) })
-  assert.equal(stale.page.items.some(item => item.label === 'Продолжить проект'), false)
+  stale.page.nextAction()
+  assert.equal(stale.page.items.some(item => item.label === 'Продолжить создание'), false)
   stale.page.onDestroy()
 })
 

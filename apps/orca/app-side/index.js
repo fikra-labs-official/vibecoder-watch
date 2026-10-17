@@ -4,7 +4,7 @@ import { forwardVoiceRequest, resolveConnection } from '../shared/bridge-client'
 
 AppSideService(BaseSideService({
   onInit() {
-    console.log('[orca] service 0.5.0 ready')
+    console.log('[orca] service 0.5.1 ready')
   },
   onRequest(request, respond) {
     const connection = resolveConnection(key => settings.settingsStorage.getItem(key), bridgeURL, deviceToken)

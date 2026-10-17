@@ -18,11 +18,12 @@ export function createAgentMenuPage({ kind, title }) {
   const PREFIX = kind.toUpperCase()
   const RESUME_KEY = kind + '-resume'
   const MODE_KEY = kind + '-mode'
+  const LAST_TASK_KEY = kind + '-last-task'
   const MODES = MODE_LABELS[kind] || MODE_LABELS.claude
   return {
   build() {
     const { width, height } = getDeviceInfo()
-    this.px = value => Math.round(value * Math.min(width / 390, height / 450))
+    this.px = value => Math.round(value * Math.min(width / 432, height / 514))
     const px = this.px
     this.closed = false
     this.sequence = 0
@@ -33,47 +34,49 @@ export function createAgentMenuPage({ kind, title }) {
     try { this.storage = new LocalStorage() } catch (error) {}
     try { setWakeUpRelaunch({ relaunch: true }) } catch (error) {}
     try { setStatusBarVisible(false) } catch (error) {}
+    const margin = Math.max(18, Math.round(width * 0.055))
+    const contentWidth = width - margin * 2
+    const headingY = Math.max(20, px(32))
+    const headingH = Math.max(28, px(36))
+    this.noteLayout = { x: margin, y: headingY + headingH + 6, w: contentWidth, h: Math.max(40, px(54)) }
+    this.noteSize = Math.max(16, px(18))
     createWidget(widget.FILL_RECT, { x: 0, y: 0, w: width, h: height, color: COLOR.bg })
-    this.heading = createWidget(widget.TEXT, { x: px(24), y: px(55), w: width - px(48), h: px(39),
-      text_size: px(24), color: COLOR.gold, align_h: align.CENTER_H, text: title })
-    this.noteLayout = { x: px(24), y: px(96), w: width - px(48), h: px(54) }
-    this.note = createWidget(widget.TEXT, { x: px(24), y: px(96), w: width - px(48), h: px(54),
-      text_size: px(17), color: COLOR.muted, align_h: align.CENTER_H, text_style: text_style.WRAP, text: '' })
-    const noteRowHeight = Math.max(22, px(24))
+    this.heading = createWidget(widget.TEXT, { x: margin, y: headingY, w: contentWidth, h: headingH,
+      text_size: Math.max(22, px(26)), color: COLOR.gold, align_h: align.CENTER_H, text: title })
+    this.note = createWidget(widget.TEXT, { ...this.noteLayout,
+      text_size: this.noteSize, color: COLOR.muted, align_h: align.CENTER_H, text_style: text_style.WRAP, text: '' })
+    const noteRowHeight = Math.max(22, px(25))
     this.noteScroll = createWidget(widget.SCROLL_LIST, {
-      ...this.noteLayout,
+      ...this.noteLayout, item_space: 0,
       item_config: [{ type_id: 1, item_height: noteRowHeight, item_bg_color: COLOR.bg, item_bg_radius: 0,
         text_view: [{ x: 0, y: 0, w: this.noteLayout.w, h: noteRowHeight, key: 'display',
-          color: COLOR.muted, text_size: px(17), align_h: align.CENTER_H, align_v: align.CENTER_V,
-          text_style: text_style.WRAP }], text_view_count: 1 }],
+          color: COLOR.muted, text_size: this.noteSize }], text_view_count: 1 }],
       item_config_count: 1, data_array: [{ display: '' }], data_count: 1,
       data_type_config: [{ start: 0, end: 0, type_id: 1 }], data_type_config_count: 1,
       snap_to_center: false, item_enable_horizon_drag: false
     })
     this.noteScroll.setProperty(prop.VISIBLE, false)
-    const listY = px(158)
-    const footerY = px(369)
-    const rowHeight = Math.max(44, px(54))
-    this.menuLayout = { x: px(24), y: listY, w: width - px(48), h: Math.max(rowHeight, footerY - listY - px(8)) }
-    this.menuList = createWidget(widget.SCROLL_LIST, {
-      ...this.menuLayout,
-      item_config: [{ type_id: 1, item_height: rowHeight, item_bg_color: COLOR.surface, item_bg_radius: px(10),
-        text_view: [{ x: px(10), y: 0, w: this.menuLayout.w - px(20), h: rowHeight, key: 'label', action: true,
-          color: COLOR.white, text_size: px(18), align_h: align.CENTER_H, align_v: align.CENTER_V,
-          text_style: text_style.WRAP }], text_view_count: 1 }],
-      item_config_count: 1, data_array: [{ label: '' }], data_count: 1,
-      data_type_config: [{ start: 0, end: 0, type_id: 1 }], data_type_config_count: 1,
-      snap_to_center: false, item_enable_horizon_drag: false,
-      item_click_func: (_list, index) => this.items[index] && this.items[index].action()
-    })
-    const button = (x, w, text, action) => {
-      const layout = { x: px(x), y: footerY, w: px(w), h: Math.max(44, px(50)) }
+    const controlHeight = Math.max(44, height >= 490 ? 52 : 48)
+    const footerY = height - (height >= 490 ? 16 : 12) - controlHeight
+    const listY = this.noteLayout.y + this.noteLayout.h + 14
+    const rowHeight = Math.max(48, px(58))
+    const rowGap = Math.max(10, Math.floor((footerY - 14 - listY - rowHeight * 3) / 2))
+    this.rowTextSize = Math.max(18, px(21))
+    this.rowLayouts = [0, 1, 2].map(index => ({ x: margin, y: listY + index * (rowHeight + rowGap),
+      w: contentWidth, h: rowHeight }))
+    this.rows = this.rowLayouts.map((layout, index) => createWidget(widget.BUTTON, {
+      ...layout, radius: px(12), normal_color: COLOR.surface, press_color: 0x413629,
+      color: COLOR.white, text_size: this.rowTextSize, text: '',
+      click_func: () => { const item = this.items[index]; if (item) item.action() }
+    }))
+    const footerWidth = Math.floor((contentWidth - 12) / 2)
+    const button = (x, text, action) => {
+      const layout = { x, y: footerY, w: footerWidth, h: controlHeight }
       return { layout, widget: createWidget(widget.BUTTON, { ...layout, radius: px(12), normal_color: COLOR.surface,
-      press_color: 0x413629, color: COLOR.gold, text_size: px(21), text, click_func: action
-      }) }
+        press_color: 0x413629, color: COLOR.gold, text_size: Math.max(18, px(22)), text, click_func: action }) }
     }
-    const back = button(24, 144, 'Назад', () => this.goBack())
-    const next = button(222, 144, 'Дальше', () => this.nextAction && this.nextAction())
+    const back = button(margin, 'Назад', () => this.goBack())
+    const next = button(width - margin - footerWidth, 'Дальше', () => this.nextAction && this.nextAction())
     this.back = back.widget
     this.backLayout = back.layout
     this.next = next.widget
@@ -182,7 +185,7 @@ export function createAgentMenuPage({ kind, title }) {
     this.items = items
     this.heading.setProperty(prop.TEXT, title)
     const noteText = String(note || '')
-    const noteData = textRows(noteText, this.noteLayout.w, Math.max(17, this.px(17)), getTextLayout)
+    const noteData = textRows(noteText, this.noteLayout.w, this.noteSize, getTextLayout)
     const scrollNote = noteData.length > 2
     this.note.setProperty(prop.TEXT, noteText)
     this.note.setProperty(prop.VISIBLE, !scrollNote)
@@ -191,12 +194,14 @@ export function createAgentMenuPage({ kind, title }) {
       data_array: noteData, data_count: noteData.length,
       data_type_config: [{ start: 0, end: noteData.length - 1, type_id: 1 }], data_type_config_count: 1, on_page: 0
     })
-    const menuData = items.map(item => ({ label: String(item.label == null ? '' : item.label) }))
-    this.menuList.setProperty(prop.UPDATE_DATA, {
-      data_array: menuData, data_count: menuData.length,
-      data_type_config: [{ start: 0, end: Math.max(0, menuData.length - 1), type_id: 1 }], data_type_config_count: 1, on_page: 0
+    this.rows.forEach((row, index) => {
+      const item = items[index]
+      const label = item ? String(item.label == null ? '' : item.label).replace(/\s+/g, ' ').trim() : ''
+      const lines = textRows(label, this.rowLayouts[index].w - 36, this.rowTextSize, getTextLayout)
+      const caption = lines.length > 1 ? lines[0].text.trimEnd() + '…' : label
+      row.setProperty(prop.MORE, { ...this.rowLayouts[index], text: caption })
+      row.setProperty(prop.VISIBLE, Boolean(item))
     })
-    this.menuList.setProperty(prop.VISIBLE, Boolean(menuData.length))
     this.backAction = back
     this.nextAction = next
     this.back.setProperty(prop.MORE, { ...this.backLayout, text: 'Назад' })
@@ -234,15 +239,17 @@ export function createAgentMenuPage({ kind, title }) {
   },
   renderHome(note, failed = false) {
     this.remember({ screen: 'home' })
-    this.show(title, note, failed ? [
-      { label: 'Повторить связь', action: () => { this.renderHome('Проверяю Mac…'); this.summarize() } },
-      { label: 'Проекты', action: () => this.projects() },
-      { label: 'История', action: () => this.history() }
-    ] : [
-      { label: 'Проекты', action: () => this.projects() },
-      { label: 'Последняя задача', action: () => this.lastTask() },
+    this.show(title, note, [
+      { label: 'Новая задача', action: () => this.newTask() },
+      failed ? { label: 'Повторить связь', action: () => this.home() }
+        : { label: 'Проекты', action: () => this.projects() },
       { label: 'История', action: () => this.history() }
     ], null, () => this.more())
+    this.next.setProperty(prop.MORE, { ...this.nextLayout, text: 'Ещё' })
+  },
+  newTask() {
+    this.voice({ target: kind, project: 'general', label: 'Общая задача', mode: 'auto',
+      modeLabel: MODES.auto, startFresh: true, autoRecord: false })
   },
   home() {
     this.renderHome(`${title} в проектах на Mac`)
@@ -280,13 +287,19 @@ export function createAgentMenuPage({ kind, title }) {
         { id: saved.jobId, approvalId: saved.approvalId, allow: true, answer: option }, voice, voice, true) }
     ], () => this.question(saved, offset))
   },
-  more() {
+  more(page = 0) {
     this.remember({ screen: 'home' })
-    this.show(title, 'Очередь на ночь, исследования, Дозор', [
+    const primary = [
       { label: 'Ночная смена', action: () => this.night() },
       { label: 'Исследование', action: () => this.research() },
       { label: 'Дозор', action: () => this.watches() }
-    ], () => this.home())
+    ]
+    const extra = [
+      { label: 'Последняя задача', action: () => this.lastTask() },
+      { label: 'Проверить связь', action: () => this.home() }
+    ]
+    this.show(title, 'Другие действия', page ? extra : primary,
+      page ? () => this.more() : () => this.home(), page ? null : () => this.more(1))
   },
   // Watchdog: standing checks of sites and project CI; only a change of state is announced.
   watches(cursor, trail = []) {
@@ -371,7 +384,7 @@ export function createAgentMenuPage({ kind, title }) {
     this.remember({ screen: 'project', project: { id: project.id, label: project.label } })
     const mode = this.mode(project.id)
     this.show(project.label, project.id, [
-      { label: 'Задача / вопрос', action: () => this.voice({ target: kind, project: project.id, label: project.label,
+      { label: 'Новая задача', action: () => this.voice({ target: kind, project: project.id, label: project.label,
         mode, modeLabel: MODES[mode], startFresh: true }) },
       { label: `Режим: ${MODES[mode]}`, action: () => this.modes(project) },
       { label: 'Продолжить сессию…', action: () => this.sessions(project) }
@@ -452,7 +465,10 @@ export function createAgentMenuPage({ kind, title }) {
   },
   lastTask() {
     let saved = null
-    try { saved = JSON.parse(this.storage.getItem(CONTEXT_KEY) || 'null') } catch (error) {}
+    try {
+      saved = JSON.parse(this.storage.getItem(CONTEXT_KEY) || 'null')
+      if (!saved || !saved.jobId) saved = JSON.parse(this.storage.getItem(LAST_TASK_KEY) || 'null')
+    } catch (error) {}
     if (saved && saved.target === kind && typeof saved.project === 'string' && saved.project &&
         typeof saved.jobId === 'string' && saved.jobId) {
       saved.resumeJob = true
@@ -467,7 +483,9 @@ export function createAgentMenuPage({ kind, title }) {
       replace({ url: 'page/voice' })
       return
     }
-    this.projects()
+    this.show('Пока нет задач', 'Создайте первую задачу.', [
+      { label: 'Новая задача', action: () => this.newTask() }
+    ], () => this.home())
   },
   history() {
     try { this.storage.setItem(kind + '-history-view', JSON.stringify({ screen: 'home' })) } catch (error) {}
@@ -476,6 +494,11 @@ export function createAgentMenuPage({ kind, title }) {
   },
   voice(context) {
     try {
+      let previous = null
+      try { previous = JSON.parse(this.storage.getItem(CONTEXT_KEY) || 'null') } catch (error) {}
+      if (previous && previous.target === kind && typeof previous.jobId === 'string' && previous.jobId) {
+        this.storage.setItem(LAST_TASK_KEY, JSON.stringify(previous))
+      }
       this.storage.setItem(CONTEXT_KEY, JSON.stringify(context))
       this.remember({ screen: 'voice' })
       replace({ url: 'page/voice' })

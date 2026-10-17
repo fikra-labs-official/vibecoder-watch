@@ -624,7 +624,7 @@ export function createVoicePage({ kind, icon, title, version, chats = false }) {
       this.persistAgentExit()
       const target = this.destination
       if (isClaude) {
-        this.resultStorage.setItem(kind + '-resume', JSON.stringify(target && target.target === kind
+        this.resultStorage.setItem(kind + '-resume', JSON.stringify(target && target.target === kind && target.project !== 'general'
           ? { screen: 'project', project: { id: target.project, label: target.label || title } }
           : { screen: 'home' }))
         replace({ url: 'page/index' })

@@ -76,9 +76,10 @@ Page(BasePage({
     this.rowLayouts = [0, 1, 2].map(index => ({
       x: this.margin, y: menuTop + index * (rowHeight + rowGap), w: contentWidth, h: rowHeight
     }))
+    this.rowTextSize = Math.max(17, this.px(20))
     this.rows = this.rowLayouts.map((layout, index) => createWidget(widget.BUTTON, {
       ...layout, radius: Math.max(9, this.px(11)), normal_color: COLOR.surface,
-      press_color: 0x413629, color: COLOR.white, text_size: Math.max(17, this.px(20)), text: '',
+      press_color: 0x413629, color: COLOR.white, text_size: this.rowTextSize, text: '',
       click_func: () => {
         const action = this.items[index] && this.items[index].action
         if (typeof action === 'function') action()
@@ -176,24 +177,46 @@ Page(BasePage({
     })
   },
 
-  show(title, note, items, back, next, generation) {
+  buttonCaption(value, layout) {
+    const label = String(value || '').replace(/\s+/gu, ' ').trim()
+    if (!label) return ''
+    const width = Math.max(1, layout.w - 36)
+    const rows = textRows(label, width, this.rowTextSize, getTextLayout)
+    if (rows.length < 2) return rows[0] ? rows[0].display : ''
+    let first = rows[0].text.trimEnd()
+    while (first && textRows(`${first}…`, width, this.rowTextSize, getTextLayout).length > 1) {
+      first = Array.from(first).slice(0, -1).join('').trimEnd()
+    }
+    return `${first}…`
+  },
+
+  show(title, note, items, back, next, generation, offset = 0) {
     if (this.closed) return
     if (generation == null) ++this.generation
     else if (generation !== this.generation) return
-    this.items = Array.isArray(items) ? items.slice(0, 3) : []
+    const choices = Array.isArray(items) ? items : []
+    const pageOffset = Number.isInteger(offset) && offset > 0 ? offset : 0
+    this.items = choices.slice(pageOffset, pageOffset + 3)
+    const visibleBack = pageOffset > 0
+      ? () => this.show(title, note, choices, back, next, null, Math.max(0, pageOffset - 3))
+      : back
+    const visibleNext = pageOffset + 3 < choices.length
+      ? () => this.show(title, note, choices, back, next, null, pageOffset + 3)
+      : next
     this.heading.setProperty(prop.TEXT, String(title || 'Orca'))
     this.setNote(note)
     this.rows.forEach((row, index) => {
       const item = this.items[index]
-      row.setProperty(prop.MORE, { ...this.rowLayouts[index], text: item ? String(item.label || '') : '' })
+      const layout = this.rowLayouts[index]
+      row.setProperty(prop.MORE, { ...layout, text: item ? this.buttonCaption(item.label, layout) : '' })
       row.setProperty(prop.VISIBLE, Boolean(item))
     })
-    this.backAction = back
-    this.nextAction = next
+    this.backAction = visibleBack
+    this.nextAction = visibleNext
     this.back.setProperty(prop.MORE, { ...this.backLayout, text: 'Назад' })
     this.next.setProperty(prop.MORE, { ...this.nextLayout, text: 'Дальше' })
-    this.back.setProperty(prop.VISIBLE, typeof back === 'function')
-    this.next.setProperty(prop.VISIBLE, typeof next === 'function')
+    this.back.setProperty(prop.VISIBLE, typeof visibleBack === 'function')
+    this.next.setProperty(prop.VISIBLE, typeof visibleNext === 'function')
   },
 
   boundedRequest(payload, options = {}) {
@@ -256,20 +279,17 @@ Page(BasePage({
     this.mutationPending = false
     this.remember({ screen: 'home' })
     const pending = this.pendingFolder()
-    if (pending && page === 1) {
-      this.show('Orca', 'Проекты и агенты на твоём Mac', [
+    if (page === 1) {
+      this.show('Orca', 'Создание и незавершённые проекты', [
+        ...(pending ? [{ label: 'Продолжить создание', action: () => this.continueFolder(pending) }] : []),
         { label: 'Новый проект', action: () => this.roots() }
       ], () => this.home(0))
     } else {
-      this.show('Orca', 'Проекты и агенты на твоём Mac', pending ? [
-        { label: 'Продолжить проект', action: () => this.continueFolder(pending) },
+      this.show('Orca', 'Проекты и агенты на твоём Mac', [
+        { label: 'Новая задача', action: () => this.newTask() },
         { label: 'Текущие проекты', action: () => this.projects() },
         { label: 'Мои связки', action: () => this.pairs() }
-      ] : [
-        { label: 'Текущие проекты', action: () => this.projects() },
-        { label: 'Мои связки', action: () => this.pairs() },
-        { label: 'Новый проект', action: () => this.roots() }
-      ], null, pending ? () => this.home(1) : null)
+      ], null, () => this.home(1))
     }
     const generation = this.generation
     Promise.resolve().then(() => this.boundedRequest({ method: 'SUMMARY', params: {} }, { timeout: 8000 })).then(reply => {
@@ -279,11 +299,34 @@ Page(BasePage({
     }).catch(() => {
       if (this.closed || generation !== this.generation) return
       this.show('Orca', 'Mac не ответил. Проверь Zepp и повтори связь.', [
+        { label: 'Новая задача', action: () => this.newTask() },
         { label: 'Повторить связь', action: () => this.home(page) },
         { label: 'Текущие проекты', action: () => this.projects() },
         { label: 'Мои связки', action: () => this.pairs() }
-      ], null, () => this.roots())
+      ], null, () => this.home(1))
     })
+  },
+
+  newTask(cursor, trail = []) {
+    const back = this.cursorBack(trail,
+      (previous, previousTrail) => this.newTask(previous, previousTrail), () => this.home())
+    this.load('ORCA_PAIRS', { cursor, limit: 3 }, reply => {
+      if (!reply.pairs.length && cursor == null) {
+        this.show('Новая задача', 'Сначала выбери или создай связку для проекта.', [
+          { label: 'Выбрать или создать связку', action: () => this.projects() }
+        ], back)
+        return
+      }
+      this.show('Новая задача', 'Выбери готовую связку', reply.pairs.map(pair => ({
+        label: `${pair.projectLabel} · ${pair.workerAgent}/${pair.reviewerAgent}`,
+        action: () => this.voice({
+          target: 'orca', pairId: pair.id, label: pair.projectLabel,
+          workerAgent: pair.workerAgent, reviewerAgent: pair.reviewerAgent,
+          startFresh: true, autoRecord: false
+        })
+      })), back, reply.nextCursor
+        ? () => this.newTask(reply.nextCursor, [...trail, cursor]) : null)
+    }, back)
   },
 
   projects(cursor, trail = []) {

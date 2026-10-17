@@ -17,6 +17,7 @@ function fixture({ kind = 'claude', request = async () => ({ ok: true }), storag
   device = { width: 390, height: 450 }, storageThrows = 0 } = {}) {
   let page
   const replacements = []
+  const widgets = []
   const interaction = { gesture: null, key: null, offGesture: 0, offKey: 0 }
   const timers = new Map()
   const statusBar = []
@@ -45,9 +46,14 @@ function fixture({ kind = 'claude', request = async () => ({ ok: true }), storag
       setItem(key, value) { storage.set(key, value) }
     },
     createWidget(kind, options) {
-      return { kind, options: { visible: true, ...options }, setProperty(property, value) {
+      const result = { kind, options: { visible: true, ...options }, setProperty(property, value) {
+        if (kind === 3 && property === 'more') {
+          for (const key of ['x', 'y', 'w', 'h', 'text']) assert.ok(Object.hasOwn(value, key), 'Native button update requires ' + key)
+        }
         if (property === 'more' || property === 'update-data') Object.assign(this.options, value); else this.options[property] = value
       } }
+      widgets.push(result)
+      return result
     },
     widget: { FILL_RECT: 1, TEXT: 2, BUTTON: 3, SCROLL_LIST: 4 }, align: { CENTER_H: 1, CENTER_V: 2 }, text_style: { WRAP: 1 },
     prop: { TEXT: 'text', VISIBLE: 'visible', MORE: 'more', UPDATE_DATA: 'update-data' },
@@ -60,7 +66,7 @@ function fixture({ kind = 'claude', request = async () => ({ ok: true }), storag
   const calls = []
   page.request = (payload, options) => { calls.push({ payload, options }); return request(payload, options) }
   page.build()
-  return { page, replacements, storage, calls, interaction, timers, clock, statusBar }
+  return { page, replacements, storage, calls, interaction, timers, clock, statusBar, widgets }
 }
 
 const project = { id: '/work/crm', label: 'CRM' }
@@ -73,8 +79,8 @@ const replies = {
 
 test('project menu dictates with the chosen mode and can continue a saved session', async () => {
   const f = fixture({ request: async ({ method }) => replies[method] })
-  assert.equal(f.page.items[0].label, 'Проекты')
-  f.page.items[0].action(); await flush()
+  assert.equal(f.page.items[0].label, 'Новая задача')
+  f.page.items.find(item => item.label === 'Проекты').action(); await flush()
   assert.equal(f.page.items[0].label, 'CRM')
   f.page.items[0].action()
   assert.equal(f.page.items[1].label, 'Режим: Авто')
@@ -99,15 +105,15 @@ test('project menu dictates with the chosen mode and can continue a saved sessio
 test('sleep restores project, voice and history screens; last task reopens the voice page', async () => {
   const storage = new Map([['claude-resume', JSON.stringify({ screen: 'project', project })]])
   const a = fixture({ storage })
-  assert.equal(a.page.items[0].label, 'Задача / вопрос')
+  assert.equal(a.page.items[0].label, 'Новая задача')
   const b = fixture({ storage: new Map([['claude-resume', JSON.stringify({ screen: 'history' })]]) })
   assert.equal(b.replacements.at(-1).url, 'page/history')
   const c = fixture({ storage: new Map([['claude-resume', JSON.stringify({ screen: 'voice' })]]) })
-  assert.equal(c.page.items[0].label, 'Проекты')
+  assert.equal(c.page.items[0].label, 'Новая задача')
   const d = fixture({ storage: new Map([['voice-destination', JSON.stringify({
     target: 'claude', project: '/work/crm', jobId: 'last-job'
   })]]) })
-  d.page.items[1].action()
+  d.page.lastTask()
   assert.equal(d.replacements.at(-1).url, 'page/voice')
   assert.deepEqual(JSON.parse(d.storage.get('voice-destination')), {
     target: 'claude', project: '/work/crm', jobId: 'last-job', resumeJob: true, startFresh: false
@@ -115,10 +121,11 @@ test('sleep restores project, voice and history screens; last task reopens the v
   const noExactJob = fixture({ storage: new Map([['voice-destination', JSON.stringify({
     target: 'claude', project: '/work/crm', sessionId: 'draft-only'
   })]]) })
-  noExactJob.page.items[1].action()
+  noExactJob.page.lastTask()
   await flush()
   assert.equal(noExactJob.replacements.length, 0)
-  assert.equal(noExactJob.calls.some(call => call.payload.method === 'CLAUDE_PROJECTS'), true)
+  assert.equal(noExactJob.calls.some(call => call.payload.method === 'CLAUDE_PROJECTS'), false)
+  assert.equal(noExactJob.page.heading.options.text, 'Пока нет задач')
   const e = fixture()
   e.page.items[2].action()
   assert.equal(e.replacements.at(-1).url, 'page/history')
@@ -127,7 +134,7 @@ test('sleep restores project, voice and history screens; last task reopens the v
   const exact = { target: 'claude', project: '/work/crm', label: 'CRM', sessionId: 'selected-session',
     jobId: '1700000000000-9', aliasId: '1700000000000-9', startFresh: true }
   const x = fixture({ storage: new Map([['voice-destination', JSON.stringify(exact)]]) })
-  x.page.items[1].action()
+  x.page.lastTask()
   assert.deepEqual(JSON.parse(x.storage.get('voice-destination')), {
     ...exact, resumeJob: true, startFresh: false
   })
@@ -140,7 +147,7 @@ test('codex menu uses CODEX methods, its own storage keys and mode labels', asyn
   }
   const f = fixture({ kind: 'codex', request: async ({ method }) => codexReplies[method] })
   assert.equal(f.page.heading.options.text, 'Codex')
-  f.page.items[0].action(); await flush()
+  f.page.items.find(item => item.label === 'Проекты').action(); await flush()
   assert.equal(f.calls[0].payload.method, 'CODEX_PROJECTS')
   f.page.items[0].action()
   assert.equal(f.page.items[1].label, 'Режим: Авто')
@@ -316,7 +323,8 @@ test('home note turns into the cross-agent summary line', async () => {
   const g = fixture({ request: async ({ method }) => method === 'SUMMARY' ? { ok: false, error: 'нет моста' } : replies[method] })
   await flush(); await flush()
   assert.equal(g.page.note.options.text, 'Mac не ответил. Проверь Zepp и повтори связь.')
-  assert.equal(g.page.items[0].label, 'Повторить связь')
+  assert.equal(g.page.items[1].label, 'Повторить связь')
+  assert.equal(g.page.items[0].label, 'Новая задача')
 })
 
 test('question screen lists the options and sends the choice, then returns to the task', async () => {
@@ -401,12 +409,13 @@ test('soft ping failure is visible and can recover without leaving home', async 
     ? online ? { ok: true, text: 'Mac на связи' } : { ok: false, error: 'offline' }
     : replies[method] })
   await flush(); await flush()
-  assert.equal(f.page.items[0].label, 'Повторить связь')
+  assert.equal(f.page.items[0].label, 'Новая задача')
+  assert.equal(f.page.items[1].label, 'Повторить связь')
   online = true
-  f.page.items[0].action()
+  f.page.items[1].action()
   await flush(); await flush()
   assert.equal(f.page.note.options.text, 'Mac на связи')
-  assert.equal(f.page.items[0].label, 'Проекты')
+  assert.equal(f.page.items[1].label, 'Проекты')
 })
 
 test('native Back, scroll rows and controls stay usable on supported compact and wide sizes', () => {
@@ -416,7 +425,8 @@ test('native Back, scroll rows and controls stay usable on supported compact and
     const saved = { screen: 'question', jobId: 'job-1', approvalId: '0123456789abcdef',
       question: longQuestion, options: [longOption, 'Второй', 'Третий'] }
     const f = fixture({ device, storage: new Map([['claude-resume', JSON.stringify(saved)]]) })
-    assert.ok(f.page.menuList.options.item_config[0].item_height >= 44)
+    assert.equal(f.page.rows.length, 3)
+    assert.ok(f.page.rows.every(row => row.kind === 3 && row.options.h >= 44))
     assert.ok(f.page.back.options.h >= 44)
     assert.ok(f.page.next.options.h >= 44)
     assert.ok(f.page.back.options.x >= 0 && f.page.back.options.x + f.page.back.options.w <= device.width)
@@ -425,7 +435,8 @@ test('native Back, scroll rows and controls stay usable on supported compact and
     assert.ok(f.page.next.options.y + f.page.next.options.h <= device.height)
     assert.equal(f.page.noteScroll.options.visible, true)
     assert.ok(f.page.noteScroll.options.data_count > 2)
-    assert.equal(f.page.menuList.options.data_array[0].label, longOption)
+    assert.equal(f.page.items[0].label, longOption)
+    assert.ok(f.page.rows[0].options.text.endsWith('…'))
     f.page.items[0].action()
     assert.equal(f.page.note.options.text, longOption)
     assert.equal(f.page.noteScroll.options.data_array.map(row => row.text).join(''), longOption)
@@ -511,4 +522,65 @@ test('authoritative preset rejection clears only its pending context and returns
   assert.equal(f.page.heading.options.text, 'Не удалось')
   assert.equal(f.page.items[0].label, 'Вернуться к командам')
   assert.equal(f.calls.filter(call => call.payload.method === 'CLAUDE_SEND').length, 1)
+})
+
+
+test('New task is first and opens a fresh general compose without a catalog or task dispatch', async () => {
+  for (const kind of ['claude', 'codex']) {
+    const old = { target: kind, project: '/work/crm', label: 'CRM', mode: 'auto',
+      sessionId: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', jobId: '1700000000000-8' }
+    const f = fixture({ kind, storage: new Map([['voice-destination', JSON.stringify(old)]]),
+      request: async () => new Promise(() => {}) })
+    assert.equal(f.page.rows[0].options.text, 'Новая задача')
+    f.page.rows[0].options.click_func()
+    assert.equal(f.replacements.at(-1).url, 'page/voice')
+    assert.deepEqual(JSON.parse(f.storage.get('voice-destination')), {
+      target: kind, project: 'general', label: 'Общая задача', mode: 'auto', modeLabel: 'Авто',
+      startFresh: true, autoRecord: false
+    })
+    assert.deepEqual(JSON.parse(f.storage.get(kind + '-last-task')), old)
+    f.page.more(1)
+    f.page.items.find(item => item.label === 'Последняя задача').action()
+    assert.equal(JSON.parse(f.storage.get('voice-destination')).jobId, old.jobId)
+    await flush()
+    assert.equal(f.calls.some(call => /_(PROJECTS|SEND|LATEST)$/.test(call.payload.method)), false)
+  }
+})
+
+test('home, More and menu controls have disjoint native rectangles on every target size', () => {
+  for (const kind of ['claude', 'codex']) for (const device of [
+    { width: 432, height: 514 }, { width: 390, height: 450 }, { width: 390, height: 400 }
+  ]) {
+    const f = fixture({ kind, device, request: async () => new Promise(() => {}) })
+    const assertLayout = () => {
+      const visible = f.widgets.filter(w => w.options.visible && w.kind !== 1)
+      for (const current of visible) {
+        const a = current.options
+        assert.ok(a.x >= 0 && a.y >= 0 && a.x + a.w <= device.width && a.y + a.h <= device.height)
+        for (const other of visible) {
+          if (current === other) continue
+          const b = other.options
+          const overlap = Math.min(a.x+a.w,b.x+b.w)>Math.max(a.x,b.x) &&
+            Math.min(a.y+a.h,b.y+b.h)>Math.max(a.y,b.y)
+          assert.equal(overlap, false, JSON.stringify({ a, b }))
+        }
+      }
+      for (const row of f.page.rows.filter(w => w.options.visible)) {
+        assert.equal(row.kind, 3)
+        assert.ok(row.options.h >= 44)
+      }
+    }
+    assertLayout()
+    f.page.next.options.click_func(); assertLayout()
+    assert.deepEqual([...f.page.items.map(x => x.label)], ['Ночная смена', 'Исследование', 'Дозор'])
+    f.page.next.options.click_func(); assertLayout()
+    assert.equal(f.page.items[0].label, 'Последняя задача')
+    f.page.back.options.click_func(); assertLayout()
+    f.page.show('Длинный вопрос', 'Подробности '.repeat(30), [
+      { label: 'Длинный вариант '.repeat(30), action() {} },
+      { label: 'Второй', action() {} }, { label: 'Третий', action() {} }
+    ], () => {}, () => {})
+    assertLayout()
+    assert.ok(f.page.rows[0].options.text.length < 40)
+  }
 })

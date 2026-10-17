@@ -4,7 +4,7 @@ import { forwardVoiceRequest, resolveConnection } from '../shared/bridge-client'
 
 AppSideService(BaseSideService({
   onInit() {
-    console.log('[codex] service 0.3.0 ready')
+    console.log('[codex] service 0.3.1 ready')
   },
   onRequest(request, respond) {
     const connection = resolveConnection(key => settings.settingsStorage.getItem(key), bridgeURL, deviceToken)

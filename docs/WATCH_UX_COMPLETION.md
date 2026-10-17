@@ -2,6 +2,10 @@
 
 ## Scope and order
 
+### Device feedback correction (17 October)
+
+The owner reports overlapping Claude/Codex menu rows after More and no obvious direct New task action. Earlier desktop acceptance covered voice states but did not establish native menu acceptance. The correction puts New task first on the home screen, gives Claude/Codex a dedicated general workspace without requiring an existing project/session, and routes Orca New task through an explicit pair choice. Three fixed native BUTTON rows replace the Claude/Codex menu SCROLL_LIST. Text readers retain continuous scrolling. Tests must check pairwise intersections in home/More and every menu category, not only screen bounds. Real watch acceptance remains separate.
+
 1. Musafir: continuous full-answer reader; retain completed draft scrolling.
 2. Codex: review project/session/task flows and apply common voice/history improvements.
 3. Orca: review pair/project/plan/clarification/approval flows and integrate the same reading/input rules.
@@ -42,3 +46,11 @@ Root verification: 284 JavaScript tests and 220 Python tests passed. Browser QA 
 Personal and public packages are built for Musafir 0.11.0 (code 29), Codex 0.3.0 (code 10), Orca 0.5.0 (code 19) and Claude 0.3.0 (code 11). Compiled phone services passed 33 synthetic method-forwarding checks, rejected another profile and completed 12 read-only HTTPS calls with status 200. Bridge 0.11.0 was installed after checking idle queues and taking consistent SQLite/source backups; all 18 existing jobs and settings were preserved. Public checkout verification/readback is recorded in the release log.
 
 Physical watch touch, swipe-versus-tap discrimination, native keyboard and BLE remain outside desktop acceptance.
+
+## Menu correction verification
+
+Released correction: Codex/Claude 0.3.1, Orca 0.5.1, bridge 0.11.1. New task is the first home action. Claude/Codex use a fixed isolated general workspace with no prior project/session requirement; history preserves the general alias and exact job identity. Existing project routes remain. Orca New task selects a pair and clears previous job intent. Fixed native menu buttons have full geometry, width-bounded captions and reverse navigation. Extra Orca actions are paginated instead of silently discarded. Native text readers are unchanged.
+
+Root verification passed 292 JavaScript and 223 Python tests. The initial full Python run hit the unchanged Parakeet test's 2-second startup timeout under load; isolated recheck and final full rerun passed without modifying that test or audio code. Browser verification covered 43 settled menu views, including home/More for all three apps and night/research/watch for Claude/Codex at three geometries, with no intersecting or out-of-bounds buttons. Both direct general-task flows reached synthetic completion, returned home, opened a fresh task and recovered the previous exact result. Orca pair selection reached compose.
+
+Three personal/public packages and embedded manifests were verified. Compiled phone services passed 25 synthetic forwarding checks and 10 read-only HTTPS requests, including general LATEST/SESSIONS. Bridge deployment preserved all 18 pre-existing jobs and settings with consistent backups. No real agent task was started. The original firmware overlap mechanism is not established by desktop simulation; physical acceptance is still required.

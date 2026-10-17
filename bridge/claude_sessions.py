@@ -109,6 +109,7 @@ def normalize_presets(values):
             break
     return answer or [dict(item, tools=list(PRESET_TOOLS)) for item in DEFAULT_PRESETS]
 RESEARCH_ID = "research"  # the watch's name for "no project, the research folder"
+GENERAL_ID = "general"    # a fresh task with no catalog project
 RESEARCH_TOOLS = ("WebSearch", "WebFetch")
 RESEARCH_PROMPT = """Проведи быстрое исследование по теме: «{topic}».
 Порядок: 1) 3–5 первых запросов веб-поиска с разных углов (обзор, техника, свежее за последний год, критика и практика); \
@@ -216,6 +217,16 @@ class ClaudeService:
         self.presets = normalize_presets(presets)
         self.research_dir = Path(research_dir or self.state / "research")
         self.research_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.workspaces_dir = self.state / "workspaces"
+        self.general_dir = self.workspaces_dir / self.KEY
+        self.workspaces_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.general_dir.mkdir(exist_ok=True, mode=0o700)
+        state_root = self.state.resolve()
+        workspaces_root = self.workspaces_dir.resolve()
+        general_root = self.general_dir.resolve()
+        if (self.workspaces_dir.is_symlink() or self.general_dir.is_symlink() or
+                workspaces_root.parent != state_root or general_root.parent != workspaces_root):
+            raise RuntimeError(f"Некорректный каталог общей задачи {self.LABEL}")
         self.lock = threading.RLock()
         self.db = sqlite3.connect(self.state / self.DB_NAME, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
@@ -296,10 +307,14 @@ class ClaudeService:
             cwd = self._cwd_of(files[0])
             if not cwd or not Path(cwd).is_dir():
                 continue
+            if self._same_general_path(cwd):
+                continue
             updated = files[0].stat().st_mtime
             if cwd not in found or found[cwd]["updated"] < updated:
                 found[cwd] = {"id": cwd, "label": Path(cwd).name or cwd, "updated": updated, "dir": str(folder)}
         for extra in self.extra:
+            if self._same_general_path(extra):
+                continue
             found.setdefault(extra, {"id": extra, "label": Path(extra).name or extra, "updated": 0, "dir": ""})
         items = sorted(found.values(), key=lambda item: item["updated"], reverse=True)
         self._catalog = (now, items)
@@ -313,22 +328,52 @@ class ClaudeService:
                 return item
         raise ValueError(f"Проект не найден среди сессий {self.LABEL}")
 
+    def _same_general_path(self, value):
+        if not isinstance(value, str) or not value:
+            return False
+        try:
+            return Path(value).resolve() == self.general_dir.resolve()
+        except (OSError, RuntimeError):
+            return False
+
+    def _general_target(self, value):
+        if value not in (GENERAL_ID, str(self.general_dir)):
+            return None
+        return {"id": str(self.general_dir), "label": "Общая задача",
+                "updated": 0, "dir": "", "general": True}
+
+    def _task_target(self, value):
+        return self._general_target(value) or self._project(value)
+
     def _target(self, value):
-        """A catalog project, or the research folder for the sentinel 'research'."""
+        """A catalog project or one of the fixed bridge-owned workspaces."""
+        general = self._general_target(value)
+        if general:
+            return general
         if value in (RESEARCH_ID, str(self.research_dir)):
             return {"id": str(self.research_dir), "label": "Исследование", "updated": 0, "dir": ""}
         return self._project(value)
 
     def sessions(self, project):
         folder = project.get("dir")
-        if not folder:
+        if not folder and project.get("general"):
+            try:
+                files = sorted(
+                    (path for path in self.projects_root.glob("*/*.jsonl")
+                     if SESSION_ID.fullmatch(path.stem)),
+                    key=lambda path: path.stat().st_mtime, reverse=True)[:400]
+                files = [path for path in files if self._same_general_path(self._cwd_of(path))][:30]
+            except OSError:
+                files = []
+        elif not folder:
             return []
+        else:
+            try:
+                files = sorted((f for f in Path(folder).glob("*.jsonl") if SESSION_ID.fullmatch(f.stem)),
+                               key=lambda f: f.stat().st_mtime, reverse=True)[:30]
+            except OSError:
+                files = []
         items = []
-        try:
-            files = sorted((f for f in Path(folder).glob("*.jsonl") if SESSION_ID.fullmatch(f.stem)),
-                           key=lambda f: f.stat().st_mtime, reverse=True)[:30]
-        except OSError:
-            files = []
         for path in files:
             label = ""
             for record in _first_records(path):
@@ -357,7 +402,7 @@ class ClaudeService:
             return {"ok": True, "projects": items[offset:offset + limit], **_page(offset, limit, len(items))}
         if method == "_SESSIONS":
             self._only(params, "project", "cursor", "limit")
-            project = self._project(params.get("project"))
+            project = self._task_target(params.get("project"))
             offset, limit = _offset(params.get("cursor")), _limit(params.get("limit"), 3, 10)
             items = self.sessions(project)
             return {"ok": True, "sessions": items[offset:offset + limit], **_page(offset, limit, len(items))}
@@ -414,7 +459,8 @@ class ClaudeService:
         raise ValueError(f"Неизвестная команда {self.LABEL}")
 
     def _send(self, job_id, params, transcript_lookup):
-        self._only(params, "id", "textId", "project", "sessionId", "mode", "night", "kind", "presetId", "pr")
+        self._only(params, "id", "textId", "project", "sessionId", "mode", "night", "kind", "presetId", "pr",
+                   "startFresh")
         kind = params.get("kind", "task")
         if kind not in self.KINDS:
             raise ValueError("Некорректный вид задачи" if kind not in KINDS else "Большое исследование умеет только Claude")
@@ -423,7 +469,7 @@ class ClaudeService:
             preset = next((p for p in self.presets if p["id"] == params["presetId"]), None)
             if preset is None or kind != "task":
                 raise ValueError("Быстрая команда не найдена")
-        project = self._target(params.get("project")) if kind in RESEARCH_KINDS else self._project(params.get("project"))
+        project = self._target(params.get("project")) if kind in RESEARCH_KINDS else self._task_target(params.get("project"))
         mode = params.get("mode") or self.DEFAULT_MODE
         if mode not in {item[0] for item in self.MODES}:
             raise ValueError("Режим недоступен")
@@ -433,6 +479,11 @@ class ClaudeService:
         session = params.get("sessionId") or ""
         if session and (not isinstance(session, str) or not SESSION_ID.fullmatch(session)):
             raise ValueError("Некорректный ID сессии")
+        start_fresh = params.get("startFresh")
+        if start_fresh is not None and type(start_fresh) is not bool:
+            raise ValueError("Некорректный флаг новой задачи")
+        if start_fresh is True and session:
+            raise ValueError("Новая задача не может продолжать сессию")
         text_id = params.get("textId")
         if preset is None and (not isinstance(text_id, str) or not JOB_ID.fullmatch(text_id)):
             raise ValueError("Некорректный ID расшифровки")
@@ -1004,7 +1055,7 @@ class ClaudeService:
         args = []
         if params.get("project") is not None:
             clause += " AND project=?"
-            args.append(self._project(params["project"])["id"])
+            args.append(self._target(params["project"])["id"])
         with self.lock:
             rows = self.db.execute(f"SELECT id,source_text,created,state,deleted_at,label FROM jobs WHERE {clause} "
                                    "ORDER BY created DESC, id DESC LIMIT ? OFFSET ?", (*args, limit + 1, offset)).fetchall()
@@ -1024,7 +1075,9 @@ class ClaudeService:
             raise ValueError("Страница за пределами истории")
         page = content[offset:offset + limit]
         context = {
-            "target": self.KEY, "project": row["project"], "jobId": row["id"],
+            "target": self.KEY,
+            "project": GENERAL_ID if self._same_general_path(row["project"]) else row["project"],
+            "jobId": row["id"],
             "openJob": True, "resumeJob": True, "autoRecord": False,
         }
         if row["label"]:
@@ -1060,7 +1113,7 @@ class ClaudeService:
         clause, args = "deleted_at IS NOT NULL AND state IN ('completed','error','night')", []
         if params.get("project") is not None:
             clause += " AND project=?"
-            args.append(self._project(params["project"])["id"])
+            args.append(self._target(params["project"])["id"])
         with self.lock:
             cursor = self.db.execute(f"DELETE FROM jobs WHERE {clause}", args)
             self.db.commit()
@@ -1112,7 +1165,6 @@ class ClaudeService:
                 "result": page, "resultLength": len(body), "error": row["error"],
                 **_page(cursor, PAGE_MAX, len(body))}
 
-    @staticmethod
-    def _only(params, *allowed):
+    def _only(self, params, *allowed):
         if not set(params) <= set(allowed):
             raise ValueError(f"Некорректные поля запроса {self.LABEL}")

@@ -208,6 +208,72 @@ class ClaudeServiceTests(unittest.TestCase):
         latest = self.service.rpc("CLAUDE_LATEST", {"project": str(self.crm)})["job"]
         self.assertEqual(latest["id"], "1-2")
 
+    def test_general_target_is_fixed_isolated_fresh_and_resumable(self):
+        state = Path(self.temp.name) / "state"
+        general = state / "workspaces" / "claude"
+        source = "  Общая задача без проекта 😀\n"
+        queued = self.service.rpc("CLAUDE_SEND", {
+            "id": "1-8", "textId": "1-8", "project": "general", "kind": "task",
+            "mode": "auto", "startFresh": True}, lambda _: source)["job"]
+        self.assertEqual((queued["id"], queued["project"], queued["projectLabel"]),
+                         ("1-8", str(general), "Общая задача"))
+        done = self.wait("1-8")
+        self.assertEqual(self.service._job("1-8")["source_text"], source)
+        self.assertEqual(self.launches[0]["cwd"], str(general))
+        self.assertTrue(general.is_dir())
+        self.assertEqual(general.parent, state / "workspaces")
+        self.assertNotEqual(general, state)
+        self.assertNotEqual(general, state / "research")
+        self.assertNotIn("--resume", self.launches[0]["argv"])
+        self.assertIn("--permission-mode", self.launches[0]["argv"])
+        self.assertNotIn("--dangerously-skip-permissions", self.launches[0]["argv"])
+        self.write_session(self.root / "-general", "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee",
+                           str(general), summary="Общий разговор")
+        self.assertNotIn(str(general), [p["id"] for p in self.service.rpc(
+            "CLAUDE_PROJECTS", {"limit": 10})["projects"]])
+        self.assertEqual([item["label"] for item in self.service.rpc("CLAUDE_SESSIONS", {
+            "project": "general", "limit": 10})["sessions"]], ["Общий разговор"])
+        self.assertEqual(self.service.rpc("CLAUDE_LATEST", {"project": "general"})["job"]["id"], "1-8")
+        self.assertEqual(self.service.rpc("CLAUDE_LATEST", {"project": str(general)})["job"]["id"], "1-8")
+        self.assertEqual(self.service.rpc("CLAUDE_HISTORY_LIST", {
+            "project": "general", "limit": 3})["items"][0]["id"], "1-8")
+        detail = self.service.rpc("CLAUDE_HISTORY_DETAIL", {"id": "1-8", "field": "text"})
+        self.assertEqual(detail["content"], source)
+        self.assertEqual(detail["context"]["project"], "general")
+        self.assertEqual(detail["context"]["label"], "Общая задача")
+        self.assertEqual(detail["context"]["mode"], "auto")
+        self.assertEqual(self.service.rpc("CLAUDE_SEND", {
+            "id": "1-8", "textId": "1-8", "project": str(general), "kind": "task",
+            "mode": "auto", "startFresh": True})["job"]["id"], "1-8")
+
+        self.process = FakeProcess(result_json("Продолжаю общую задачу."))
+        self.service.rpc("CLAUDE_SEND", {
+            "id": "1-9", "textId": "1-9", "project": str(general), "kind": "task",
+            "mode": "auto", "startFresh": False, "sessionId": done["sessionId"]}, lambda _: "Продолжи")
+        self.assertEqual(self.wait("1-9")["state"], "completed")
+        self.assertEqual(self.launches[1]["cwd"], str(general))
+        self.assertEqual(self.launches[1]["argv"][self.launches[1]["argv"].index("--resume") + 1],
+                         done["sessionId"])
+        with self.assertRaises(ValueError):
+            self.service.rpc("CLAUDE_SEND", {
+                "id": "1-10", "textId": "1-10", "project": "general", "startFresh": True,
+                "sessionId": done["sessionId"]}, lambda _: "x")
+        for invalid in (str(state / "workspaces" / "other"), str(general / ".." / "claude")):
+            with self.assertRaises(ValueError):
+                self.service.rpc("CLAUDE_SEND", {
+                    "id": "1-11", "textId": "1-11", "project": invalid,
+                    "startFresh": True}, lambda _: "x")
+
+    def test_general_target_refuses_a_workspace_symlink(self):
+        base = Path(self.temp.name)
+        state = base / "unsafe-state"
+        outside = base / "outside"; outside.mkdir()
+        (state / "workspaces").mkdir(parents=True)
+        (state / "workspaces" / "claude").symlink_to(outside, target_is_directory=True)
+        with self.assertRaises(RuntimeError):
+            ClaudeService(state, executable="/fake/claude", projects_root=self.root,
+                          runner=lambda argv, cwd, env: FakeProcess(result_json("x")))
+
     def test_replay_requires_the_same_text_id_and_options_and_keeps_exact_source(self):
         params = {"id": "9-1", "textId": "9-2", "project": str(self.crm),
                   "mode": "auto", "night": True}

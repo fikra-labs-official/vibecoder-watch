@@ -83,10 +83,12 @@ class CodexService(ClaudeService):
             if not meta:
                 continue
             _, cwd = meta
-            if cwd in found or not Path(cwd).is_dir():
+            if cwd in found or not Path(cwd).is_dir() or self._same_general_path(cwd):
                 continue
             found[cwd] = {"id": cwd, "label": Path(cwd).name or cwd, "updated": path.stat().st_mtime, "dir": str(self.projects_root)}
         for extra in self.extra:
+            if self._same_general_path(extra):
+                continue
             found.setdefault(extra, {"id": extra, "label": Path(extra).name or extra, "updated": 0, "dir": ""})
         items = sorted(found.values(), key=lambda item: item["updated"], reverse=True)
         self._catalog = (now, items)
@@ -96,7 +98,11 @@ class CodexService(ClaudeService):
         items = []
         for path in self._rollouts():
             meta = self._meta(path)
-            if not meta or meta[1] != project["id"]:
+            if not meta:
+                continue
+            if project.get("general") and not self._same_general_path(meta[1]):
+                continue
+            if not project.get("general") and meta[1] != project["id"]:
                 continue
             label = ""
             for record in _first_records(path, limit=400):

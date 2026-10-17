@@ -5,8 +5,8 @@
     "appName": "Orca",
     "appType": "app",
     "version": {
-      "code": 19,
-      "name": "0.5.0"
+      "code": 20,
+      "name": "0.5.1"
     },
     "icon": "orca-icon.png",
     "vender": "Fikra Labs",

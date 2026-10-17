@@ -106,6 +106,7 @@ const demoTerminals = [
 const demoPair = {
   id: 'pair-demo', projectLabel: 'Демо проект', workerAgent: 'codex', reviewerAgent: 'claude'
 }
+const sentAgentJobs = new Map()
 const historyDemo = [
   {
     id: RESULT_JOB_ID, created: 1700000500, state: 'completed', deleted: false,
@@ -759,6 +760,22 @@ function syntheticBridge(payload) {
       case 'CODEX_PROJECTS':
         resolve({ ok: true, projects: [{ id: '/local/demo', label: 'Демо проект' }], nextCursor: null })
         return
+      case 'CLAUDE_NIGHT':
+      case 'CODEX_NIGHT':
+        resolve({ ok: true, active: false, at: '01:00', count: 2, nextCursor: null,
+          jobs: [{ id: 'night-1', projectLabel: 'Демо проект', text: 'Проверить длинное название задания в ночной смене' },
+            { id: 'night-2', projectLabel: 'Демо проект', text: 'Подготовить список изменений' }] })
+        return
+      case 'WATCH_LIST':
+        resolve({ ok: true, count: 2, nextCursor: null, items: [
+          { id: 'watch-1', label: 'Демо сайт', state: 'ok', detail: 'Синтетическая проверка доступности' },
+          { id: 'watch-2', label: 'CI демо проекта', state: 'ok', detail: 'Синтетическая сборка' }] })
+        return
+      case 'CLAUDE_QUICK_LIST':
+      case 'CODEX_QUICK_LIST':
+        resolve({ ok: true, nextCursor: null, items: [
+          { id: 'demo-status', label: 'Статус проекта' }, { id: 'demo-check', label: 'Что упало?' }] })
+        return
       case 'CLAUDE_MODES':
       case 'CODEX_MODES':
         resolve({ ok: true, modes: [{ id: 'auto', label: 'Авто' }, { id: 'read-only', label: 'Только чтение' }], nextCursor: null })
@@ -773,6 +790,8 @@ function syntheticBridge(payload) {
       case 'CODEX_JOB': {
         if (scenario === 'offline') { reject(new Error('Телефон не ответил')); return }
         if (scenario === 'error') { resolve({ ok: false, error: `Не удалось получить статус ${PROFILES[appKind].title}` }); return }
+        const sent = sentAgentJobs.get(`${payload.method.split('_')[0]}:${params.id}`)
+        if (payload.method.endsWith('_JOB') && sent) { resolve({ ok: true, job: sent }); return }
         if (scenario === 'compose' || scenario === 'ready' || scenario === 'review') {
           resolve({ ok: true, job: null }); return
         }
@@ -792,11 +811,14 @@ function syntheticBridge(payload) {
         return
       }
       case 'CLAUDE_SEND':
-      case 'CODEX_SEND':
-        resolve({ ok: true, job: { id: params.id, state: 'completed',
+      case 'CODEX_SEND': {
+        const job = { id: params.id, state: 'completed',
           result: `Синтетический итог ${PROFILES[appKind].title}.`,
-          resultLength: Array.from(fullReport).length, sessionId: 'session-demo' } })
+          resultLength: Array.from(fullReport).length, sessionId: 'session-demo' }
+        sentAgentJobs.set(`${payload.method.split('_')[0]}:${params.id}`, job)
+        resolve({ ok: true, job })
         return
+      }
       case 'CLAUDE_APPROVE':
       case 'CODEX_APPROVE':
         resolve({ ok: true, job: { id: params.id, state: params.allow ? 'completed' : 'error',
@@ -1024,6 +1046,7 @@ function observeState() {
 }
 
 function resetSyntheticRuntime() {
+  sentAgentJobs.clear()
   files.clear()
   fileHandles.clear()
   uploads.clear()

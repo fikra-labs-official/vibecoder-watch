@@ -1609,6 +1609,53 @@ const agentProfiles = [
   { kind: 'codex', prefix: 'CODEX', context: { target: 'codex', project: '/work/typed', label: 'Typed', mode: 'read-only' } }
 ]
 
+test('direct general tasks send exact typed text without resuming a previous agent session', async () => {
+  for (const kind of ['claude', 'codex']) {
+    const prefix = kind.toUpperCase()
+    const storage = new Map([['voice-destination', JSON.stringify({
+      target: kind, project: 'general', label: 'Общая задача', mode: 'auto',
+      startFresh: true, autoRecord: false
+    })]])
+    const text = '  Новая самостоятельная задача 🙂\n'
+    let uploaded = ''
+    const f = pageFixture({ kind, storage, reply: ({ method, params }) => {
+      if (method === 'TEXT_BEGIN') return { ok: true, id: params.id,
+        textLength: params.textLength, receivedLength: 0 }
+      if (method === 'TEXT_PART') {
+        uploaded += params.text
+        return { ok: true, id: params.id, textLength: Array.from(text).length,
+          receivedLength: params.offset + Array.from(params.text).length }
+      }
+      if (method === 'TEXT_FINISH') return { ok: true, id: params.id,
+        state: 'ready', textLength: Array.from(text).length }
+      if (method === prefix + '_SEND') {
+        assert.equal(params.project, 'general')
+        assert.equal(params.mode, 'auto')
+        assert.equal(params.sessionId, undefined)
+        return { ok: true, job: { id: params.id, state: 'completed', result: 'Готово',
+          sessionId: 'new-session-id' } }
+      }
+      throw new Error(`unexpected ${method}`)
+    } })
+    f.page.build(); await flush()
+    assert.equal(f.page.client.getState().phase, 'ready')
+    assert.equal(f.requests.length, 0)
+    f.page.secondaryButton.options.click_func()
+    f.keyboard().onComplete(null, { data: text })
+    assertReviewText(f.page, text)
+    assert.equal(f.requests.length, 0)
+    f.page.primaryButton.options.click_func(); await flush()
+    assert.equal(uploaded, text)
+    assert.deepEqual(f.requests.map(item => item.method),
+      ['TEXT_BEGIN', 'TEXT_PART', 'TEXT_FINISH', prefix + '_SEND'])
+    assertReaderText(f.page, 'Готово')
+    f.page.backButton.options.click_func()
+    assert.equal(f.replacements.at(-1).url, 'page/index')
+    assert.deepEqual(JSON.parse(storage.get(kind + '-resume')), { screen: 'home' })
+    f.page.onDestroy()
+  }
+})
+
 test('Orca, Claude and Codex typed compose cancel safely, persist drafts and honor every Back path', async () => {
   for (const profile of agentProfiles) {
     const storage = new Map([['voice-destination', JSON.stringify(profile.context)]])

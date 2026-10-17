@@ -134,6 +134,53 @@ class CodexServiceTests(unittest.TestCase):
         self.assertIn("--dangerously-bypass-approvals-and-sandbox", argv)
         self.assertNotIn("-C", argv)
 
+    def test_general_target_uses_only_the_fixed_codex_workspace(self):
+        state = Path(self.temp.name) / "state"
+        general = state / "workspaces" / "codex"
+        source = "\tНовая общая задача Codex 😀\n"
+        self.service.rpc("CODEX_SEND", {
+            "id": "1-8", "textId": "1-8", "project": "general", "kind": "task",
+            "mode": "auto", "startFresh": True}, lambda _: source)
+        done = self.wait("1-8")
+        self.assertEqual(self.service._job("1-8")["source_text"], source)
+        self.assertEqual(self.launches[0]["cwd"], str(general))
+        self.assertEqual(self.launches[0]["argv"][:4], ["/fake/codex", "exec", "-C", str(general)])
+        self.assertIn('sandbox_mode="workspace-write"', self.launches[0]["argv"])
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", self.launches[0]["argv"])
+        self.rollout("2026/09/28", "01a0d000-0000-7000-8000-000000000003",
+                     str(general), "Общий разговор Codex")
+        self.assertNotIn(str(general), [p["id"] for p in self.service.rpc(
+            "CODEX_PROJECTS", {"limit": 10})["projects"]])
+        self.assertEqual([item["label"] for item in self.service.rpc("CODEX_SESSIONS", {
+            "project": str(general), "limit": 10})["sessions"]], ["Общий разговор Codex"])
+        self.assertEqual(self.service.rpc("CODEX_LATEST", {"project": "general"})["job"]["id"], "1-8")
+        self.assertEqual(self.service.rpc("CODEX_LATEST", {"project": str(general)})["job"]["id"], "1-8")
+        self.assertEqual(self.service.rpc("CODEX_HISTORY_LIST", {
+            "project": str(general), "limit": 3})["items"][0]["id"], "1-8")
+        detail = self.service.rpc("CODEX_HISTORY_DETAIL", {"id": "1-8", "field": "text"})
+        self.assertEqual(detail["content"], source)
+        self.assertEqual(detail["context"]["project"], "general")
+        self.assertEqual(detail["context"]["label"], "Общая задача")
+        self.assertEqual(self.service.rpc("CODEX_SEND", {
+            "id": "1-8", "textId": "1-8", "project": str(general), "kind": "task",
+            "mode": "auto", "startFresh": True})["job"]["id"], "1-8")
+
+        self.process = FakeProcess(events(done["sessionId"], "Продолжение."))
+        self.service.rpc("CODEX_SEND", {
+            "id": "1-9", "textId": "1-9", "project": str(general), "kind": "task",
+            "mode": "auto", "startFresh": False, "sessionId": done["sessionId"]}, lambda _: "Продолжи")
+        self.assertEqual(self.wait("1-9")["result"], "Продолжение.")
+        self.assertEqual(self.launches[1]["cwd"], str(general))
+        self.assertEqual(self.launches[1]["argv"][:4], ["/fake/codex", "exec", "resume", done["sessionId"]])
+        with self.assertRaises(ValueError):
+            self.service.rpc("CODEX_SEND", {
+                "id": "1-10", "textId": "1-10", "project": "general", "startFresh": True,
+                "sessionId": done["sessionId"]}, lambda _: "x")
+        with self.assertRaises(ValueError):
+            self.service.rpc("CODEX_SEND", {
+                "id": "1-11", "textId": "1-11", "project": str(state / "workspaces" / "claude"),
+                "startFresh": True}, lambda _: "x")
+
     def test_errors_without_agent_message_and_nonzero_exit(self):
         self.process = FakeProcess(events("01a0e48f-981b-7422-b8e8-75ce82b663a8", None, error="model unavailable"))
         self.service.rpc("CODEX_SEND", {"id": "2-1", "textId": "2-1", "project": str(self.crm)}, lambda _: "x")
