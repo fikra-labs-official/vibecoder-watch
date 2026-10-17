@@ -19,8 +19,8 @@ class FakeHermes:
         self.status = {'status': 'completed', 'output': 'Готово'}
         self.failure = None
 
-    def call(self, path, body=None, request_id=None, timeout=12):
-        self.calls.append((path, body, request_id, timeout))
+    def call(self, path, body=None, request_id=None, timeout=12, session_key=None):
+        self.calls.append((path, body, request_id, timeout, session_key))
         if self.failure:
             raise self.failure
         if path == '/v1/runs':
@@ -53,10 +53,10 @@ class BridgeTests(unittest.TestCase):
         self.hermes.status = {'status': 'waiting_for_approval', 'approval': {'request_id': 'approval-1', 'command': command}}
         self.assertEqual(self.bridge.job_status('123-1')['approval']['text'], command)
         original = self.hermes.call
-        def expired(path, body=None, request_id=None, timeout=12):
+        def expired(path, body=None, request_id=None, timeout=12, session_key=None):
             if path.endswith('/approval'):
                 raise HTTPError(path, 409, 'expired', {}, None)
-            return original(path, body, request_id, timeout)
+            return original(path, body, request_id, timeout, session_key)
         self.hermes.call = expired
         result = self.bridge.rpc('JOB_APPROVE', {'id': '123-1', 'approvalId': 'approval-1', 'allow': True})
         self.assertEqual(result['state'], 'submitting')
@@ -706,11 +706,11 @@ class BridgeTests(unittest.TestCase):
         self.hermes.status = {'status': 'waiting_for_approval',
                               'approval': {'request_id': 'approve-1', 'command': 'command'}}
         original = self.hermes.call
-        def lost(path, body=None, request_id=None, timeout=12):
+        def lost(path, body=None, request_id=None, timeout=12, session_key=None):
             if path.endswith('/approval'):
                 self.hermes.calls.append((path, body, request_id, timeout))
                 raise TimeoutError()
-            return original(path, body, request_id, timeout)
+            return original(path, body, request_id, timeout, session_key)
         self.hermes.call = lost
         result = self.bridge.rpc('JOB_APPROVE', {
             'id': '123-1', 'approvalId': 'approve-1', 'allow': True})

@@ -22,8 +22,8 @@ export const JOB_POLL_MS = 3000
 
 const LOCAL_ID = /^\d{1,16}-\d{1,8}$/
 const JOB_STATES = new Set([
-  'transcribing', 'ready', 'submitting', 'queued', 'running', 'approval',
-  'completed', 'error', 'unknown'
+  'transcribing', 'ready', 'submitting', 'queued', 'running', 'stopping', 'approval',
+  'completed', 'cancelled', 'error', 'unknown'
 ])
 const RETRYABLE_READS = new Set(['STATUS', 'LATEST_JOB', 'AUDIO_STATUS', 'JOB_STATUS'])
 
@@ -348,17 +348,21 @@ export function createWatchClient({
     }
 
     const rejected = job.state === 'error' && job.retryTextId === job.id
-    const accepted = ['submitting', 'queued', 'running', 'approval', 'completed', 'unknown'].includes(job.state) ||
+    const accepted = ['submitting', 'queued', 'running', 'stopping', 'approval', 'completed', 'cancelled', 'unknown'].includes(job.state) ||
       (job.state === 'error' && !rejected)
     if (accepted) clearDraft(job.id)
     const base = { id: job.id, jobId: job.id, state: job.state, busy: false }
+    if (typeof job.chatId === 'string') base.chatId = job.chatId
+    if (typeof job.summary === 'string') base.summary = job.summary
+    if (job.mode === 'task' || job.mode === 'research') base.mode = job.mode
+    if (Number.isInteger(job.reportLength) && job.reportLength >= 0) base.reportLength = job.reportLength
     if (job.state === 'transcribing') {
       emit({ ...base, phase: 'transcribing', busy: true })
       scheduleAudioStatus(job.id, operation)
     } else if (job.state === 'ready') {
       if (typeof job.text !== 'string' || !job.text.trim()) throw new Error('INVALID_RESPONSE')
       emitReview(job.id, job.text, null)
-    } else if (job.state === 'submitting' || job.state === 'queued' || job.state === 'running') {
+    } else if (job.state === 'submitting' || job.state === 'queued' || job.state === 'running' || job.state === 'stopping') {
       emit({ ...base, phase: 'job', text: job.text || '', busy: true })
       scheduleJobStatus(job.id, operation)
     } else if (job.state === 'approval') {
@@ -380,11 +384,12 @@ export function createWatchClient({
         })
       }
       scheduleJobStatus(job.id, operation)
-    } else if (job.state === 'completed') {
+    } else if (job.state === 'completed' || job.state === 'cancelled') {
       lastResult = {
         ...base,
         text: typeof job.text === 'string' ? job.text : '',
-        result: typeof job.result === 'string' && job.result ? job.result : 'Готово'
+        result: typeof job.result === 'string' && job.result
+          ? job.result : job.state === 'cancelled' ? 'Задание остановлено' : 'Готово'
       }
       if (recovered && resultWasAcknowledged(job.id)) {
         emit({
@@ -813,6 +818,35 @@ export function createWatchClient({
           showJob(reply, operation)
         } catch (error) {
           fail(error, operation, 'JOB_STATUS', id, 'job')
+        }
+      })()
+      return true
+    },
+
+    stopJob() {
+      if (!['job', 'approval'].includes(current.phase) || typeof current.jobId !== 'string' ||
+          !['submitting', 'queued', 'running', 'approval'].includes(current.state)) return false
+      const id = current.jobId
+      const text = typeof current.text === 'string' ? current.text : ''
+      const operation = beginOperation()
+      const keepPolling = error => {
+        if (!active(operation) || error && error.message === 'CANCELED') return
+        emit({ phase: 'job', id, jobId: id, state: 'stopping', text, busy: true,
+          error: messageOf(error) })
+        scheduleJobStatus(id, operation)
+      }
+      emit({ phase: 'job', id, jobId: id, state: 'stopping', text, busy: true })
+      ;(async () => {
+        try {
+          const reply = await call({ method: 'JOB_STOP', params: { id } })
+          assertActive(operation)
+          if (!validReply(reply) || reply.id !== id || reply.state === 'unknown') {
+            keepPolling(new Error(reply && (reply.error || reply.result) || 'Статус остановки уточняется'))
+            return
+          }
+          showJob(reply, operation)
+        } catch (error) {
+          keepPolling(error)
         }
       })()
       return true

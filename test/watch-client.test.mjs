@@ -1153,3 +1153,97 @@ test('an unsent edited draft is restored without any automatic submission', asyn
   assert.equal(draft, null)
   f.client.close()
 })
+
+test('stop is sent once, stopping stays a job phase, and cancelled becomes a result', async () => {
+  let statusCalls = 0
+  let stopCalls = 0
+  const f = fixture(({ method, params }) => {
+    if (method === 'STATUS') return Promise.resolve({ ok: true, agent: 'Мусафир' })
+    if (method === 'LATEST_JOB') return Promise.resolve({ ok: true, job: {
+      id: '123-20', state: 'running', text: 'Долгая задача', chatId: '123-20',
+      summary: 'Долгая задача', mode: 'research', reportLength: 120
+    } })
+    if (method === 'JOB_STOP') {
+      stopCalls += 1
+      return Promise.resolve({ ok: true, id: params.id, state: 'stopping',
+        chatId: '123-20', summary: 'Останавливаю', mode: 'research', reportLength: 120 })
+    }
+    if (method === 'JOB_STATUS') {
+      statusCalls += 1
+      return Promise.resolve({ ok: true, id: params.id, state: 'cancelled', result: '',
+        chatId: '123-20', summary: 'Остановлено', mode: 'research', reportLength: 120 })
+    }
+    throw new Error(method)
+  })
+  f.client.start()
+  await flush()
+  assert.equal(f.client.stopJob(), true)
+  assert.equal(f.client.stopJob(), false)
+  await flush()
+  assert.equal(stopCalls, 1)
+  assert.equal(f.client.getState().phase, 'job')
+  assert.equal(f.client.getState().state, 'stopping')
+  assert.equal(f.client.getState().chatId, '123-20')
+  assert.equal(f.client.getState().reportLength, 120)
+
+  f.clock.fireDelay(3000)
+  await flush()
+  assert.equal(statusCalls, 1)
+  assert.equal(f.client.getState().phase, 'result')
+  assert.equal(f.client.getState().state, 'cancelled')
+  assert.equal(f.client.getState().result, 'Задание остановлено')
+  f.client.close()
+})
+
+test('unknown stop receipt polls the exact job without repeating JOB_STOP', async () => {
+  let stopCalls = 0
+  const f = fixture(({ method, params }) => {
+    if (method === 'STATUS') return Promise.resolve({ ok: true, agent: 'Мусафир' })
+    if (method === 'LATEST_JOB') return Promise.resolve({ ok: true, job: {
+      id: '123-21', state: 'running', text: 'Задача'
+    } })
+    if (method === 'JOB_STOP') {
+      stopCalls += 1
+      return Promise.resolve({ ok: true, id: params.id, state: 'unknown',
+        error: 'Ответ об остановке потерян' })
+    }
+    if (method === 'JOB_STATUS') return Promise.resolve({ ok: true, id: params.id,
+      state: 'cancelled' })
+    throw new Error(method)
+  })
+  f.client.start()
+  await flush()
+  assert.equal(f.client.stopJob(), true)
+  await flush()
+  assert.equal(stopCalls, 1)
+  assert.equal(f.client.getState().phase, 'job')
+  assert.equal(f.client.getState().state, 'stopping')
+  f.clock.fireDelay(3000)
+  await flush()
+  assert.equal(stopCalls, 1)
+  assert.deepEqual(f.sent.filter(item => item.payload.method === 'JOB_STATUS')
+    .map(item => item.payload.params.id), ['123-21'])
+  assert.equal(f.client.getState().phase, 'result')
+  f.client.close()
+})
+
+test('closing during stop suppresses a late invalid reply', async () => {
+  let resolveStop
+  const f = fixture(({ method }) => {
+    if (method === 'STATUS') return Promise.resolve({ ok: true, agent: 'Мусафир' })
+    if (method === 'LATEST_JOB') return Promise.resolve({ ok: true, job: {
+      id: '123-22', state: 'running', text: 'Задача'
+    } })
+    if (method === 'JOB_STOP') return new Promise(resolve => { resolveStop = resolve })
+    throw new Error(method)
+  })
+  f.client.start()
+  await flush()
+  assert.equal(f.client.stopJob(), true)
+  const count = f.states.length
+  f.client.close()
+  resolveStop({ ok: true, id: 'other', state: 'cancelled' })
+  await flush()
+  assert.equal(f.states.length, count)
+  assert.equal(f.clock.count(), 0)
+})

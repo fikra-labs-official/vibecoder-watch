@@ -103,6 +103,14 @@ class DigestTests(unittest.TestCase):
         self.assertIn("Тишина", text)
         self.assertEqual(text.count("\n"), 1)
 
+    def test_stopping_hermes_job_stays_active_until_remote_confirmation(self):
+        db = sqlite3.connect(self.state / "state.sqlite3")
+        db.execute("INSERT INTO jobs VALUES (?,?,?,?,?,?,?)", (
+            "stopping", "Останавливается", "stopping", "", "", at(20, 10), None))
+        db.commit()
+        db.close()
+        self.assertEqual(summary(self.state, at(28, 10))["working"], 1)
+
     def test_schedule_sends_once_per_day_after_the_configured_time(self):
         notes = []
         d = Digest(self.state, lambda key, text: notes.append(key) or True, at="10:00", now=lambda: at(28, 9, 59))

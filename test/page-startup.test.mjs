@@ -5,6 +5,7 @@ import vm from 'node:vm'
 import { createWatchClient, MAX_AUDIO_BYTES } from '../shared/watch-client.js'
 import { createOrcaVoiceRoute, createFolderVoiceRoute } from '../shared/orca-voice.js'
 import { createClaudeVoiceRoute, createCodexVoiceRoute } from '../shared/claude-voice.js'
+import { createMusafirVoiceRoute, normalizeContext, heroById, MUSAFIR_CONTEXT_KEY, MUSAFIR_HERO_KEY } from '../shared/musafir-chat.js'
 
 const alertSource = fs.readFileSync(new URL('../shared/watch-alerts.js', import.meta.url), 'utf8')
   .replace(/^import .*$/gm, '')
@@ -12,14 +13,15 @@ const alertSource = fs.readFileSync(new URL('../shared/watch-alerts.js', import.
 const voiceSource = fs.readFileSync(new URL('../shared/voice-page.js', import.meta.url), 'utf8')
   .replace(/^import .*$/gm, '')
   .replace('export function createVoicePage', 'function createVoicePage')
-const entrySource = fs.readFileSync(new URL('../page/index.js', import.meta.url), 'utf8')
-  .replace(/^import .*$/gm, '')
+// Legacy recorder tests exercise the same component used by all four voice apps.
+// The new chat entry is exercised explicitly with chats:true below.
+const entrySource = "Page(BasePage(createVoicePage({ kind: 'musafir', icon: 'brand-mark.png', title: 'Мусафир', version: '0.9.0' })))"
 const source = `${alertSource}\n${voiceSource}\n${entrySource}`
 const flush = () => new Promise(resolve => setImmediate(resolve))
 
 export function pageFixture({ media = () => { throw Error('recorder unavailable') }, layout,
   width = 390, height = 450, files = {}, reply, storage = new Map(),
-  storageError = false, displayError = false, vibratorError = false, kind = 'musafir', keyboard } = {}) {
+  storageError = false, displayError = false, vibratorError = false, kind = 'musafir', keyboard, chats = false } = {}) {
   let page
   let mediaCalls = 0
   let nextTimer = 0
@@ -42,7 +44,7 @@ export function pageFixture({ media = () => { throw Error('recorder unavailable'
     displayCalls.push({ name, ...value })
     if (displayError) throw Error('display unavailable')
   }]))
-  const executable = kind === 'musafir' ? source : kind === 'claude' || kind === 'codex'
+  const executable = kind === 'musafir' ? chats ? `${alertSource}\n${voiceSource}\nPage(BasePage(createVoicePage({kind:'musafir',chats:true,icon:'heroes/musafir.png',title:'Мусафир',version:'0.9.0'})))` : source : kind === 'claude' || kind === 'codex'
     ? `${alertSource}\n${voiceSource}\nPage(BasePage(createVoicePage({ kind: '${kind}', icon: '${kind}-mark.png', title: '${kind === 'codex' ? 'Codex' : 'Claude'}', version: '0.1.0' })))`
     : `${alertSource}\n${voiceSource}\nPage(BasePage(createVoicePage({
     kind: 'orca', icon: 'orca-mark.png', title: 'Orca', version: '0.2.0'
@@ -50,6 +52,7 @@ export function pageFixture({ media = () => { throw Error('recorder unavailable'
   vm.runInNewContext(executable, {
     Page(value) { page = value }, BasePage: value => value,
     createWatchClient, MAX_AUDIO_BYTES, createOrcaVoiceRoute, createFolderVoiceRoute, createClaudeVoiceRoute, createCodexVoiceRoute,
+    createMusafirVoiceRoute, normalizeContext, heroById, MUSAFIR_CONTEXT_KEY, MUSAFIR_HERO_KEY,
     replace(value) { replacements.push(value) },
     ...display, keyboardUI,
     LocalStorage: class {
@@ -114,6 +117,149 @@ test('startup connects without opening the microphone', async () => {
   assert.equal(f.page.client.getState().phase, 'ready')
   assert.equal(f.page.primaryButton.options.visible, true)
   f.page.onDestroy()
+})
+
+test('Musafir New task starts local recording without waiting for Mac or loading a previous answer', async () => {
+  const storage = new Map([['musafir-context', JSON.stringify({ target: 'musafir', chatId: null,
+    mode: 'task', jobId: null, openJob: false, autoRecord: true })], ['musafir-hero', 'barq']])
+  let starts = 0
+  const f = pageFixture({ chats: true, storage, media: () => ({
+    setFormat() {}, start() { starts++ }, stop() {}
+  }), reply: () => { throw Error('Mac must not be needed for local recording') } })
+  f.page.build()
+  await flush()
+  f.tick(0)
+  assert.equal(starts, 1)
+  assert.equal(f.page.client.getState().phase, 'recording')
+  assert.equal(f.requests.length, 0)
+  assert.equal(f.page.hero.id, 'barq')
+  assert.equal(JSON.parse(storage.get('musafir-pending-context')).chatId, null)
+  assert.equal(JSON.parse(storage.get('musafir-context')).autoRecord, false)
+  f.page.onDestroy()
+})
+
+test('Musafir explicit task resumes after sleep and animates its cosmetic hero only while running', async () => {
+  const id = '1700000000000-21'
+  const storage = new Map([['musafir-context', JSON.stringify({ target: 'musafir', chatId: 'legacy',
+    mode: 'task', jobId: id, openJob: true })], ['musafir-hero', 'amin']])
+  let state = 'queued'
+  const reply = ({ method }) => method === 'STATUS' ? { ok: true, agent: 'Мусафир' }
+    : { ok: true, id, chatId: 'legacy', state, text: 'Задание', result: '', summary: '', reportLength: 0 }
+  const f = pageFixture({ chats: true, storage, reply })
+  f.page.build()
+  await flush()
+  assert.deepEqual(f.requests.map(x => x.method), ['STATUS', 'JOB_STATUS'])
+  assert.equal(f.page.statusWidget.options.text, 'Задание получено')
+  assert.equal(f.page.brandWidget.options.src, 'heroes/amin.png')
+  state = 'running'
+  f.tick(3000)
+  await flush()
+  assert.equal(f.page.client.getState().state, 'running')
+  assert.equal(f.page.statusWidget.options.text, 'Мусафир работает')
+  assert.equal(f.page.stageWidget.options.text.includes('Orca'), false)
+  f.advance(1800)
+  f.tick(300)
+  assert.match(f.page.brandWidget.options.src, /^heroes\/amin-[012]\.png$/)
+  f.page.onDestroy()
+  assert.equal(JSON.parse(storage.get('musafir-context')).openJob, true)
+  const reopened = pageFixture({ chats: true, storage, reply })
+  reopened.page.build()
+  await flush()
+  assert.deepEqual(reopened.requests.map(x => x.method), ['STATUS', 'JOB_STATUS'])
+  assert.equal(reopened.page.client.getState().jobId, id)
+  reopened.page.onDestroy()
+})
+
+test('Musafir result exposes full report and continuing scopes its draft to the accepted chat', async () => {
+  const id = '1700000000000-31'
+  const storage = new Map([['musafir-context', JSON.stringify({ target: 'musafir', chatId: id,
+    mode: 'research', jobId: id, openJob: true })]])
+  const f = pageFixture({ chats: true, storage, media: () => ({ setFormat() {}, start() {}, stop() {} }),
+    reply: ({ method }) => method === 'STATUS' ? { ok: true, agent: 'Мусафир' } : {
+      ok: true, id, chatId: id, mode: 'research', state: 'completed', result: 'Полный ответ',
+      summary: 'Начало ответа', reportLength: 15000
+    } })
+  f.page.build()
+  await flush()
+  assert.equal(f.page.bodyWidget.options.text, 'Начало ответа')
+  assert.equal(f.page.menuButton.options.text, 'Полный ответ')
+  f.page.menuButton.options.click_func()
+  assert.equal(f.storage.get('musafir-report-job'), id)
+  assert.equal(f.replacements.at(-1).url, 'page/report')
+  f.page.primaryButton.options.click_func()
+  assert.equal(f.page.draftStorageKey, 'voice-draft:musafir:' + id)
+  assert.equal(JSON.parse(storage.get('musafir-pending-context')).chatId, id)
+  assert.equal(JSON.parse(storage.get('pending-audio')).destinationKey, f.page.draftStorageKey)
+  f.page.onDestroy()
+})
+
+test('Musafir never overwrites another chat audio when a stale Continue destination auto-starts', async () => {
+  const audio = { id: '1700000000000-41', fileName: 'saved.opus', accepted: true,
+    totalBytes: 100, destinationKey: 'voice-draft:musafir:legacy' }
+  const storage = new Map([['pending-audio', JSON.stringify(audio)],
+    ['musafir-pending-context', JSON.stringify({ target: 'musafir', chatId: 'legacy', mode: 'task',
+      jobId: null, openJob: false, autoRecord: false })],
+    ['musafir-context', JSON.stringify({ target: 'musafir', chatId: '1700000000000-42', mode: 'task',
+      jobId: null, openJob: false, autoRecord: true })]])
+  const f = pageFixture({ chats: true, storage })
+  f.page.build()
+  await flush()
+  f.tick(0)
+  assert.equal(f.mediaCalls(), 0)
+  assert.deepEqual(JSON.parse(storage.get('pending-audio')), audio)
+  assert.equal(f.replacements.at(-1).url, 'page/index')
+  f.page.onDestroy()
+})
+
+test('Musafir can stop while awaiting approval and can read saved output after failure', async () => {
+  const id = '1700000000000-51'
+  const makeStorage = () => new Map([['musafir-context', JSON.stringify({ target: 'musafir', chatId: 'legacy',
+    mode: 'research', jobId: id, openJob: true })]])
+  const f = pageFixture({ chats: true, storage: makeStorage(), reply: ({ method }) =>
+    method === 'STATUS' ? { ok: true, agent: 'Мусафир' } : { ok: true, id, chatId: 'legacy',
+      state: method === 'JOB_STOP' ? 'cancelled' : 'approval', result: '', reportLength: 0,
+      approval: { id: 'permission-1', text: 'Действие, ожидающее решения' } } })
+  f.page.build()
+  await flush()
+  assert.equal(f.page.menuButton.options.text, 'Остановить задание')
+  assert.equal(f.page.primaryButton.options.text, 'Разрешить')
+  assert.equal(f.page.secondaryButton.options.text, 'Отказать')
+  f.page.menuButton.options.click_func()
+  assert.equal(f.page.menuButton.options.text, 'Подтвердить остановку')
+  f.page.menuButton.options.click_func()
+  await flush()
+  assert.equal(f.page.client.getState().state, 'cancelled')
+  assert.equal(f.requests.filter(x => x.method === 'JOB_STOP').length, 1)
+  assert.equal(f.requests.filter(x => x.method === 'JOB_APPROVE').length, 0)
+  f.page.onDestroy()
+  const failed = pageFixture({ chats: true, storage: makeStorage(), reply: ({ method }) =>
+    method === 'STATUS' ? { ok: true, agent: 'Мусафир' } : { ok: true, id, chatId: 'legacy',
+      state: 'error', result: 'Собранные данные', summary: 'Собранные данные', reportLength: 10000, error: 'Исследование прервано' } })
+  failed.page.build()
+  await flush()
+  assert.equal(failed.page.client.getState().phase, 'error')
+  assert.equal(failed.page.menuButton.options.visible, true)
+  assert.equal(failed.page.menuButton.options.text, 'Сохранённый ответ')
+  failed.page.menuButton.options.click_func()
+  assert.equal(failed.replacements.at(-1).url, 'page/report')
+  failed.page.onDestroy()
+})
+
+test('Musafir hero, clock and text have separate bounds at native, compatibility and compact sizes', async () => {
+  for (const [width, height] of [[432, 514], [390, 450], [390, 400]]) {
+    const id = '1700000000000-61'
+    const f = pageFixture({ chats: true, width, height, storage: new Map([['musafir-context',
+      JSON.stringify({ target: 'musafir', chatId: 'legacy', mode: 'task', jobId: id, openJob: true })]]),
+      reply: ({ method }) => method === 'STATUS' ? { ok: true, agent: 'Мусафир' }
+        : { ok: true, id, chatId: 'legacy', state: 'running', result: '', reportLength: 0 } })
+    f.page.build()
+    await flush()
+    const hero = f.page.brandWidget.options, clock = f.page.metricWidget.options, body = f.page.bodyWidget.options
+    assert.ok(hero.y + hero.h <= clock.y)
+    assert.ok(clock.y + clock.h <= body.y)
+    assert.ok(body.y + body.h <= f.page.primaryButton.options.y)
+    f.page.onDestroy()
+  }
 })
 
 test('Orca missing project operation offers saved text and a working exit to the menu', async () => {

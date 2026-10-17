@@ -31,11 +31,16 @@ if (kind !== 'musafir') {
     await copyFile(join(source, 'page', name), join(stage, 'page', name))
   }
 } else {
-  await copyFile(join(root, 'page/index.js'), join(stage, 'page/index.js'))
-  await copyFile(join(root, 'page/history.js'), join(stage, 'page/history.js'))
+  for (const name of ['index', 'voice', 'report', 'history']) {
+    await copyFile(join(root, 'page', name + '.js'), join(stage, 'page', name + '.js'))
+  }
 }
 const assets = kind === 'musafir' ? ['musafer-icon.png', 'brand-mark.png'] : [kind + '-icon.png', kind + '-mark.png']
 for (const name of assets) await copyFile(join(root, 'assets/common.s', name), join(stage, 'assets/common.s', name))
+if (kind === 'musafir') {
+  await cp(join(root, 'assets/common.s/heroes'), join(stage, 'assets/common.s/heroes'), { recursive: true })
+  await cp(join(stage, 'assets/common.s'), join(stage, 'assets/common.w432-s'), { recursive: true })
+}
 const manifest = JSON.parse(await readFile(join(source, 'app.json'), 'utf8'))
 const pkg = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'))
 pkg.name = `${kind}-bipmax`

@@ -1,9 +1,4 @@
 import { BasePage } from '@zeppos/zml/base-page'
-import { createVoicePage } from '../shared/voice-page'
+import { createMusafirPage } from '../shared/musafir-page'
 
-Page(BasePage(createVoicePage({
-  kind: 'musafir',
-  icon: 'brand-mark.png',
-  title: 'Мусафир',
-  version: '0.8.0'
-})))
+Page(BasePage(createMusafirPage()))

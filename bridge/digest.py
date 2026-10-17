@@ -13,7 +13,7 @@ import time
 DEFAULT_TIME = "10:00"
 WINDOW = 24 * 3600
 ACTIVE_ORCA = ("queued", "running", "question", "unknown")
-ACTIVE_HERMES = ("queued", "submitting", "running", "approval", "unknown")
+ACTIVE_HERMES = ("queued", "submitting", "running", "approval", "unknown", "stopping")
 
 
 def parse_time(value):
@@ -91,12 +91,12 @@ def compose(state_dir, now=None):
 
     hermes = _rows(state / "state.sqlite3", """
         SELECT text, state, result, error, created FROM jobs
-        WHERE deleted_at IS NULL AND (created >= ? OR state IN ('queued','submitting','running','approval','unknown'))
+        WHERE deleted_at IS NULL AND (created >= ? OR state IN ('queued','submitting','running','approval','unknown','stopping'))
         ORDER BY created DESC""", (since,))
     answered = [r for r in hermes if r["state"] == "completed" and r["created"] >= since]
     errors = [r for r in hermes if r["state"] == "error" and r["created"] >= since]
     approvals = [r for r in hermes if r["state"] == "approval"]
-    running = [r for r in hermes if r["state"] in ("queued", "submitting", "running")]
+    running = [r for r in hermes if r["state"] in ("queued", "submitting", "running", "stopping")]
     lost = [r for r in hermes if r["state"] == "unknown"]
     if answered or errors or approvals or running or lost:
         quiet = False
@@ -150,7 +150,7 @@ def summary(state_dir, now=None):
     state = Path(state_dir)
     counts = {"working": 0, "waiting": 0, "done": 0, "night": 0, "errors": 0, "down": 0}
     hermes = _rows(state / "state.sqlite3", "SELECT state, created FROM jobs WHERE deleted_at IS NULL")
-    counts["working"] += sum(1 for r in hermes if r["state"] in ("queued", "submitting", "running"))
+    counts["working"] += sum(1 for r in hermes if r["state"] in ("queued", "submitting", "running", "stopping"))
     counts["waiting"] += sum(1 for r in hermes if r["state"] == "approval")
     counts["done"] += sum(1 for r in hermes if r["state"] == "completed" and r["created"] >= since)
     counts["errors"] += sum(1 for r in hermes if r["state"] == "error" and r["created"] >= since)

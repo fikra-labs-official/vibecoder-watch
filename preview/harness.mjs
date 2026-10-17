@@ -1,5 +1,9 @@
 import { MAX_AUDIO_BYTES, createWatchClient } from '/shared/watch-client.js'
 import { createFolderVoiceRoute, createOrcaVoiceRoute } from '/shared/orca-voice.js'
+import {
+  createMusafirVoiceRoute, normalizeContext, heroById, MUSAFIR_HEROES,
+  MUSAFIR_CONTEXT_KEY, MUSAFIR_HERO_KEY
+} from '/shared/musafir-chat.js'
 
 const screen = document.querySelector('#watch-screen')
 const layer = document.querySelector('#widget-layer')
@@ -30,6 +34,52 @@ let lastState = { phase: 'booting' }
 let audioStatusCalls = 0
 let jobStatusCalls = 0
 
+const CHAT_ID = '1700000000000-1'
+const OTHER_CHAT_ID = '1700000000001-1'
+const RESULT_JOB_ID = '1700000001000-1'
+const OLDER_JOB_ID = '1700000000900-1'
+const RUNNING_JOB_ID = '1700000001100-1'
+const APPROVAL_JOB_ID = '1700000001200-1'
+const REVIEW_AUDIO_ID = '1700000002000-1'
+const LOCAL_ID = /^\d{1,16}-\d{1,8}$/
+const archivedChats = new Set()
+const submittedJobs = new Map()
+const submittedChats = new Map()
+
+const reviewText = 'Проверь состояние проекта. Исправь две опечатки в названии экрана. Перед началом покажи, что задание принято. После выполнения пришли результат на часы. '.repeat(3)
+const fullReport = [
+  'Проверка завершена.',
+  '',
+  'Найдены две опечатки в названии экрана. В локальной демонстрации файлы и команды не изменяются.',
+  '',
+  'Что проверено:',
+  '• главный экран с недавними чатами;',
+  '• продолжение выбранной темы;',
+  '• запись, распознавание и просмотр текста;',
+  '• возврат к чатам и чтение полного ответа.',
+  '',
+  'Это синтетический отчёт для browser preview. Hermes, bridge и реальные агенты не запускались.'
+].join('\n')
+
+function makeMusafirJob(id, state, values = {}) {
+  const report = values.report || fullReport
+  return {
+    ok: true,
+    id,
+    chatId: values.chatId || CHAT_ID,
+    mode: values.mode === 'research' ? 'research' : 'task',
+    state,
+    text: values.text || 'Проверь экран и подготовь краткий отчёт.',
+    summary: values.summary || (state === 'completed' ? 'Проверка завершена' : 'Проверяю интерфейс'),
+    result: values.result == null
+      ? (state === 'completed' ? 'Проверка завершена. Полный отчёт доступен ниже.' : '')
+      : values.result,
+    error: values.error || '',
+    reportLength: Array.from(report).length,
+    ...(values.approval ? { approval: values.approval } : {})
+  }
+}
+
 const demoWorkspace = {
   id: 'demo-repo::/local/demo', projectLabel: 'Демо проект', name: 'main',
   path: '/local/demo', kind: 'git'
@@ -49,20 +99,37 @@ const historyDemo = [0, 1, 2, 3].map(i => ({
 
 const scenarios = {
   ready: null,
-  review: {
-    id: '1700000000000-1', state: 'ready',
-    text: 'Проверь состояние проекта. Исправь две опечатки в названии экрана. Перед началом покажи, что задание принято. После выполнения пришли результат на часы. '.repeat(3)
-  },
-  approval: {
-    id: 'demo-job-1', state: 'approval', text: 'Показываю план без изменений.',
-    approval: { id: 'demo-approval-1', text: 'Разрешить демонстрационное действие: показать план на сегодня без изменений?' }
-  },
-  job: { id: 'demo-job-1', state: 'running', text: 'Проверяю запланированные дела. Ничего не изменяю.' },
-  result: {
-    id: 'demo-job-1', state: 'completed', text: 'Покажи мой план на сегодня и ничего не меняй.',
-    result: 'Сегодня в плане три пункта. В 10:00 проверить входящие сообщения. В 13:30 подготовить заметки к встрече. В 18:00 подвести итоги дня. Я ничего не менял и не отправлял. Можно открыть любой пункт для чтения, но в этой демонстрации файлы, задачи и сообщения остаются без изменений. Длинный ответ листается стрелками на экране часов.'
-  }
+  review: { id: REVIEW_AUDIO_ID, state: 'ready', text: reviewText },
+  approval: makeMusafirJob(APPROVAL_JOB_ID, 'approval', {
+    approval: {
+      id: '1700000001300-1',
+      text: 'Разрешить синтетическую проверку без реальных изменений?'
+    },
+    summary: 'Нужно решение'
+  }),
+  job: makeMusafirJob(RUNNING_JOB_ID, 'running'),
+  result: makeMusafirJob(RESULT_JOB_ID, 'completed')
 }
+
+const demoChats = [
+  {
+    id: CHAT_ID, title: 'Интерфейс часов', updated: 1700000200,
+    latestJob: { id: RESULT_JOB_ID, state: 'completed', summary: 'Проверка завершена', mode: 'task' }
+  },
+  {
+    id: OTHER_CHAT_ID, title: 'Идеи для поездки', updated: 1700000100,
+    latestJob: { id: OLDER_JOB_ID, state: 'completed', summary: 'План готов', mode: 'research' }
+  }
+]
+
+const demoJobs = new Map([
+  [RESULT_JOB_ID, scenarios.result],
+  [OLDER_JOB_ID, makeMusafirJob(OLDER_JOB_ID, 'completed', {
+    chatId: OTHER_CHAT_ID, mode: 'research', text: 'Собери идеи для поездки.', summary: 'План готов'
+  })],
+  [RUNNING_JOB_ID, scenarios.job],
+  [APPROVAL_JOB_ID, scenarios.approval]
+])
 
 // This browser-only stand-in exercises the page callbacks; the watch uses Zepp's native keyboard.
 const keyboardUI = {
@@ -99,7 +166,19 @@ function imageSource(value) {
   const raw = String(value || '')
   if (!raw) return ''
   if (raw.startsWith('/') || raw.startsWith('data:')) return raw
+  if (/^heroes\/(?:musafir|kashif|barq|hakim|amin)(?:-[0-2])?\.png$/.test(raw)) {
+    return `/assets/common.s/${raw}`
+  }
   return `/assets/common.s/${raw.split('/').pop()}`
+}
+
+function setWatchGeometry() {
+  const width = appKind === 'musafir' ? 432 : 390
+  const height = appKind === 'musafir' ? 514 : 450
+  document.documentElement.style.setProperty('--watch-width', `${width}px`)
+  document.documentElement.style.setProperty('--watch-height', `${height}px`)
+  screen.dataset.app = appKind
+  return { width, height }
 }
 
 function applyGeometry(node, options) {
@@ -200,6 +279,34 @@ function updateSnapshot() {
   if (source) source.textContent = `${currentPath}.js`
 }
 
+function allDemoChats() {
+  const chats = new Map(demoChats.map(chat => [chat.id, chat]))
+  for (const chat of submittedChats.values()) chats.set(chat.id, chat)
+  return [...chats.values()].map(chat => ({
+    ...chat,
+    archived: archivedChats.has(chat.id),
+    latestJob: chat.latestJob ? { ...chat.latestJob } : null
+  }))
+}
+
+function jobsForChat(chatId) {
+  const jobs = [...demoJobs.values(), ...submittedJobs.values()]
+    .filter(job => job.chatId === chatId)
+  const unique = new Map(jobs.map(job => [job.id, job]))
+  return [...unique.values()].sort((left, right) => right.id.localeCompare(left.id))
+}
+
+function activeDemoJob() {
+  const selected = scenarios[scenario]
+  const job = selected && (knownJob(selected.id) || selected)
+  if (!job || !['submitting', 'queued', 'running', 'stopping', 'approval', 'unknown'].includes(job.state)) return null
+  return { id: job.id, chatId: job.chatId, state: job.state, mode: job.mode }
+}
+
+function knownJob(id) {
+  return submittedJobs.get(id) || demoJobs.get(id) || null
+}
+
 function localRequest(payload) {
   const ownSession = session
   const delay = payload.method === 'AUDIO_CHUNK' ? 105 : 220
@@ -207,6 +314,45 @@ function localRequest(payload) {
     if (ownSession !== session) { reject(new Error('CANCELED')); return }
     const params = payload.params || {}
     switch (payload.method) {
+      case 'CHAT_LIST': {
+        const offset = Number.isSafeInteger(params.offset) && params.offset >= 0 ? params.offset : 0
+        const limit = Number.isSafeInteger(params.limit) && params.limit > 0 ? Math.min(params.limit, 10) : 3
+        const chats = allDemoChats().filter(chat => chat.archived === (params.archived === true))
+        resolve({
+          ok: true,
+          chats: chats.slice(offset, offset + limit),
+          nextOffset: offset + limit < chats.length ? offset + limit : null,
+          activeJob: params.archived === true ? null : activeDemoJob()
+        })
+        return
+      }
+      case 'CHAT_DETAIL': {
+        const chat = allDemoChats().find(item => item.id === params.chatId)
+        if (!chat || !LOCAL_ID.test(params.chatId || '')) {
+          resolve({ ok: false, error: 'Чат не найден' })
+          return
+        }
+        const offset = Number.isSafeInteger(params.offset) && params.offset >= 0 ? params.offset : 0
+        const jobs = jobsForChat(chat.id)
+        resolve({
+          ok: true,
+          chat: { id: chat.id, title: chat.title, archived: chat.archived },
+          jobs: jobs.slice(offset, offset + 2).map(job => ({ ...job })),
+          nextOffset: offset + 2 < jobs.length ? offset + 2 : null
+        })
+        return
+      }
+      case 'CHAT_ARCHIVE': {
+        const chat = allDemoChats().find(item => item.id === params.chatId)
+        if (!chat || !LOCAL_ID.test(params.chatId || '') || typeof params.archived !== 'boolean') {
+          resolve({ ok: false, error: 'Некорректный чат' })
+          return
+        }
+        if (params.archived) archivedChats.add(chat.id)
+        else archivedChats.delete(chat.id)
+        resolve({ ok: true, chatId: chat.id, archived: params.archived })
+        return
+      }
       case 'HISTORY_LIST': {
         const items = historyDemo.filter(x => x.deleted === params.trash)
         resolve({ ok: true, items: items.slice(params.offset, params.offset + params.limit), hasMore: items.length > params.offset + params.limit })
@@ -266,6 +412,10 @@ function localRequest(payload) {
         resolve({ ok: true, job: scenarios[scenario] ?? null })
         return
       case 'AUDIO_BEGIN':
+        if (!LOCAL_ID.test(params.id || '') || !Number.isInteger(params.totalBytes) || params.totalBytes <= 0) {
+          resolve({ ok: false, error: 'Некорректная аудиозапись' })
+          return
+        }
         if (!uploads.has(params.id)) uploads.set(params.id, { totalBytes: params.totalBytes, receivedBytes: 0 })
         resolve({ ok: true, id: params.id, ...uploads.get(params.id) })
         return
@@ -282,13 +432,13 @@ function localRequest(payload) {
         return
       case 'AUDIO_STATUS':
         audioStatusCalls += 1
-        if (audioStatusCalls < 2) {
+        if (scenario !== 'review' && audioStatusCalls < 2) {
           resolve({ ok: true, id: params.id, state: 'transcribing', text: '',
             textOffset: 0, textLength: 0, textComplete: true })
           return
         }
         {
-          const characters = Array.from(scenarios.review.text)
+          const characters = Array.from(reviewText)
           const offset = params.textOffset || 0
           const page = characters.slice(offset, offset + (params.textLimit || 1000)).join('')
           resolve({ ok: true, id: params.id, state: 'ready', text: page,
@@ -296,26 +446,88 @@ function localRequest(payload) {
             textComplete: offset + Array.from(page).length === characters.length })
         }
         return
-      case 'SEND_TEXT':
+      case 'SEND_TEXT': {
+        const validChat = params.chatId === null || allDemoChats().some(chat => chat.id === params.chatId)
+        if (!LOCAL_ID.test(params.id || '') || !validChat || !['task', 'research'].includes(params.mode)) {
+          resolve({ ok: false, error: 'Некорректное задание' })
+          return
+        }
         jobStatusCalls = 0
-        resolve({ ok: true, id: params.id, state: 'queued', text: 'Команда принята в локальную демонстрацию.' })
+        const chatId = params.chatId || params.id
+        const text = typeof params.text === 'string' ? params.text : reviewText
+        const job = makeMusafirJob(params.id, 'completed', {
+          chatId, mode: params.mode, text,
+          summary: 'Синтетический ответ готов'
+        })
+        submittedJobs.set(job.id, job)
+        const title = text.replace(/\s+/g, ' ').trim().slice(0, 34) || 'Новая задача'
+        submittedChats.set(chatId, {
+          id: chatId, title, updated: Math.floor(Date.now() / 1000),
+          latestJob: { id: job.id, state: job.state, summary: job.summary, mode: job.mode }
+        })
+        resolve({ ...job })
         return
+      }
       case 'JOB_STATUS':
-        if (scenario === 'job') {
-          resolve({ ok: true, ...scenarios.job, id: params.id })
+        if (scenario === 'error') {
+          resolve({ ok: false, error: 'Не удалось получить статус задания' })
           return
         }
         jobStatusCalls += 1
-        resolve(jobStatusCalls < 2
-          ? { ok: true, id: params.id, state: 'running', text: 'Проверяю план. Ничего не изменяю.' }
-          : { ok: true, id: params.id, state: 'approval', text: scenarios.approval.text, approval: scenarios.approval.approval })
+        {
+          const job = knownJob(params.id)
+          resolve(job ? { ...job } : { ok: false, error: 'Задание не найдено' })
+        }
         return
-      case 'JOB_APPROVE':
+      case 'JOB_APPROVE': {
+        const existing = knownJob(params.id)
+        if (!existing || existing.state !== 'approval') {
+          resolve({ ok: false, error: 'Подтверждение устарело' })
+          return
+        }
+        const completed = makeMusafirJob(params.id, params.allow ? 'completed' : 'cancelled', {
+          chatId: existing.chatId, mode: existing.mode, text: existing.text,
+          summary: params.allow ? 'Проверка завершена' : 'Действие отклонено',
+          result: params.allow ? 'Проверка завершена. Полный отчёт доступен ниже.' : 'Действие отклонено. Изменений нет.'
+        })
+        demoJobs.set(params.id, completed)
+        resolve({ ...completed })
+        return
+      }
+      case 'JOB_STOP': {
+        const existing = knownJob(params.id)
+        if (!existing || !LOCAL_ID.test(params.id || '')) {
+          resolve({ ok: false, error: 'Задание не найдено' })
+          return
+        }
+        const stopped = makeMusafirJob(params.id, 'cancelled', {
+          chatId: existing.chatId, mode: existing.mode, text: existing.text,
+          summary: 'Задание остановлено', result: 'Задание остановлено'
+        })
+        if (submittedJobs.has(params.id)) submittedJobs.set(params.id, stopped)
+        else demoJobs.set(params.id, stopped)
+        resolve({ ...stopped })
+        return
+      }
+      case 'JOB_REPORT': {
+        const job = knownJob(params.id)
+        const offset = params.offset
+        const limit = params.limit
+        if (!job || !LOCAL_ID.test(params.id || '') || !Number.isSafeInteger(offset) || offset < 0 ||
+            !Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
+          resolve({ ok: false, error: 'Отчёт не найден' })
+          return
+        }
+        const characters = Array.from(fullReport)
+        const text = characters.slice(offset, offset + limit).join('')
         resolve({
-          ok: true, id: params.id, state: 'completed', text: scenarios.review.text,
-          result: params.allow ? scenarios.result.result : 'Действие отклонено. Изменений нет.'
+          ok: true, id: params.id, offset, text, textLength: characters.length,
+          nextOffset: offset + Array.from(text).length < characters.length
+            ? offset + Array.from(text).length : null,
+          truncated: false
         })
         return
+      }
       case 'DIAGNOSTIC':
         resolve({ ok: true })
         return
@@ -472,47 +684,63 @@ function localReplace({ url }) {
   navigate(url).catch(error => console.error('[preview] replace', error))
 }
 
-function evaluatePage(source, path) {
-  const factory = pageSources.get('shared/watch-alerts').replace('export function createWatchAlerts', 'function createWatchAlerts') + '\n' + pageSources.get('shared/voice-page')
-  const prefix = path === 'page/index' || path === 'page/voice'
-    ? factory.replace(/^\s*import\s+.*$/gm, '').replace('export function createVoicePage', 'function createVoicePage')
-    : path === 'page/history'
-      ? pageSources.get('shared/history-page').replace(/^\s*import\s+.*$/gm, '').replace('export function createHistoryPage', 'function createHistoryPage')
-      : ''
-  const executable = `${prefix}\n${source.replace(/^\s*import\s+.*$/gm, '')}`
+function executableSource(source, exportedFactory) {
+  const clean = source.replace(/^\s*import\s+.*$/gm, '')
+  return exportedFactory
+    ? clean.replace(`export function ${exportedFactory}`, `function ${exportedFactory}`)
+    : clean.replace(/^\s*export\s+/gm, '')
+}
+
+function evaluatePage(source, sourcePath) {
+  let prefix = ''
+  if (sourcePath === 'page/index') {
+    prefix = executableSource(pageSources.get('shared/musafir-page'), 'createMusafirPage')
+  } else if (sourcePath === 'page/voice' || sourcePath === 'page/voice-orca') {
+    prefix = executableSource(pageSources.get('shared/watch-alerts'), 'createWatchAlerts') + '\n' +
+      executableSource(pageSources.get('shared/voice-page'), 'createVoicePage')
+  } else if (sourcePath === 'page/report') {
+    prefix = executableSource(pageSources.get('shared/musafir-report-page'), 'createMusafirReportPage')
+  } else if (sourcePath === 'page/history' || sourcePath === 'page/history-orca') {
+    prefix = executableSource(pageSources.get('shared/history-page'), 'createHistoryPage')
+  }
+  const executable = `${prefix}\n${executableSource(source)}`
   const names = [
     'createWidget', 'widget', 'align', 'text_style', 'prop', 'getTextLayout',
     'getDeviceInfo', 'setTimeout', 'clearTimeout', 'codec', 'create', 'mediaId',
     'closeSync', 'openSync', 'O_RDONLY', 'readSync', 'rmSync', 'statSync',
     'BasePage', 'MAX_AUDIO_BYTES', 'createWatchClient', 'createFolderVoiceRoute',
-    'createOrcaVoiceRoute', 'replace', 'Page', 'LocalStorage', 'setWakeUpRelaunch',
+    'createOrcaVoiceRoute', 'createMusafirVoiceRoute', 'normalizeContext', 'heroById',
+    'MUSAFIR_HEROES', 'MUSAFIR_CONTEXT_KEY', 'MUSAFIR_HERO_KEY',
+    'replace', 'Page', 'LocalStorage', 'setWakeUpRelaunch',
     'setPageBrightTime', 'resetPageBrightTime', 'pauseDropWristScreenOff',
     'resetDropWristScreenOff', 'Vibrator', 'VIBRATOR_SCENE_SHORT_STRONG', 'keyboardUI'
   ]
   const values = [
     createWidget, widget, align, text_style, prop, getTextLayout,
-    () => ({ width: 390, height: 450 }), window.setTimeout.bind(window), window.clearTimeout.bind(window),
+    () => appKind === 'musafir' ? { width: 432, height: 514 } : { width: 390, height: 450 },
+    window.setTimeout.bind(window), window.clearTimeout.bind(window),
     { OPUS: 'opus' }, media.create, media.RECORDER,
     closeSyncMock, openSyncMock, 0, readSyncMock, ({ path: file }) => files.delete(file),
     ({ path: file }) => ({ size: files.get(file)?.byteLength || 0 }),
     definition => ({ request: localRequest, ...definition }),
     MAX_AUDIO_BYTES, createWatchClient, createFolderVoiceRoute, createOrcaVoiceRoute,
+    createMusafirVoiceRoute, normalizeContext, heroById, MUSAFIR_HEROES,
+    MUSAFIR_CONTEXT_KEY, MUSAFIR_HERO_KEY,
     localReplace, instantiatePage,
     class {
-      getItem(key) { return storage.get(key) }
+      getItem(key) { return storage.has(key) ? storage.get(key) : null }
       setItem(key, value) { storage.set(key, value) }
     },
     () => {}, () => {}, () => {}, () => {}, () => {},
     class { start({ mode }) { console.log('[preview] simulated vibration:', mode) } stop() {} }, 'short-strong', keyboardUI
   ]
-  new Function(...names, `${executable}\n//# sourceURL=/${path}.js`)(...values)
+  new Function(...names, `${executable}\n//# sourceURL=/${sourcePath}.js`)(...values)
 }
 
 function destroyPage() {
   session += 1
   try { currentPage?.onDestroy?.() } catch (error) { console.warn('[preview] destroy', error) }
   currentPage = null
-  files.clear()
   fileHandles.clear()
   widgets.splice(0)
   layer.replaceChildren()
@@ -520,26 +748,35 @@ function destroyPage() {
 
 async function navigate(path) {
   const sourcePath = appKind === 'orca' && path === 'page/index' ? 'page/orca'
-    : appKind === 'orca' && path === 'page/history' ? 'page/history-orca' : path
+    : appKind === 'orca' && path === 'page/voice' ? 'page/voice-orca'
+      : appKind === 'orca' && path === 'page/history' ? 'page/history-orca' : path
   const source = pageSources.get(sourcePath)
   if (!source) throw new Error(`Нет страницы ${path}`)
   destroyPage()
   currentPath = path
-  lastState = { phase: sourcePath === 'page/orca' ? 'menu' : 'booting' }
-  evaluatePage(source, path)
+  lastState = {
+    phase: sourcePath === 'page/orca' ? 'menu'
+      : sourcePath === 'page/index' ? 'home'
+        : sourcePath === 'page/report' ? 'report' : 'booting'
+  }
+  evaluatePage(source, sourcePath)
   observeState()
   updateSnapshot()
 }
 
-function waitForPhase(phase, timeout = 2500) {
+function waitFor(check, timeout = 2500) {
   return new Promise(resolve => {
     const started = Date.now()
-    const check = () => {
-      if (lastState.phase === phase || Date.now() - started >= timeout) resolve()
-      else setTimeout(check, 30)
+    const poll = () => {
+      if (check() || Date.now() - started >= timeout) resolve()
+      else setTimeout(poll, 30)
     }
-    check()
+    poll()
   })
+}
+
+function waitForPhase(phase, timeout = 2500) {
+  return waitFor(() => lastState.phase === phase, timeout)
 }
 
 function observeState() {
@@ -554,11 +791,92 @@ function observeState() {
   updateSnapshot()
 }
 
+function resetSyntheticRuntime() {
+  files.clear()
+  fileHandles.clear()
+  uploads.clear()
+  textDrafts.clear()
+  submittedJobs.clear()
+  submittedChats.clear()
+  archivedChats.clear()
+  demoJobs.clear()
+  demoJobs.set(RESULT_JOB_ID, scenarios.result)
+  demoJobs.set(OLDER_JOB_ID, makeMusafirJob(OLDER_JOB_ID, 'completed', {
+    chatId: OTHER_CHAT_ID, mode: 'research', text: 'Собери идеи для поездки.', summary: 'План готов'
+  }))
+  demoJobs.set(RUNNING_JOB_ID, scenarios.job)
+  demoJobs.set(APPROVAL_JOB_ID, scenarios.approval)
+  const hero = storage.get(MUSAFIR_HERO_KEY)
+  storage.clear()
+  if (hero) storage.set(MUSAFIR_HERO_KEY, hero)
+  historyDemo.forEach(item => { item.deleted = false })
+}
+
+function musafirContext({ chatId = CHAT_ID, mode = 'task', jobId = null, openJob = false, autoRecord = false } = {}) {
+  return { target: 'musafir', chatId, mode, jobId, openJob, autoRecord }
+}
+
+function seedMusafirScenario(name) {
+  if (name === 'review') {
+    storage.set(MUSAFIR_CONTEXT_KEY, JSON.stringify(musafirContext()))
+    storage.set('pending-audio', JSON.stringify({
+      id: REVIEW_AUDIO_ID, fileName: 'musafir-review.opus', totalBytes: 8192, accepted: true,
+      destinationKey: `voice-draft:musafir:${CHAT_ID}`
+    }))
+    return 'page/voice'
+  }
+  if (name === 'recording') {
+    storage.set(MUSAFIR_CONTEXT_KEY, JSON.stringify(musafirContext({
+      chatId: null, autoRecord: true
+    })))
+    return 'page/voice'
+  }
+  if (name === 'job') {
+    storage.set(MUSAFIR_CONTEXT_KEY, JSON.stringify(musafirContext({
+      jobId: RUNNING_JOB_ID, openJob: true
+    })))
+    return 'page/voice'
+  }
+  if (name === 'approval') {
+    storage.set(MUSAFIR_CONTEXT_KEY, JSON.stringify(musafirContext({
+      jobId: APPROVAL_JOB_ID, openJob: true
+    })))
+    return 'page/voice'
+  }
+  if (name === 'result' || name === 'report') {
+    storage.set(MUSAFIR_CONTEXT_KEY, JSON.stringify(musafirContext({
+      jobId: RESULT_JOB_ID, openJob: true
+    })))
+    if (name === 'report') {
+      storage.set('musafir-report-job', RESULT_JOB_ID)
+      return 'page/report'
+    }
+    return 'page/voice'
+  }
+  if (name === 'offline') {
+    storage.set(MUSAFIR_CONTEXT_KEY, JSON.stringify(musafirContext()))
+    return 'page/voice'
+  }
+  if (name === 'error') {
+    storage.set(MUSAFIR_CONTEXT_KEY, JSON.stringify(musafirContext({
+      jobId: RESULT_JOB_ID, openJob: true
+    })))
+    return 'page/voice'
+  }
+  if (name === 'uploading' || name === 'transcribing') {
+    storage.set(MUSAFIR_CONTEXT_KEY, JSON.stringify(musafirContext()))
+    return 'page/voice'
+  }
+  return 'page/index'
+}
+
 async function rebuild(nextScenario) {
+  destroyPage()
   scenario = nextScenario
   audioStatusCalls = 0
   jobStatusCalls = 0
-  uploads.clear()
+  resetSyntheticRuntime()
+  setWatchGeometry()
   if (appKind === 'orca') {
     storage.set('voice-destination', JSON.stringify({
       target: 'orca', pairId: demoPair.id, label: demoPair.projectLabel,
@@ -566,14 +884,21 @@ async function rebuild(nextScenario) {
     }))
     await navigate('page/voice')
   } else {
-    storage.set('voice-destination', '')
-    await navigate('page/index')
+    await navigate(seedMusafirScenario(nextScenario))
   }
   const expectedPhase = {
-    ready: 'ready', review: 'review', approval: 'approval', job: 'job',
-    result: 'result', offline: 'error', error: 'error'
+    ready: appKind === 'musafir' ? 'home' : 'ready',
+    recording: 'recording', uploading: 'ready', transcribing: 'ready',
+    review: 'review', approval: 'approval', job: 'job', result: 'result',
+    report: 'report', offline: 'error', error: 'error'
   }[nextScenario]
-  await waitForPhase(expectedPhase, 1200)
+  if (expectedPhase === 'home') {
+    await waitFor(() => currentPath === 'page/index' && currentPage && currentPage.items && currentPage.items.length > 0, 1800)
+  } else if (expectedPhase === 'report') {
+    await waitFor(() => currentPath === 'page/report' && currentPage && currentPage.loading === false, 1800)
+  } else if (expectedPhase) {
+    await waitForPhase(expectedPhase, nextScenario === 'review' ? 3200 : 1800)
+  }
 }
 
 async function previewShow(name = 'ready') {
@@ -581,9 +906,13 @@ async function previewShow(name = 'ready') {
   select.value = name
 
   if (name === 'recording') {
-    await rebuild('ready')
-    await waitForPhase('ready')
-    currentPage.startRecording()
+    await rebuild(appKind === 'musafir' ? 'recording' : 'ready')
+    if (appKind === 'orca') {
+      await waitForPhase('ready')
+      currentPage.startRecording()
+    } else {
+      await waitForPhase('recording')
+    }
     // ponytail: one honest demo offset makes the timer and pulse visible immediately.
     if (currentPage.recording) {
       currentPage.recording.startedAt = Date.now() - 7000
@@ -596,19 +925,15 @@ async function previewShow(name = 'ready') {
     return window.previewState()
   }
   if (name === 'uploading' || name === 'transcribing') {
-    await rebuild('ready')
+    await rebuild(appKind === 'musafir' ? name : 'ready')
     await waitForPhase('ready')
     currentPage.client.close()
     const state = name === 'uploading'
-      ? { phase: 'uploading', id: '1700000000000-1', sentBytes: 6349, totalBytes: 10240, busy: true }
-      : { phase: 'transcribing', id: '1700000000000-1', busy: true }
+      ? { phase: 'uploading', id: REVIEW_AUDIO_ID, sentBytes: 6349, totalBytes: 10240, busy: true }
+      : { phase: 'transcribing', id: REVIEW_AUDIO_ID, busy: true }
     lastState = state
     currentPage.render(state)
     updateSnapshot()
-    return window.previewState()
-  }
-  if (name === 'result') {
-    await rebuild(name)
     return window.previewState()
   }
   await rebuild(name)
@@ -620,7 +945,11 @@ window.previewState = () => ({
   scenario,
   page: currentPath,
   state: { ...lastState },
-  widgets: widgets.map(({ type, options }) => ({ type, ...options }))
+  widgets: widgets.map(({ type, options, node }) => ({
+    type,
+    ...options,
+    ...(type === widget.IMG ? { currentSrc: node.currentSrc || node.src || '' } : {})
+  }))
 })
 
 select.addEventListener('change', () => previewShow(select.value))
@@ -629,7 +958,9 @@ appSelect.addEventListener('change', async () => {
   appName.textContent = appKind === 'orca' ? 'Orca' : 'Мусафир'
   scenario = 'ready'
   select.value = 'ready'
-  storage.set('voice-destination', '')
+  destroyPage()
+  resetSyntheticRuntime()
+  setWatchGeometry()
   await navigate('page/index')
 })
 window.addEventListener('beforeunload', destroyPage)
@@ -637,16 +968,21 @@ setInterval(updateClock, 1000)
 updateClock()
 
 try {
-  const sources = await Promise.all(['page/index', 'page/orca', 'page/history', 'shared/voice-page', 'shared/watch-alerts', 'shared/history-page'].map(async path => {
+  const sources = await Promise.all([
+    'page/index', 'page/voice', 'page/report', 'page/orca', 'page/history',
+    'shared/voice-page', 'shared/watch-alerts', 'shared/history-page',
+    'shared/musafir-page', 'shared/musafir-report-page'
+  ].map(async path => {
     const response = await fetch(`/${path}.js`, { cache: 'no-store' })
     if (!response.ok) throw new Error(`${path}.js: HTTP ${response.status}`)
     return [path, await response.text()]
   }))
   for (const [path, source] of sources) pageSources.set(path, source)
-  pageSources.set('page/voice', `Page(BasePage(createVoicePage({
+  pageSources.set('page/voice-orca', `Page(BasePage(createVoicePage({
     kind: 'orca', icon: 'orca-mark.png', title: 'Orca', version: '0.3.7'
   })))`)
   pageSources.set('page/history-orca', "Page(BasePage(createHistoryPage({ kind: 'orca' })))")
+  setWatchGeometry()
   await previewShow('ready')
 } catch (error) {
   console.error(error)

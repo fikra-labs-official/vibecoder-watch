@@ -1,4 +1,6 @@
 :root {
+  --watch-width: 432px;
+  --watch-height: 514px;
   color-scheme: dark;
   font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   background: #0b0b0a;
@@ -42,7 +44,7 @@ main {
 }
 
 .stage {
-  min-height: 610px;
+  min-height: calc(var(--watch-height) + 96px);
   display: grid;
   place-items: center;
   overflow-x: auto;
@@ -55,8 +57,8 @@ main {
 }
 
 .watch-shell {
-  width: 438px;
-  height: 506px;
+  width: calc(var(--watch-width) + 48px);
+  height: calc(var(--watch-height) + 56px);
   padding: 28px 24px;
   border: 1px solid #35312a;
   border-radius: 72px;
@@ -70,8 +72,8 @@ main {
 
 .watch-screen {
   position: relative;
-  width: 390px;
-  height: 450px;
+  width: var(--watch-width);
+  height: var(--watch-height);
   overflow: hidden;
   border-radius: 48px;
   background: #050807;
@@ -98,6 +100,8 @@ main {
   font-weight: 650;
   letter-spacing: .03em;
 }
+
+.watch-screen[data-app="musafir"] .os-header { display: none; }
 
 .zepp-text,
 .zepp-button {
@@ -237,9 +241,9 @@ select:focus { border-color: #a98746; box-shadow: 0 0 0 3px rgba(185,144,66,.13)
     gap: 38px;
   }
 
-  .stage { min-height: 560px; }
+  .stage { min-height: calc(var(--watch-height) + 76px); }
   .controls {
-    width: min(438px, 100%);
+    width: min(calc(var(--watch-width) + 48px), 100%);
     justify-self: center;
     padding-bottom: 34px;
   }
@@ -251,7 +255,7 @@ select:focus { border-color: #a98746; box-shadow: 0 0 0 3px rgba(185,144,66,.13)
     place-items: center start;
     border-radius: 26px;
   }
-  .watch-shell { flex: 0 0 438px; }
+  .watch-shell { flex: 0 0 calc(var(--watch-width) + 48px); }
   .controls { padding-inline: 8px; }
 }
 

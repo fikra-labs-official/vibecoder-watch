@@ -20,6 +20,8 @@ const mime = {
 function sourcePath(pathname) {
   if (pathname === '/' || pathname === '/index.html') return join(root, 'preview/index.html')
   if (pathname === '/page/index.js') return join(root, 'page/index.js')
+  if (pathname === '/page/voice.js') return join(root, 'page/voice.js')
+  if (pathname === '/page/report.js') return join(root, 'page/report.js')
   if (pathname === '/page/orca.js') return join(root, 'page/orca.js')
   if (pathname === '/page/history.js') return join(root, 'page/history.js')
   if (pathname === '/shared/watch-client.js') return join(root, 'shared/watch-client.js')
@@ -27,6 +29,9 @@ function sourcePath(pathname) {
   if (pathname === '/shared/watch-alerts.js') return join(root, 'shared/watch-alerts.js')
   if (pathname === '/shared/voice-page.js') return join(root, 'shared/voice-page.js')
   if (pathname === '/shared/history-page.js') return join(root, 'shared/history-page.js')
+  if (pathname === '/shared/musafir-chat.js') return join(root, 'shared/musafir-chat.js')
+  if (pathname === '/shared/musafir-page.js') return join(root, 'shared/musafir-page.js')
+  if (pathname === '/shared/musafir-report-page.js') return join(root, 'shared/musafir-report-page.js')
   if (pathname.startsWith('/preview/')) {
     const name = pathname.slice('/preview/'.length)
     if (previewFiles.has(name)) return join(root, 'preview', name)
@@ -34,6 +39,9 @@ function sourcePath(pathname) {
   if (pathname.startsWith('/assets/common.s/')) {
     const name = pathname.slice('/assets/common.s/'.length)
     if (/^[a-zA-Z0-9._-]+\.png$/.test(name)) return join(root, 'assets/common.s', name)
+    if (/^heroes\/(?:musafir|kashif|barq|hakim|amin)(?:-[0-2])?\.png$/.test(name)) {
+      return join(root, 'assets/common.s', ...name.split('/'))
+    }
   }
   return null
 }

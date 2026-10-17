@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import hmac
 import json
 import logging
@@ -24,7 +25,7 @@ from lexicon import compile_rules, normalize
 from orca_service import CliFailure
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 ID = re.compile(r"^[0-9]{1,16}-[0-9]{1,8}$")
 MAX_AUDIO = 8 * 1024 * 1024
 MAX_TEXT_CHARS = 30_000
@@ -35,9 +36,16 @@ TEXT_DRAFT_RETENTION = 86400
 TEXT_PAGE_DEFAULT = 1_000
 TEXT_PAGE_MAX = 2_000
 JOB_TEXT_PREVIEW = 1_000
+JOB_RESULT_PREVIEW = 6_000
+JOB_SUMMARY = 500
+JOB_REPORT_MAX = 200_000
 APPROVAL_TEXT_MAX = 12_000
 MAX_REQUEST_BYTES = 512 * 1024
-ACTIVE_JOB_STATES = ("queued", "submitting", "running", "approval", "unknown")
+ACTIVE_JOB_STATES = ("queued", "submitting", "running", "approval", "unknown", "stopping")
+TERMINAL_JOB_STATES = ("completed", "error", "cancelled")
+JOB_MODES = ("task", "research")
+LEGACY_CHAT_ID = "legacy"
+LEGACY_SESSION_KEY = "musafer-watch"
 DIAGNOSTIC_STAGES = {
     "recorder_create", "recorder_format", "recorder_start",
     "recorder_stop", "recorder_file", "recorder_open",
@@ -50,6 +58,18 @@ INSTRUCTIONS = (
     "сначала опиши точное действие и запроси отдельное подтверждение. "
     "Сохраняй действующие правила и профиль Мусафира."
 )
+RESEARCH_INSTRUCTIONS = (
+    "Сообщение владельца с его часов, текст подтверждён им перед отправкой. "
+    "Проведи тщательное исследование по запросу и начни ответ с краткого вывода, "
+    "удобного для экрана часов. Затем дай полный структурированный отчёт. "
+    "Ссылайся только на источники, которые действительно использовал, и явно отделяй "
+    "проверенные факты от выводов. Не отправляй результат другим людям и не публикуй "
+    "ничего без явного указания в самой команде. Для удаления данных, платежей, "
+    "изменения доступа или публикации сначала запроси отдельное подтверждение. "
+    "Сохраняй действующие правила и профиль Мусафира."
+)
+
+_MISSING = object()
 
 
 class Invalid(ValueError):
@@ -62,11 +82,32 @@ def identifier(value):
     return value
 
 
+def chat_identifier(value):
+    if value == LEGACY_CHAT_ID:
+        return value
+    return identifier(value)
+
+
+def chat_title(text):
+    title = " ".join(str(text or "").split())
+    return title[:48] or "Новая задача"
+
+
+def request_fingerprint(text, text_id, requested_chat, mode):
+    payload = json.dumps({
+        "text": text,
+        "textId": text_id,
+        "chatId": requested_chat,
+        "mode": mode,
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 class Hermes:
     def __init__(self, env_path):
         self.env_path = Path(env_path)
 
-    def call(self, path, body=None, request_id=None, timeout=12):
+    def call(self, path, body=None, request_id=None, timeout=12, session_key=None):
         key = ""
         for line in self.env_path.read_text().splitlines():
             if line.startswith("API_SERVER_KEY="):
@@ -77,7 +118,7 @@ class Hermes:
         headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json"}
         if request_id:
             headers["Idempotency-Key"] = "musafer-watch-" + request_id
-            headers["X-Hermes-Session-Key"] = "musafer-watch"
+            headers["X-Hermes-Session-Key"] = session_key or LEGACY_SESSION_KEY
         req = Request("http://127.0.0.1:8642" + path,
                       data=None if body is None else json.dumps(body).encode(), headers=headers)
         with urlopen(req, timeout=timeout) as response:
@@ -119,18 +160,65 @@ class Bridge:
                 id TEXT PRIMARY KEY, source_id TEXT NOT NULL, text_length INTEGER NOT NULL,
                 text TEXT NOT NULL DEFAULT '', state TEXT NOT NULL,
                 created REAL NOT NULL, updated REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS chats (
+                id TEXT PRIMARY KEY, title TEXT NOT NULL, session_key TEXT NOT NULL UNIQUE,
+                created REAL NOT NULL, updated REAL NOT NULL, archived_at REAL);
             CREATE TABLE IF NOT EXISTS jobs (
                 id TEXT PRIMARY KEY, text TEXT, created REAL, state TEXT,
                 run_id TEXT DEFAULT '', result TEXT DEFAULT '', error TEXT DEFAULT '',
                 decision_id TEXT DEFAULT '');
         """)
         job_columns = {row[1] for row in self.db.execute("PRAGMA table_info(jobs)")}
-        if "deleted_at" not in job_columns:
-            self.db.execute("ALTER TABLE jobs ADD COLUMN deleted_at REAL")
-        if "decision_id" not in job_columns:
-            self.db.execute("ALTER TABLE jobs ADD COLUMN decision_id TEXT DEFAULT ''")
+        migrations = {
+            "deleted_at": "REAL",
+            "decision_id": "TEXT DEFAULT ''",
+            "chat_id": "TEXT DEFAULT ''",
+            "mode": "TEXT NOT NULL DEFAULT 'task'",
+            "full_result": "TEXT NOT NULL DEFAULT ''",
+            "report_truncated": "INTEGER NOT NULL DEFAULT 0",
+            "stop_requested": "INTEGER NOT NULL DEFAULT 0",
+            "source_text_id": "TEXT NOT NULL DEFAULT ''",
+            "request_fingerprint": "TEXT NOT NULL DEFAULT ''",
+        }
+        for column, ddl in migrations.items():
+            if column not in job_columns:
+                self.db.execute(f"ALTER TABLE jobs ADD COLUMN {column} {ddl}")
+        # Old watch packages used one fixed Hermes conversation. Preserve that exact
+        # continuity, but do not create an empty placeholder in a fresh installation.
+        legacy = self.db.execute(
+            "SELECT id,text,created FROM jobs WHERE COALESCE(chat_id,'')='' ORDER BY created,id LIMIT 1"
+        ).fetchone()
+        if legacy is not None:
+            bounds = self.db.execute(
+                "SELECT MIN(created),MAX(created) FROM jobs WHERE COALESCE(chat_id,'')=''"
+            ).fetchone()
+            self.db.execute(
+                "INSERT OR IGNORE INTO chats(id,title,session_key,created,updated) VALUES (?,?,?,?,?)",
+                (LEGACY_CHAT_ID, chat_title(legacy["text"]), LEGACY_SESSION_KEY,
+                 bounds[0] or time.time(), bounds[1] or bounds[0] or time.time()))
+            self.db.execute(
+                "UPDATE jobs SET chat_id=?, mode=COALESCE(NULLIF(mode,''),'task'), "
+                "full_result=CASE WHEN full_result='' THEN COALESCE(result,'') ELSE full_result END "
+                "WHERE COALESCE(chat_id,'')=''",
+                (LEGACY_CHAT_ID,))
+        # Old rows kept the whole answer in result. Move it into the paged
+        # report field and bound both persisted and watch-facing payloads.
+        self.db.execute(
+            "UPDATE jobs SET "
+            "report_truncated=CASE WHEN report_truncated=1 OR "
+            "length(CASE WHEN full_result='' THEN COALESCE(result,'') ELSE full_result END)>? "
+            "THEN 1 ELSE 0 END, "
+            "full_result=substr(CASE WHEN full_result='' THEN COALESCE(result,'') ELSE full_result END,1,?), "
+            "result=substr(COALESCE(result,''),1,?)",
+            (JOB_REPORT_MAX, JOB_REPORT_MAX, JOB_RESULT_PREVIEW))
+        self.db.execute("CREATE INDEX IF NOT EXISTS jobs_chat_created ON jobs(chat_id,created DESC,id DESC)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS chats_updated ON chats(archived_at,updated DESC,id DESC)")
         self.db.execute("UPDATE jobs SET state='unknown', error='Мост был перезапущен во время отправки. Не повторяйте команду.' WHERE state='submitting'")
-        self.db.execute("UPDATE jobs SET state='error', error='Перезапуск до отправки. Команда не отправлена.' WHERE state='queued'")
+        self.db.execute(
+            "UPDATE jobs SET state='error', error='Перезапуск до отправки. Команда не отправлена.' "
+            "WHERE state='queued' AND COALESCE(run_id,'')=''"
+        )
+        self.db.execute("UPDATE jobs SET state='unknown', error='Мост был перезапущен во время остановки. Проверьте итог Hermes.' WHERE state='stopping' AND run_id=''")
         self.db.execute("UPDATE uploads SET state='error', error='Распознавание прервано перезапуском. Нажмите повтор, чтобы продолжить.' WHERE state='transcribing'")
         self.db.commit()
         self.worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="musafer")
@@ -169,7 +257,7 @@ class Bridge:
             try:
                 with self.lock:
                     rows = self.db.execute(
-                        "SELECT id FROM jobs WHERE state IN ('queued','submitting','running','approval','unknown') AND run_id!=''").fetchall()
+                        "SELECT id FROM jobs WHERE state IN ('queued','submitting','running','approval','unknown','stopping') AND run_id!=''").fetchall()
                 for row in rows:
                     if self.stop.is_set():
                         break
@@ -225,7 +313,7 @@ class Bridge:
                             if len(self.orca_observed) > 128:
                                 self.orca_observed.pop(next(iter(self.orca_observed)))
                             self.event("orca_state", **metadata)
-            if method in ("AUDIO_BEGIN", "AUDIO_FINISH", "JOB_APPROVE", "SEND_TEXT", "CLAUDE_SEND", "CLAUDE_STOP", "CODEX_SEND", "CODEX_STOP") or (
+            if method in ("AUDIO_BEGIN", "AUDIO_FINISH", "JOB_APPROVE", "JOB_STOP", "SEND_TEXT", "CLAUDE_SEND", "CLAUDE_STOP", "CODEX_SEND", "CODEX_STOP") or (
                 isinstance(method, str) and method.startswith("ORCA_") and method not in ("ORCA_JOB", "ORCA_LATEST", "ORCA_OPERATION", "ORCA_HISTORY_LIST", "ORCA_HISTORY_DETAIL")):
                 self.event("rpc", method=method, id=request_id, ms=round((time.monotonic() - started) * 1000), state=result.get("state"))
             return result
@@ -293,11 +381,17 @@ class Bridge:
             with self.lock:
                 row = self.db.execute("""
                     SELECT id FROM jobs WHERE deleted_at IS NULL
-                    ORDER BY CASE WHEN state IN ('queued','submitting','running','approval','unknown')
+                    ORDER BY CASE WHEN state IN ('queued','submitting','running','approval','unknown','stopping')
                                   THEN 0 ELSE 1 END,
                              created DESC, id DESC LIMIT 1
                 """).fetchone()
             return {"ok": True, "job": self.job_status(row[0]) if row else None}
+        if method == "CHAT_LIST":
+            return self.chat_list(params)
+        if method == "CHAT_DETAIL":
+            return self.chat_detail(params)
+        if method == "CHAT_ARCHIVE":
+            return self.chat_archive(params)
         if method == "HISTORY_LIST":
             return self.history_list(params)
         if method == "HISTORY_DETAIL":
@@ -318,24 +412,39 @@ class Bridge:
             return self.text_finish(params)
         request_id = identifier(params.get("id"))
         if method == "JOB_STATUS":
-            return self.job_status(request_id)
+            if set(params) - {"id", "brief"} or type(params.get("brief", False)) is not bool:
+                raise Invalid("Некорректный статус")
+            return self.job_status(request_id, brief=params.get("brief", False))
+        if method == "JOB_REPORT":
+            return self.job_report(request_id, params)
+        if method == "JOB_STOP":
+            return self.job_stop(request_id, params)
         if method == "JOB_APPROVE":
             approval_id, allow = params.get("approvalId"), params.get("allow")
             if not isinstance(approval_id, str) or not isinstance(allow, bool):
                 raise Invalid("Некорректное подтверждение")
             # Keep the stale-approval guard, but fit the read and decision into
             # the watch request deadline. The result is observed by later polls.
+            with self.lock:
+                pending = self._get("jobs", request_id)
+            if pending.get("stop_requested") or pending["state"] == "stopping":
+                raise Invalid("Остановка уже запрошена")
             current = self.job_status(request_id, timeout=4)
             if current["state"] != "approval" or current.get("approval", {}).get("id") != approval_id:
                 raise Invalid("Это подтверждение больше не действует")
             with self.lock:
                 row = self._get("jobs", request_id)
+                if row["stop_requested"]:
+                    raise Invalid("Остановка уже запрошена")
                 if row["state"] != "approval" or row["decision_id"] == approval_id:
                     raise Invalid("Это подтверждение больше не действует")
                 run_id = row["run_id"]
                 # Record the attempt before I/O. A lost receipt must never let
-                # the same approval be posted twice.
-                self.db.execute("UPDATE jobs SET decision_id=? WHERE id=?", (approval_id, request_id))
+                # the same approval be posted twice. This is also the decision's
+                # linearization point relative to a concurrent stop request.
+                self.db.execute(
+                    "UPDATE jobs SET decision_id=?,state='submitting',result=?,error='' WHERE id=?",
+                    (approval_id, "Решение передаётся Hermes.", request_id))
                 self.db.commit()
             state, result, error = "submitting", "Решение передано Hermes.", ""
             try:
@@ -356,19 +465,27 @@ class Bridge:
             except (OSError, ValueError, RuntimeError):
                 state, result, error = "unknown", "", "Ответ о приёме решения потерян. Не повторяйте его."
             with self.lock:
-                self.db.execute("UPDATE jobs SET state=?,result=?,error=? WHERE id=?",
-                                (state, result, error, request_id))
-                self.db.commit()
                 row = self._get("jobs", request_id)
+                # A status/stop request may have completed while the approval
+                # POST was in flight. Never overwrite that newer observation.
+                if (row["state"] not in TERMINAL_JOB_STATES and not row["stop_requested"] and
+                        row["state"] == "submitting" and row["decision_id"] == approval_id):
+                    self.db.execute("UPDATE jobs SET state=?,result=?,error=? WHERE id=?",
+                                    (state, result, error, request_id))
+                    self.db.commit()
+                    row = self._get("jobs", request_id)
             return self._public(row)
         if method == "SEND_TEXT":
+            if set(params) - {"id", "text", "textId", "chatId", "mode"}:
+                raise Invalid("Некорректная команда")
             text, text_id = params.get("text"), params.get("textId")
             if text is not None and text_id is not None:
                 raise Invalid("Укажите текст или ID расшифровки")
             if text_id is not None:
                 text_id = identifier(text_id)
                 text = self.transcript(text_id)
-            return self.send(request_id, text, text_id)
+            chat_id = params["chatId"] if "chatId" in params else _MISSING
+            return self.send(request_id, text, text_id, chat_id=chat_id, mode=params.get("mode", "task"))
         with self.lock:
             # Unsubmitted speech is ephemeral. Accepted jobs are retained independently.
             self.db.execute("DELETE FROM uploads WHERE created<? AND state!='transcribing'", (time.time() - 86400,))
@@ -461,6 +578,99 @@ class Bridge:
                         "textComplete": offset + len(page) == len(text)}
         raise Invalid("Неизвестная команда")
 
+    @staticmethod
+    def _job_summary(row):
+        text = row.get("full_result") or row.get("result") or row.get("error") or row.get("text") or ""
+        return " ".join(str(text).split())[:JOB_SUMMARY]
+
+    def _chat(self, chat_id):
+        row = self.db.execute("SELECT * FROM chats WHERE id=?", (chat_id,)).fetchone()
+        if row is None:
+            raise Invalid("Чат не найден")
+        return dict(row)
+
+    def chat_list(self, params):
+        if set(params) - {"offset", "limit", "archived"}:
+            raise Invalid("Некорректный список чатов")
+        offset, limit, archived = params.get("offset", 0), params.get("limit", 10), params.get("archived", False)
+        if (type(offset) is not int or not 0 <= offset <= 2**53 - 1 or
+                type(limit) is not int or not 1 <= limit <= 10 or type(archived) is not bool):
+            raise Invalid("Некорректный список чатов")
+        with self.lock:
+            active_row = self.db.execute(
+                "SELECT id FROM jobs WHERE state IN ('queued','submitting','running','approval','unknown','stopping') "
+                "ORDER BY created DESC,id DESC LIMIT 1").fetchone()
+        if active_row is not None:
+            self.job_status(active_row["id"])
+        clause = "archived_at IS NOT NULL" if archived else "archived_at IS NULL"
+        with self.lock:
+            rows = self.db.execute(
+                f"SELECT * FROM chats WHERE {clause} ORDER BY updated DESC,id DESC LIMIT ? OFFSET ?",
+                (limit + 1, offset)).fetchall()
+            active = self.db.execute(
+                "SELECT id,chat_id,state,mode FROM jobs WHERE state IN "
+                "('queued','submitting','running','approval','unknown','stopping') "
+                "ORDER BY created DESC,id DESC LIMIT 1").fetchone()
+            chats = []
+            for row in rows[:limit]:
+                latest = self.db.execute(
+                    "SELECT * FROM jobs WHERE chat_id=? AND deleted_at IS NULL "
+                    "ORDER BY created DESC,id DESC LIMIT 1", (row["id"],)).fetchone()
+                chats.append({
+                    "id": row["id"], "title": row["title"], "updated": row["updated"],
+                    "archived": row["archived_at"] is not None,
+                    "latestJob": None if latest is None else {
+                        "id": latest["id"], "state": latest["state"],
+                        "summary": self._job_summary(dict(latest))[:120],
+                        "mode": latest["mode"] or "task"},
+                })
+        active_job = None if active is None else {
+            "id": active["id"], "chatId": active["chat_id"] or LEGACY_CHAT_ID,
+            "state": active["state"], "mode": active["mode"] or "task"}
+        return {"ok": True, "chats": chats,
+                "nextOffset": offset + limit if len(rows) > limit else None,
+                "activeJob": active_job}
+
+    def chat_detail(self, params):
+        if set(params) - {"chatId", "offset", "limit"}:
+            raise Invalid("Некорректный чат")
+        chat_id = chat_identifier(params.get("chatId"))
+        offset, limit = params.get("offset", 0), params.get("limit", 5)
+        if (type(offset) is not int or not 0 <= offset <= 2**53 - 1 or
+                type(limit) is not int or not 1 <= limit <= 5):
+            raise Invalid("Некорректный чат")
+        with self.lock:
+            chat = self._chat(chat_id)
+            rows = self.db.execute(
+                "SELECT * FROM jobs WHERE chat_id=? AND deleted_at IS NULL "
+                "ORDER BY created DESC,id DESC LIMIT ? OFFSET ?", (chat_id, limit + 1, offset)).fetchall()
+        return {
+            "ok": True,
+            "chat": {"id": chat["id"], "title": chat["title"], "archived": chat["archived_at"] is not None},
+            "jobs": [self._chat_public(dict(row)) for row in rows[:limit]],
+            "nextOffset": offset + limit if len(rows) > limit else None,
+        }
+
+    def chat_archive(self, params):
+        if set(params) != {"chatId", "archived"} or type(params.get("archived")) is not bool:
+            raise Invalid("Некорректный чат")
+        chat_id, archived = chat_identifier(params.get("chatId")), params["archived"]
+        with self.lock:
+            self._chat(chat_id)
+            if archived:
+                active = self.db.execute(
+                    "SELECT 1 FROM jobs WHERE chat_id=? AND state IN "
+                    "('queued','submitting','running','approval','unknown','stopping') LIMIT 1",
+                    (chat_id,)).fetchone()
+                if active:
+                    raise Invalid("Активный чат нельзя архивировать")
+                self.db.execute("UPDATE chats SET archived_at=COALESCE(archived_at,?) WHERE id=?",
+                                (time.time(), chat_id))
+            else:
+                self.db.execute("UPDATE chats SET archived_at=NULL WHERE id=?", (chat_id,))
+            self.db.commit()
+        return {"ok": True, "chatId": chat_id, "archived": archived}
+
     def history_list(self, params):
         if set(params) - {"trash", "offset", "limit"}:
             raise Invalid("Некорректная история")
@@ -486,7 +696,8 @@ class Bridge:
             raise Invalid("Некорректная история")
         with self.lock:
             row = self._get("jobs", request_id)
-        content = row["text"] if field == "text" else row["result"] or row["error"] or ""
+        content = (row["text"] if field == "text" else
+                   row.get("full_result") or row["result"] or row["error"] or "")
         if offset > len(content):
             raise Invalid("Страница за пределами истории")
         page = content[offset:offset + limit]
@@ -500,7 +711,7 @@ class Bridge:
         request_id, deleted = identifier(params.get("id")), params["deleted"]
         with self.lock:
             row = self._get("jobs", request_id)
-            if deleted and row["state"] not in ("completed", "error"):
+            if deleted and row["state"] not in ("completed", "error", "cancelled"):
                 raise Invalid("Активную команду нельзя удалить")
             if deleted:
                 self.db.execute("UPDATE jobs SET deleted_at=COALESCE(deleted_at,?) WHERE id=?",
@@ -516,7 +727,7 @@ class Bridge:
             raise Invalid("Некорректная история")
         with self.lock:
             cursor = self.db.execute(
-                "DELETE FROM jobs WHERE deleted_at IS NOT NULL AND state IN ('completed','error')")
+                "DELETE FROM jobs WHERE deleted_at IS NOT NULL AND state IN ('completed','error','cancelled')")
             self.db.commit()
         self.event("history_purged", removed=cursor.rowcount)
         return {"ok": True, "removed": cursor.rowcount}
@@ -527,7 +738,7 @@ class Bridge:
         with self.lock:
             row = self.db.execute("""
                 SELECT id FROM jobs WHERE deleted_at IS NULL
-                  AND state IN ('queued','submitting','running','approval','unknown')
+                  AND state IN ('queued','submitting','running','approval','unknown','stopping')
                 ORDER BY created DESC,id DESC LIMIT 1
             """).fetchone()
         if not row:
@@ -705,9 +916,11 @@ class Bridge:
         finally:
             shutil.rmtree(folder, ignore_errors=True)
 
-    def send(self, request_id, text, text_id=None):
+    def send(self, request_id, text, text_id=None, *, chat_id=_MISSING, mode="task"):
         if not isinstance(text, str) or not text.strip() or len(text) > MAX_TEXT_CHARS:
             raise Invalid("Пустая или слишком длинная команда")
+        if mode not in JOB_MODES:
+            raise Invalid("Некорректный режим команды")
         try:
             text.encode("utf-8")
         except UnicodeEncodeError as exc:
@@ -716,11 +929,24 @@ class Bridge:
         # Keep it byte-for-byte; direct legacy input retains its old trimming.
         if text_id is None:
             text = text.strip()
+        if chat_id is _MISSING:
+            requested_chat, effective_chat = "__missing__", LEGACY_CHAT_ID
+        elif chat_id is None:
+            requested_chat, effective_chat = "__new__", request_id
+        else:
+            requested_chat = effective_chat = chat_identifier(chat_id)
+        fingerprint = request_fingerprint(text, text_id, requested_chat, mode)
         with self.lock:
             old = self.db.execute("SELECT * FROM jobs WHERE id=?", (request_id,)).fetchone()
             if old:
-                if old["text"] != text:
-                    raise Invalid("ID уже принят с другим текстом")
+                # Rows created before chat routing have no fingerprint. They may
+                # only replay through the legacy call shape used by old packages.
+                if old["request_fingerprint"]:
+                    same = hmac.compare_digest(old["request_fingerprint"], fingerprint)
+                else:
+                    same = (old["text"] == text and chat_id is _MISSING and mode == "task")
+                if not same:
+                    raise Invalid("ID уже принят с другими параметрами")
                 return self._public(dict(old))
             # A legacy direct command must still match its ASR row exactly. An
             # edited command is accepted only through an immutable ready draft
@@ -735,71 +961,244 @@ class Bridge:
                 speech = self.db.execute("SELECT state,text FROM uploads WHERE id=?", (speech_id,)).fetchone()
                 if speech and (speech["state"] != "ready" or speech["text"] != text):
                     raise Invalid("Текст не соответствует распознанной записи")
-            active = self.db.execute("SELECT count(*) FROM jobs WHERE state IN ('queued','submitting','running','approval','unknown')").fetchone()[0]
+            active = self.db.execute(
+                "SELECT count(*) FROM jobs WHERE state IN "
+                "('queued','submitting','running','approval','unknown','stopping')").fetchone()[0]
             if active:
                 raise Invalid("Сначала дождитесь результата предыдущей команды")
-            self.db.execute("INSERT INTO jobs(id,text,created,state) VALUES (?,?,?,'queued')", (request_id, text, time.time()))
+            now = time.time()
+            if chat_id is None:
+                if self.db.execute("SELECT 1 FROM chats WHERE id=?", (effective_chat,)).fetchone():
+                    raise Invalid("ID уже используется другим чатом")
+                session_key = f"musafer-watch-chat-{effective_chat}"
+                self.db.execute(
+                    "INSERT INTO chats(id,title,session_key,created,updated) VALUES (?,?,?,?,?)",
+                    (effective_chat, chat_title(text), session_key, now, now))
+            elif chat_id is _MISSING:
+                chat = self.db.execute("SELECT * FROM chats WHERE id=?", (LEGACY_CHAT_ID,)).fetchone()
+                if chat is None:
+                    self.db.execute(
+                        "INSERT INTO chats(id,title,session_key,created,updated) VALUES (?,?,?,?,?)",
+                        (LEGACY_CHAT_ID, chat_title(text), LEGACY_SESSION_KEY, now, now))
+                    session_key = LEGACY_SESSION_KEY
+                else:
+                    if chat["archived_at"] is not None:
+                        raise Invalid("Чат находится в архиве")
+                    session_key = chat["session_key"]
+            else:
+                chat = self._chat(effective_chat)
+                if chat["archived_at"] is not None:
+                    raise Invalid("Чат находится в архиве")
+                session_key = chat["session_key"]
+            self.db.execute(
+                "INSERT INTO jobs(id,text,created,state,chat_id,mode,source_text_id,request_fingerprint) "
+                "VALUES (?,?,?,'queued',?,?,?,?)",
+                (request_id, text, now, effective_chat, mode, text_id or "", fingerprint))
+            self.db.execute("UPDATE chats SET updated=? WHERE id=?", (now, effective_chat))
             self.db.commit()
-            self.worker.submit(self._submit, request_id, text)
+            self.worker.submit(self._submit, request_id, text, session_key, mode)
             return self._public(self._get("jobs", request_id))
 
-    def _submit(self, request_id, text):
+    def _submit(self, request_id, text, session_key, mode):
         started = time.monotonic()
         with self.lock:
+            row = self._get("jobs", request_id)
+            if row["state"] != "queued" or row["stop_requested"]:
+                return
             self.db.execute("UPDATE jobs SET state='submitting' WHERE id=?", (request_id,))
             self.db.commit()
         try:
-            response = self.hermes.call("/v1/runs", {"input": text, "instructions": INSTRUCTIONS}, request_id)
+            instructions = RESEARCH_INSTRUCTIONS if mode == "research" else INSTRUCTIONS
+            response = self.hermes.call(
+                "/v1/runs", {"input": text, "instructions": instructions}, request_id,
+                session_key=session_key)
             self.event("hermes_submitted", id=request_id, ms=round((time.monotonic() - started) * 1000))
             run_id = response.get("run_id")
             if not isinstance(run_id, str) or not re.fullmatch(r"run_[0-9a-f]{32}", run_id):
                 raise RuntimeError("Invalid run id")
             with self.lock:
                 # A run id confirms receipt, not that an agent has started work.
-                self.db.execute("UPDATE jobs SET state='queued',run_id=? WHERE id=?", (run_id, request_id))
+                current = self._get("jobs", request_id)
+                if current["state"] in TERMINAL_JOB_STATES:
+                    return
+                state = "stopping" if current["stop_requested"] else "queued"
+                self.db.execute("UPDATE jobs SET state=?,run_id=? WHERE id=?", (state, run_id, request_id))
                 self.db.commit()
+                should_stop = bool(current["stop_requested"])
+            if should_stop:
+                self._request_stop(request_id, run_id)
         except Exception as exc:
             # A timeout can follow acceptance. Never turn a lost receipt into a duplicate run.
             certain_rejection = isinstance(exc, HTTPError) and 400 <= exc.code < 500
             with self.lock:
-                self.db.execute("UPDATE jobs SET state=?,error=? WHERE id=?", (
-                    "error" if certain_rejection else "unknown",
-                    "Hermes отклонил команду" if certain_rejection else "Ответ о приёме потерян. Не отправляйте команду повторно.", request_id))
-                self.db.commit()
+                current = self._get("jobs", request_id)
+                if current["state"] not in TERMINAL_JOB_STATES:
+                    self.db.execute("UPDATE jobs SET state=?,error=? WHERE id=?", (
+                        "error" if certain_rejection else "unknown",
+                        "Hermes отклонил команду" if certain_rejection else "Ответ о приёме потерян. Не отправляйте команду повторно.", request_id))
+                    self.db.commit()
             self._announce(request_id, "error" if certain_rejection else "unknown", error="Hermes отклонил команду")
 
-    @staticmethod
-    def _public(row):
+    @classmethod
+    def _public(cls, row):
         text = row["text"]
+        report = row.get("full_result") or row.get("result") or row.get("error") or ""
         return {"ok": True, "id": row["id"], "text": text[:JOB_TEXT_PREVIEW],
                 "textLength": len(text), "textComplete": len(text) <= JOB_TEXT_PREVIEW,
-                **{k: row[k] for k in ("state", "result", "error")}}
+                **{k: row[k] for k in ("state", "result", "error")},
+                "chatId": row.get("chat_id") or LEGACY_CHAT_ID,
+                "mode": row.get("mode") or "task",
+                "summary": cls._job_summary(row),
+                "reportLength": len(report),
+                "reportTruncated": bool(row.get("report_truncated")),
+                "stopRequested": bool(row.get("stop_requested"))}
 
-    def job_status(self, request_id, timeout=8):
+    @classmethod
+    def _chat_public(cls, row):
+        answer = cls._public(row)
+        answer["text"] = answer["text"][:160]
+        answer["textComplete"] = answer["textLength"] <= 160
+        answer["result"] = ""
+        answer["summary"] = answer["summary"][:160]
+        return answer
+
+    @staticmethod
+    def _brief_status(answer, brief):
+        if not brief or "approval" in answer:
+            return answer
+        answer["text"] = answer["text"][:160]
+        answer["textComplete"] = answer["textLength"] <= 160
+        answer["result"] = answer["summary"][:JOB_SUMMARY]
+        return answer
+
+    def job_report(self, request_id, params):
+        if set(params) - {"id", "offset", "limit"}:
+            raise Invalid("Некорректный отчёт")
+        offset, limit = params.get("offset", 0), params.get("limit", 1000)
+        if (type(offset) is not int or offset < 0 or type(limit) is not int or
+                not 1 <= limit <= 1000):
+            raise Invalid("Некорректный отчёт")
         with self.lock:
             row = self._get("jobs", request_id)
-        if row["run_id"] and row["state"] in ("queued", "submitting", "running", "approval", "unknown"):
+        report = row.get("full_result") or row.get("result") or row.get("error") or ""
+        if offset > len(report):
+            raise Invalid("Страница за пределами отчёта")
+        page = report[offset:offset + limit]
+        next_offset = offset + len(page)
+        return {"ok": True, "id": request_id, "text": page, "textLength": len(report),
+                "offset": offset, "nextOffset": next_offset if next_offset < len(report) else None,
+                "truncated": bool(row.get("report_truncated"))}
+
+    @staticmethod
+    def _remote_state(remote_status):
+        return {
+            "queued": "queued", "submitting": "submitting", "running": "running",
+            "stopping": "stopping", "completed": "completed", "failed": "error",
+            "cancelled": "cancelled", "interrupted": "error",
+            "waiting_for_approval": "approval",
+        }.get(remote_status)
+
+    def _apply_remote(self, request_id, remote):
+        if not isinstance(remote, dict):
+            return None
+        mapped = self._remote_state(remote.get("status"))
+        if mapped is None:
+            return None
+        output = str(remote.get("output") or "")
+        full_result = output[:JOB_REPORT_MAX]
+        truncated = len(output) > JOB_REPORT_MAX
+        result = output[:JOB_RESULT_PREVIEW]
+        error = str(remote.get("error") or "")[:500]
+        with self.lock:
+            row = self._get("jobs", request_id)
+            # Network responses can complete out of order. A terminal state is
+            # monotonic, and a stop request fences every later active response.
+            if row["state"] in TERMINAL_JOB_STATES:
+                return row
+            if row["stop_requested"] and mapped in ("queued", "submitting", "running", "approval"):
+                mapped = "stopping"
+            previous = row["state"]
+            self.db.execute(
+                "UPDATE jobs SET state=?,result=?,full_result=?,report_truncated=?,error=? WHERE id=?",
+                (mapped, result, full_result, int(truncated), error, request_id))
+            self.db.commit()
+            row = self._get("jobs", request_id)
+        if previous != mapped:
+            self.event("job_state", id=request_id, state=mapped, previous=previous,
+                       ms=round((time.time() - row["created"]) * 1000))
+        return row
+
+    def job_stop(self, request_id, params):
+        if set(params) != {"id"}:
+            raise Invalid("Некорректная остановка")
+        with self.lock:
+            row = self._get("jobs", request_id)
+            if row["state"] in ("completed", "error", "cancelled") or row["stop_requested"]:
+                return self._public(row)
+            if row["state"] == "queued" and not row["run_id"]:
+                self.db.execute(
+                    "UPDATE jobs SET state='cancelled',stop_requested=1,result=?,error='' WHERE id=?",
+                    ("Остановлено до отправки Hermes.", request_id))
+                self.db.commit()
+                return self._public(self._get("jobs", request_id))
+            state = "stopping" if row["state"] != "unknown" or row["run_id"] else "unknown"
+            error = "" if row["run_id"] or row["state"] == "submitting" else (
+                "Нет идентификатора Hermes для подтверждения остановки.")
+            self.db.execute(
+                "UPDATE jobs SET state=?,stop_requested=1,error=? WHERE id=?",
+                (state, error, request_id))
+            self.db.commit()
+            row = self._get("jobs", request_id)
+        return self._request_stop(request_id, row["run_id"]) if row["run_id"] else self._public(row)
+
+    def _request_stop(self, request_id, run_id):
+        try:
+            remote = self.hermes.call(f"/v1/runs/{run_id}/stop", {}, timeout=6)
+            applied = self._apply_remote(request_id, remote)
+            if applied is None:
+                with self.lock:
+                    current = self._get("jobs", request_id)
+                    if current["state"] not in TERMINAL_JOB_STATES:
+                        self.db.execute(
+                            "UPDATE jobs SET state='stopping',error=? WHERE id=?",
+                            ("Hermes вернул неизвестный статус остановки. Статус обновляется.", request_id))
+                        self.db.commit()
+            with self.lock:
+                row = self._get("jobs", request_id)
+            return self._public(row)
+        except (OSError, ValueError, RuntimeError):
+            with self.lock:
+                row = self._get("jobs", request_id)
+                if row["state"] not in ("completed", "error", "cancelled"):
+                    self.db.execute(
+                        "UPDATE jobs SET state='stopping',error=? WHERE id=?",
+                        ("Не удалось подтвердить остановку. Статус обновляется.", request_id))
+                    self.db.commit()
+                row = self._get("jobs", request_id)
+            return self._public(row)
+
+    def job_status(self, request_id, timeout=8, brief=False):
+        with self.lock:
+            row = self._get("jobs", request_id)
+        if row["run_id"] and row["state"] in ACTIVE_JOB_STATES:
             try:
                 remote = self.hermes.call("/v1/runs/" + row["run_id"], timeout=timeout)
-                states = {"queued": "queued", "submitting": "submitting", "running": "running",
-                          "completed": "completed", "failed": "error", "cancelled": "error",
-                          "interrupted": "error", "waiting_for_approval": "approval"}
-                previous = row["state"]
-                mapped = states.get(remote.get("status"))
-                if mapped is None:
-                    return {**self._public(row), "state": "unknown",
-                            "error": "Hermes вернул неизвестный статус. Команда не повторялась."}
-                row["state"] = mapped
-                if previous != row["state"]:
-                    self.event("job_state", id=request_id, state=row["state"], previous=previous, ms=round((time.time() - row["created"]) * 1000))
-                row["result"] = str(remote.get("output") or "")[:6000]
-                row["error"] = str(remote.get("error") or "")[:500]
-                with self.lock:
-                    self.db.execute("UPDATE jobs SET state=?,result=?,error=? WHERE id=?",
-                                    (row["state"], row["result"], row["error"], request_id))
-                    self.db.commit()
+                row = self._apply_remote(request_id, remote)
+                if row is None:
+                    with self.lock:
+                        current = self._get("jobs", request_id)
+                        if current["state"] in TERMINAL_JOB_STATES:
+                            return self._brief_status(self._public(current), brief)
+                        unknown_state = "stopping" if current["stop_requested"] else "unknown"
+                        message = "Hermes вернул неизвестный статус. Команда не повторялась."
+                        self.db.execute("UPDATE jobs SET state=?,error=? WHERE id=?",
+                                        (unknown_state, message, request_id))
+                        self.db.commit()
+                        current = self._get("jobs", request_id)
+                    self._announce(request_id, unknown_state, error=message)
+                    return self._brief_status(self._public(current), brief)
                 answer = self._public(row)
-                if row["state"] == "approval":
+                if row["state"] == "approval" and not row["stop_requested"]:
                     approval = remote.get("approval") or {}
                     proposal = str(approval.get("command") or approval.get("description") or "")
                     aid = approval.get("request_id")
@@ -808,10 +1207,17 @@ class Bridge:
                                    if self.expired_approvals.get(row["run_id"]) == aid else
                                    "Решение уже передавалось Hermes. Повтора не будет.")
                         with self.lock:
-                            self.db.execute("UPDATE jobs SET state='submitting',result=?,error='' WHERE id=?",
-                                            (message, request_id))
-                            self.db.commit()
-                        return {**answer, "state": "submitting", "result": message, "error": ""}
+                            current = self._get("jobs", request_id)
+                            if (current["state"] in TERMINAL_JOB_STATES or
+                                    current["stop_requested"]):
+                                return self._brief_status(self._public(current), brief)
+                            if current["state"] == "approval" and current["decision_id"] == aid:
+                                self.db.execute(
+                                    "UPDATE jobs SET state='submitting',result=?,error='' WHERE id=?",
+                                    (message, request_id))
+                                self.db.commit()
+                                current = self._get("jobs", request_id)
+                        return self._brief_status(self._public(current), brief)
                     # Never approve an unidentified or truncated action from the watch.
                     if isinstance(aid, str) and aid and proposal and len(proposal) <= APPROVAL_TEXT_MAX:
                         answer["approval"] = {"id": aid, "text": proposal}
@@ -819,10 +1225,16 @@ class Bridge:
                         self.event("approval_unavailable", id=request_id, chars=len(proposal), identified=bool(aid))
                         answer["result"] = "Не удалось показать полное действие для подтверждения. Оно не одобрено. Статус обновляется автоматически."
                 self._announce(request_id, row["state"], answer.get("approval"), row["result"], row["error"])
-                return answer
+                return self._brief_status(answer, brief)
             except (OSError, ValueError, RuntimeError):
-                return {**self._public(row), "error": "Не удалось обновить статус. Команда не отправлялась повторно."}
-        return self._public(row)
+                with self.lock:
+                    current = self._get("jobs", request_id)
+                if current["state"] in TERMINAL_JOB_STATES:
+                    return self._brief_status(self._public(current), brief)
+                answer = {**self._public(current),
+                          "error": "Не удалось обновить статус. Команда не отправлялась повторно."}
+                return self._brief_status(answer, brief)
+        return self._brief_status(self._public(row), brief)
 
 
 def make_handler(bridge, token):
